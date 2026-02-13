@@ -4,7 +4,7 @@ Stream (append-only log) operations for Flo client.
 Uses StreamID-native positioning (timestamp_ms + sequence).
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from .types import (
     OpCode,
@@ -43,7 +43,7 @@ class StreamOperations:
         self,
         stream: str,
         payload: bytes,
-        options: Optional[StreamAppendOptions] = None,
+        options: StreamAppendOptions | None = None,
     ) -> StreamAppendResult:
         """Append a record to a stream.
 
@@ -75,7 +75,7 @@ class StreamOperations:
     async def read(
         self,
         stream: str,
-        options: Optional[StreamReadOptions] = None,
+        options: StreamReadOptions | None = None,
     ) -> StreamReadResult:
         """Read records from a stream.
 
@@ -148,7 +148,7 @@ class StreamOperations:
     async def info(
         self,
         stream: str,
-        options: Optional[StreamInfoOptions] = None,
+        options: StreamInfoOptions | None = None,
     ) -> StreamInfo:
         """Get stream metadata.
 
@@ -179,7 +179,7 @@ class StreamOperations:
     async def trim(
         self,
         stream: str,
-        options: Optional[StreamTrimOptions] = None,
+        options: StreamTrimOptions | None = None,
     ) -> None:
         """Trim a stream based on retention policy.
 
@@ -228,7 +228,7 @@ class StreamOperations:
         stream: str,
         group: str,
         consumer: str,
-        options: Optional[StreamGroupJoinOptions] = None,
+        options: StreamGroupJoinOptions | None = None,
     ) -> None:
         """Join a consumer group.
 
@@ -259,7 +259,7 @@ class StreamOperations:
         stream: str,
         group: str,
         consumer: str,
-        options: Optional[StreamGroupJoinOptions] = None,
+        options: StreamGroupJoinOptions | None = None,
     ) -> None:
         """Leave a consumer group.
 
@@ -290,7 +290,7 @@ class StreamOperations:
         stream: str,
         group: str,
         consumer: str,
-        options: Optional[StreamGroupReadOptions] = None,
+        options: StreamGroupReadOptions | None = None,
     ) -> StreamReadResult:
         """Read records from a consumer group.
 
@@ -343,7 +343,7 @@ class StreamOperations:
         stream: str,
         group: str,
         seqs: list[int],
-        options: Optional[StreamGroupAckOptions] = None,
+        options: StreamGroupAckOptions | None = None,
     ) -> None:
         """Acknowledge records in a consumer group.
 

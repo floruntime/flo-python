@@ -3,11 +3,10 @@
 Core types, constants, and data classes for the Flo client SDK.
 """
 
+import struct
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional
-import struct
-
 
 # =============================================================================
 # Protocol Constants
@@ -247,64 +246,64 @@ class OptionTag(IntEnum):
     """
 
     # KV Options (0x01 - 0x0F)
-    TTL_SECONDS = 0x01   # u64: Time-to-live in seconds (0 = no expiration)
-    CAS_VERSION = 0x02   # u64: Expected version for compare-and-swap
-    IF_NOT_EXISTS = 0x03 # void: Only set if key doesn't exist (NX)
-    IF_EXISTS = 0x04     # void: Only set if key exists (XX)
-    LIMIT = 0x05         # u32: Maximum number of results for scan/list operations
-    KEYS_ONLY = 0x06     # u8: Skip values in scan response (0/1)
-    CURSOR = 0x07        # bytes: Pagination cursor (ShardWalker format)
+    TTL_SECONDS = 0x01  # u64: Time-to-live in seconds (0 = no expiration)
+    CAS_VERSION = 0x02  # u64: Expected version for compare-and-swap
+    IF_NOT_EXISTS = 0x03  # void: Only set if key doesn't exist (NX)
+    IF_EXISTS = 0x04  # void: Only set if key exists (XX)
+    LIMIT = 0x05  # u32: Maximum number of results for scan/list operations
+    KEYS_ONLY = 0x06  # u8: Skip values in scan response (0/1)
+    CURSOR = 0x07  # bytes: Pagination cursor (ShardWalker format)
 
     # Queue Options (0x10 - 0x1F)
-    PRIORITY = 0x10            # u8: Message priority (0-255, higher = more urgent)
-    DELAY_MS = 0x11            # u64: Delay before message becomes visible
+    PRIORITY = 0x10  # u8: Message priority (0-255, higher = more urgent)
+    DELAY_MS = 0x11  # u64: Delay before message becomes visible
     VISIBILITY_TIMEOUT_MS = 0x12  # u32: How long message is invisible after dequeue
-    DEDUP_KEY = 0x13           # string: Deduplication key
-    MAX_RETRIES = 0x14         # u8: Maximum retry attempts before DLQ
-    COUNT = 0x15               # u32: Number of messages to dequeue
-    SEND_TO_DLQ = 0x16         # u8: Whether to send failed messages to DLQ (0/1)
-    BLOCK_MS = 0x17            # u32: Block timeout - wait until exists (0=forever)
-    WAIT_MS = 0x18             # u32: Watch timeout - wait for NEXT version change (0=forever)
+    DEDUP_KEY = 0x13  # string: Deduplication key
+    MAX_RETRIES = 0x14  # u8: Maximum retry attempts before DLQ
+    COUNT = 0x15  # u32: Number of messages to dequeue
+    SEND_TO_DLQ = 0x16  # u8: Whether to send failed messages to DLQ (0/1)
+    BLOCK_MS = 0x17  # u32: Block timeout - wait until exists (0=forever)
+    WAIT_MS = 0x18  # u32: Watch timeout - wait for NEXT version change (0=forever)
 
     # Stream Options (0x20 - 0x2F) - StreamID-native ONLY
     # All stream positioning uses StreamID (timestamp_ms + sequence) - no legacy offset/timestamp modes
     # 0x20 reserved
-    STREAM_START = 0x21      # [16]u8: Start StreamID for reads (inclusive)
-    STREAM_END = 0x22        # [16]u8: End StreamID for reads (inclusive)
-    STREAM_TAIL = 0x23       # void: Flag indicating tail read (start from end)
-    PARTITION = 0x24         # u32: Explicit partition index
-    PARTITION_KEY = 0x25     # string: Key for partition routing
-    MAX_AGE_SECONDS = 0x26   # u64: Maximum age in seconds for retention
-    MAX_BYTES = 0x27         # u64: Maximum size in bytes for retention
-    DRY_RUN = 0x28           # void: Flag to preview what would be deleted
-    RETENTION_COUNT = 0x29   # u64: Retention policy - max event count
-    RETENTION_AGE = 0x2A     # u64: Retention policy - max age in seconds
-    RETENTION_BYTES = 0x2B   # u64: Retention policy - max bytes
+    STREAM_START = 0x21  # [16]u8: Start StreamID for reads (inclusive)
+    STREAM_END = 0x22  # [16]u8: End StreamID for reads (inclusive)
+    STREAM_TAIL = 0x23  # void: Flag indicating tail read (start from end)
+    PARTITION = 0x24  # u32: Explicit partition index
+    PARTITION_KEY = 0x25  # string: Key for partition routing
+    MAX_AGE_SECONDS = 0x26  # u64: Maximum age in seconds for retention
+    MAX_BYTES = 0x27  # u64: Maximum size in bytes for retention
+    DRY_RUN = 0x28  # void: Flag to preview what would be deleted
+    RETENTION_COUNT = 0x29  # u64: Retention policy - max event count
+    RETENTION_AGE = 0x2A  # u64: Retention policy - max age in seconds
+    RETENTION_BYTES = 0x2B  # u64: Retention policy - max bytes
 
     # Consumer Group Options (0x30 - 0x3F)
-    ACK_TIMEOUT_MS = 0x30      # u32: Time before unacked message auto-redelivers
-    MAX_DELIVER = 0x31         # u8: Max delivery attempts before DLQ (default: 10)
-    SUBSCRIPTION_MODE = 0x32   # u8: 0=shared, 1=exclusive, 2=key_shared
-    REDELIVERY_DELAY_MS = 0x33 # u32: Delay before NACK'd message becomes visible
-    CONSUMER_TIMEOUT_MS = 0x34 # u32: Remove consumer from group if no activity
-    NO_ACK = 0x35              # void: Auto-ack on delivery (at-most-once)
-    IDLE_TIMEOUT_MS = 0x36     # u64: Min idle time for claiming stuck messages
-    MAX_ACK_PENDING = 0x37     # u32: Max unacked messages per consumer
-    EXTEND_ACK_MS = 0x38       # u32: Amount of time to extend ack deadline
-    MAX_STANDBYS = 0x39        # u16: Max standby consumers in exclusive mode
-    NUM_SLOTS = 0x3A           # u16: Number of hash slots for key_shared mode
+    ACK_TIMEOUT_MS = 0x30  # u32: Time before unacked message auto-redelivers
+    MAX_DELIVER = 0x31  # u8: Max delivery attempts before DLQ (default: 10)
+    SUBSCRIPTION_MODE = 0x32  # u8: 0=shared, 1=exclusive, 2=key_shared
+    REDELIVERY_DELAY_MS = 0x33  # u32: Delay before NACK'd message becomes visible
+    CONSUMER_TIMEOUT_MS = 0x34  # u32: Remove consumer from group if no activity
+    NO_ACK = 0x35  # void: Auto-ack on delivery (at-most-once)
+    IDLE_TIMEOUT_MS = 0x36  # u64: Min idle time for claiming stuck messages
+    MAX_ACK_PENDING = 0x37  # u32: Max unacked messages per consumer
+    EXTEND_ACK_MS = 0x38  # u32: Amount of time to extend ack deadline
+    MAX_STANDBYS = 0x39  # u16: Max standby consumers in exclusive mode
+    NUM_SLOTS = 0x3A  # u16: Number of hash slots for key_shared mode
 
     # Worker/Action Options (0x40 - 0x4F)
     WORKER_ID = 0x40  # string: Worker identifier
     EXTEND_MS = 0x41  # u32: Lease extension time in milliseconds
     MAX_TASKS = 0x42  # u32: Maximum tasks to return in batch
-    RETRY = 0x43      # u8: Whether to retry on failure (0/1)
+    RETRY = 0x43  # u8: Whether to retry on failure (0/1)
 
     # Workflow Options (0x50 - 0x5F)
-    TIMEOUT_MS = 0x50      # u64: Workflow/activity timeout
-    RETRY_POLICY = 0x51    # bytes: Serialized retry policy
+    TIMEOUT_MS = 0x50  # u64: Workflow/activity timeout
+    RETRY_POLICY = 0x51  # bytes: Serialized retry policy
     CORRELATION_ID = 0x52  # string: Correlation ID for tracing
-    SUBSCRIPTION_ID = 0x53 # u64: Subscription ID for stream subscriptions
+    SUBSCRIPTION_ID = 0x53  # u64: Subscription ID for stream subscriptions
 
 
 # =============================================================================
@@ -317,7 +316,7 @@ class KVEntry:
     """KV entry from scan results."""
 
     key: bytes
-    value: Optional[bytes]  # None if keys_only=True
+    value: bytes | None  # None if keys_only=True
 
 
 @dataclass
@@ -325,7 +324,7 @@ class ScanResult:
     """Result of a KV scan operation."""
 
     entries: list[KVEntry]
-    cursor: Optional[bytes]  # None if no more pages
+    cursor: bytes | None  # None if no more pages
     has_more: bool
 
 
@@ -406,7 +405,7 @@ class StreamRecord:
     timestamp_ms: int
     tier: StorageTier = StorageTier.HOT
     payload: bytes = b""
-    headers: Optional[dict[str, str]] = None
+    headers: dict[str, str] | None = None
 
 
 @dataclass
@@ -443,17 +442,17 @@ class StreamInfo:
 class GetOptions:
     """Options for KV get operations."""
 
-    namespace: Optional[str] = None
-    block_ms: Optional[int] = None  # Block until value available (0 = infinite)
+    namespace: str | None = None
+    block_ms: int | None = None  # Block until value available (0 = infinite)
 
 
 @dataclass
 class PutOptions:
     """Options for KV put operations."""
 
-    namespace: Optional[str] = None
-    ttl_seconds: Optional[int] = None
-    cas_version: Optional[int] = None
+    namespace: str | None = None
+    ttl_seconds: int | None = None
+    cas_version: int | None = None
     if_not_exists: bool = False
     if_exists: bool = False
 
@@ -462,16 +461,16 @@ class PutOptions:
 class DeleteOptions:
     """Options for KV delete operations."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
 
 
 @dataclass
 class ScanOptions:
     """Options for KV scan operations."""
 
-    namespace: Optional[str] = None
-    cursor: Optional[bytes] = None
-    limit: Optional[int] = None
+    namespace: str | None = None
+    cursor: bytes | None = None
+    limit: int | None = None
     keys_only: bool = False
 
 
@@ -479,41 +478,41 @@ class ScanOptions:
 class HistoryOptions:
     """Options for KV history operations."""
 
-    namespace: Optional[str] = None
-    limit: Optional[int] = None
+    namespace: str | None = None
+    limit: int | None = None
 
 
 @dataclass
 class EnqueueOptions:
     """Options for queue enqueue operations."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
     priority: int = 0
-    delay_ms: Optional[int] = None
-    dedup_key: Optional[str] = None
+    delay_ms: int | None = None
+    dedup_key: str | None = None
 
 
 @dataclass
 class DequeueOptions:
     """Options for queue dequeue operations."""
 
-    namespace: Optional[str] = None
-    visibility_timeout_ms: Optional[int] = None
-    block_ms: Optional[int] = None
+    namespace: str | None = None
+    visibility_timeout_ms: int | None = None
+    block_ms: int | None = None
 
 
 @dataclass
 class AckOptions:
     """Options for queue ack operations."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
 
 
 @dataclass
 class NackOptions:
     """Options for queue nack operations."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
     to_dlq: bool = False
 
 
@@ -521,7 +520,7 @@ class NackOptions:
 class DlqListOptions:
     """Options for DLQ list operations."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
     limit: int = 100
 
 
@@ -529,21 +528,21 @@ class DlqListOptions:
 class DlqRequeueOptions:
     """Options for DLQ requeue operations."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
 
 
 @dataclass
 class PeekOptions:
     """Options for queue peek operations."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
 
 
 @dataclass
 class TouchOptions:
     """Options for queue touch (lease renewal) operations."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
 
 
 # =============================================================================
@@ -555,8 +554,8 @@ class TouchOptions:
 class StreamAppendOptions:
     """Options for stream append operations."""
 
-    namespace: Optional[str] = None
-    headers: Optional[dict[str, str]] = None
+    namespace: str | None = None
+    headers: dict[str, str] | None = None
 
 
 @dataclass
@@ -566,54 +565,54 @@ class StreamReadOptions:
     Uses StreamID-native positioning (timestamp_ms + sequence).
     """
 
-    namespace: Optional[str] = None
-    start: Optional["StreamID"] = None     # Start StreamID for reads (inclusive)
-    end: Optional["StreamID"] = None       # End StreamID for reads (inclusive)
-    tail: bool = False                     # Start from end of stream (mutually exclusive with start)
-    partition: Optional[int] = None        # Explicit partition index
-    count: Optional[int] = None            # Maximum number of records to return
-    block_ms: Optional[int] = None         # Blocking timeout (0 = infinite)
+    namespace: str | None = None
+    start: Optional["StreamID"] = None  # Start StreamID for reads (inclusive)
+    end: Optional["StreamID"] = None  # End StreamID for reads (inclusive)
+    tail: bool = False  # Start from end of stream (mutually exclusive with start)
+    partition: int | None = None  # Explicit partition index
+    count: int | None = None  # Maximum number of records to return
+    block_ms: int | None = None  # Blocking timeout (0 = infinite)
 
 
 @dataclass
 class StreamTrimOptions:
     """Options for stream trim operations."""
 
-    namespace: Optional[str] = None
-    max_len: Optional[int] = None          # Retention policy - max event count
-    max_age_seconds: Optional[int] = None  # Retention policy - max age in seconds
-    max_bytes: Optional[int] = None        # Retention policy - max bytes
-    dry_run: bool = False                  # Preview what would be deleted
+    namespace: str | None = None
+    max_len: int | None = None  # Retention policy - max event count
+    max_age_seconds: int | None = None  # Retention policy - max age in seconds
+    max_bytes: int | None = None  # Retention policy - max bytes
+    dry_run: bool = False  # Preview what would be deleted
 
 
 @dataclass
 class StreamInfoOptions:
     """Options for stream info operations."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
 
 
 @dataclass
 class StreamGroupJoinOptions:
     """Options for joining a consumer group."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
 
 
 @dataclass
 class StreamGroupReadOptions:
     """Options for reading from a consumer group."""
 
-    namespace: Optional[str] = None
-    count: Optional[int] = None  # Max records to read
-    block_ms: Optional[int] = None  # Block waiting for records
+    namespace: str | None = None
+    count: int | None = None  # Max records to read
+    block_ms: int | None = None  # Block waiting for records
 
 
 @dataclass
 class StreamGroupAckOptions:
     """Options for acknowledging records in a consumer group."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
 
 
 # =============================================================================
@@ -636,7 +635,7 @@ class ActionInfo:
     action_type: ActionType
     timeout_ms: int
     max_retries: int
-    description: Optional[str] = None
+    description: str | None = None
 
 
 @dataclass
@@ -645,8 +644,8 @@ class ActionRunStatus:
 
     run_id: str
     status: str  # "pending", "running", "completed", "failed"
-    result: Optional[bytes] = None
-    error: Optional[str] = None
+    result: bytes | None = None
+    error: str | None = None
 
 
 @dataclass
@@ -661,7 +660,7 @@ class ActionListResult:
     """Result of listing actions."""
 
     actions: list[ActionInfo]
-    cursor: Optional[bytes] = None
+    cursor: bytes | None = None
 
 
 # =============================================================================
@@ -673,42 +672,42 @@ class ActionListResult:
 class ActionRegisterOptions:
     """Options for registering an action."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
     timeout_ms: int = 30000
     max_retries: int = 3
-    description: Optional[str] = None
+    description: str | None = None
 
 
 @dataclass
 class ActionInvokeOptions:
     """Options for invoking an action."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
     priority: int = 10
-    idempotency_key: Optional[str] = None
+    idempotency_key: str | None = None
 
 
 @dataclass
 class ActionStatusOptions:
     """Options for getting action status."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
 
 
 @dataclass
 class ActionListOptions:
     """Options for listing actions."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
     limit: int = 100
-    prefix: Optional[str] = None
+    prefix: str | None = None
 
 
 @dataclass
 class ActionDeleteOptions:
     """Options for deleting an action."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
 
 
 # =============================================================================
@@ -735,7 +734,7 @@ WorkerTask = TaskAssignment
 class WorkerAwaitResult:
     """Result of awaiting a task."""
 
-    task: Optional[TaskAssignment] = None  # None if no task available
+    task: TaskAssignment | None = None  # None if no task available
 
 
 @dataclass
@@ -762,23 +761,23 @@ class WorkerListResult:
 class WorkerRegisterOptions:
     """Options for registering a worker."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
 
 
 @dataclass
 class WorkerAwaitOptions:
     """Options for awaiting a task."""
 
-    namespace: Optional[str] = None
-    block_ms: Optional[int] = None  # Block waiting for task (0 = infinite)
-    timeout_ms: Optional[int] = None
+    namespace: str | None = None
+    block_ms: int | None = None  # Block waiting for task (0 = infinite)
+    timeout_ms: int | None = None
 
 
 @dataclass
 class WorkerTouchOptions:
     """Options for extending task lease."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
     extend_ms: int = 30000
 
 
@@ -786,14 +785,14 @@ class WorkerTouchOptions:
 class WorkerCompleteOptions:
     """Options for completing a task."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
 
 
 @dataclass
 class WorkerFailOptions:
     """Options for failing a task."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
     retry: bool = True  # Whether to retry the task
 
 
@@ -801,5 +800,5 @@ class WorkerFailOptions:
 class WorkerListOptions:
     """Options for listing workers."""
 
-    namespace: Optional[str] = None
+    namespace: str | None = None
     limit: int = 100

@@ -7,7 +7,7 @@ This module provides low-level operations for actions and workers:
 For a higher-level API, see `Worker` in worker.py.
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from .types import (
     ActionDeleteOptions,
@@ -62,7 +62,7 @@ class ActionOperations:
         self,
         name: str,
         action_type: ActionType = ActionType.USER,
-        options: Optional[ActionRegisterOptions] = None,
+        options: ActionRegisterOptions | None = None,
     ) -> None:
         """Register an action.
 
@@ -92,7 +92,7 @@ class ActionOperations:
         self,
         name: str,
         input_data: bytes,
-        options: Optional[ActionInvokeOptions] = None,
+        options: ActionInvokeOptions | None = None,
     ) -> ActionInvokeResult:
         """Invoke an action.
 
@@ -127,7 +127,7 @@ class ActionOperations:
     async def status(
         self,
         run_id: str,
-        options: Optional[ActionStatusOptions] = None,
+        options: ActionStatusOptions | None = None,
     ) -> ActionRunStatus:
         """Get action run status.
 
@@ -158,7 +158,7 @@ class ActionOperations:
 
     async def list(
         self,
-        options: Optional[ActionListOptions] = None,
+        options: ActionListOptions | None = None,
     ) -> ActionListResult:
         """List registered actions.
 
@@ -186,7 +186,7 @@ class ActionOperations:
     async def delete(
         self,
         name: str,
-        options: Optional[ActionDeleteOptions] = None,
+        options: ActionDeleteOptions | None = None,
     ) -> None:
         """Delete an action.
 
@@ -219,7 +219,7 @@ class WorkerOperations:
         self,
         worker_id: str,
         task_types: list[str],
-        options: Optional[WorkerRegisterOptions] = None,
+        options: WorkerRegisterOptions | None = None,
     ) -> None:
         """Register a worker.
 
@@ -244,7 +244,7 @@ class WorkerOperations:
         self,
         worker_id: str,
         task_types: list[str],
-        options: Optional[WorkerAwaitOptions] = None,
+        options: WorkerAwaitOptions | None = None,
     ) -> WorkerAwaitResult:
         """Wait for a task assignment.
 
@@ -288,7 +288,7 @@ class WorkerOperations:
         self,
         worker_id: str,
         task_id: str,
-        options: Optional[WorkerTouchOptions] = None,
+        options: WorkerTouchOptions | None = None,
     ) -> None:
         """Extend task lease (heartbeat).
 
@@ -314,7 +314,7 @@ class WorkerOperations:
         worker_id: str,
         task_id: str,
         result: bytes,
-        options: Optional[WorkerCompleteOptions] = None,
+        options: WorkerCompleteOptions | None = None,
     ) -> None:
         """Complete a task successfully.
 
@@ -341,7 +341,7 @@ class WorkerOperations:
         worker_id: str,
         task_id: str,
         error_message: str,
-        options: Optional[WorkerFailOptions] = None,
+        options: WorkerFailOptions | None = None,
     ) -> None:
         """Fail a task.
 
@@ -371,7 +371,7 @@ class WorkerOperations:
 
     async def list(
         self,
-        options: Optional[WorkerListOptions] = None,
+        options: WorkerListOptions | None = None,
     ) -> WorkerListResult:
         """List registered workers.
 

@@ -3,7 +3,7 @@
 Key-value store operations for Flo client.
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from .types import (
     DeleteOptions,
@@ -31,8 +31,8 @@ class KVOperations:
     async def get(
         self,
         key: str | bytes,
-        options: Optional[GetOptions] = None,
-    ) -> Optional[bytes]:
+        options: GetOptions | None = None,
+    ) -> bytes | None:
         """Get value for a key.
 
         Args:
@@ -83,7 +83,7 @@ class KVOperations:
         self,
         key: str | bytes,
         value: bytes,
-        options: Optional[PutOptions] = None,
+        options: PutOptions | None = None,
     ) -> None:
         """Set a key-value pair.
 
@@ -133,7 +133,7 @@ class KVOperations:
     async def delete(
         self,
         key: str | bytes,
-        options: Optional[DeleteOptions] = None,
+        options: DeleteOptions | None = None,
     ) -> None:
         """Delete a key.
 
@@ -164,7 +164,7 @@ class KVOperations:
     async def scan(
         self,
         prefix: str | bytes,
-        options: Optional[ScanOptions] = None,
+        options: ScanOptions | None = None,
     ) -> ScanResult:
         """Scan keys with a prefix.
 
@@ -219,7 +219,7 @@ class KVOperations:
     async def history(
         self,
         key: str | bytes,
-        options: Optional[HistoryOptions] = None,
+        options: HistoryOptions | None = None,
     ) -> list[VersionEntry]:
         """Get version history for a key.
 

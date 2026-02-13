@@ -23,11 +23,11 @@ Example:
 import asyncio
 import json
 import logging
-import os
 import secrets
 import socket
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any
 
 from .client import FloClient
 from .types import ActionType, TaskAssignment, WorkerAwaitOptions, WorkerTouchOptions
@@ -45,7 +45,7 @@ class WorkerConfig:
 
     endpoint: str
     namespace: str = "default"
-    worker_id: Optional[str] = None
+    worker_id: str | None = None
     concurrency: int = 10
     action_timeout: float = 300.0  # 5 minutes
     block_ms: int = 30000
@@ -139,7 +139,7 @@ class Worker:
         endpoint: str,
         *,
         namespace: str = "default",
-        worker_id: Optional[str] = None,
+        worker_id: str | None = None,
         concurrency: int = 10,
         action_timeout: float = 300.0,
         block_ms: int = 30000,
@@ -166,12 +166,12 @@ class Worker:
             debug=debug,
         )
 
-        self._client: Optional[FloClient] = None
+        self._client: FloClient | None = None
         self._handlers: dict[str, ActionHandler] = {}
         self._running = False
         self._stop_event = asyncio.Event()
         self._tasks: set[asyncio.Task] = set()
-        self._semaphore: Optional[asyncio.Semaphore] = None
+        self._semaphore: asyncio.Semaphore | None = None
 
         if debug:
             logging.basicConfig(level=logging.DEBUG)
@@ -319,8 +319,7 @@ class Worker:
         """Execute a task with error handling."""
         try:
             logger.info(
-                f"Executing action: {task.task_type} "
-                f"(task={task.task_id}, attempt={task.attempt})"
+                f"Executing action: {task.task_type} (task={task.task_id}, attempt={task.attempt})"
             )
 
             # Get handler

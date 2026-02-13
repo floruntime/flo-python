@@ -3,7 +3,7 @@
 Queue operations for Flo client.
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from .types import (
     AckOptions,
@@ -34,7 +34,7 @@ class QueueOperations:
         self,
         queue: str,
         payload: bytes,
-        options: Optional[EnqueueOptions] = None,
+        options: EnqueueOptions | None = None,
     ) -> int:
         """Enqueue a message to a queue.
 
@@ -88,7 +88,7 @@ class QueueOperations:
         self,
         queue: str,
         count: int,
-        options: Optional[DequeueOptions] = None,
+        options: DequeueOptions | None = None,
     ) -> DequeueResult:
         """Dequeue messages from a queue.
 
@@ -146,7 +146,7 @@ class QueueOperations:
         self,
         queue: str,
         seqs: list[int],
-        options: Optional[AckOptions] = None,
+        options: AckOptions | None = None,
     ) -> None:
         """Acknowledge messages as successfully processed.
 
@@ -183,7 +183,7 @@ class QueueOperations:
         self,
         queue: str,
         seqs: list[int],
-        options: Optional[NackOptions] = None,
+        options: NackOptions | None = None,
     ) -> None:
         """Negative acknowledge messages (retry or send to DLQ).
 
@@ -224,7 +224,7 @@ class QueueOperations:
     async def dlq_list(
         self,
         queue: str,
-        options: Optional[DlqListOptions] = None,
+        options: DlqListOptions | None = None,
     ) -> DequeueResult:
         """List messages in the Dead Letter Queue.
 
@@ -261,7 +261,7 @@ class QueueOperations:
         self,
         queue: str,
         seqs: list[int],
-        options: Optional[DlqRequeueOptions] = None,
+        options: DlqRequeueOptions | None = None,
     ) -> None:
         """Move messages from DLQ back to the main queue.
 
@@ -295,7 +295,7 @@ class QueueOperations:
         self,
         queue: str,
         count: int,
-        options: Optional[PeekOptions] = None,
+        options: PeekOptions | None = None,
     ) -> DequeueResult:
         """Peek at messages without creating leases.
 
@@ -337,7 +337,7 @@ class QueueOperations:
         self,
         queue: str,
         seqs: list[int],
-        options: Optional[TouchOptions] = None,
+        options: TouchOptions | None = None,
     ) -> None:
         """Renew lease on messages to prevent visibility timeout.
 

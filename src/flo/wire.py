@@ -7,7 +7,6 @@ Header: 24 bytes, little-endian, CRC32 validated.
 import struct
 from binascii import crc32
 from dataclasses import dataclass
-from typing import Optional
 
 from .exceptions import (
     IncompleteResponseError,
@@ -98,19 +97,19 @@ class Option:
     tag: OptionTag
     data: bytes
 
-    def as_u8(self) -> Optional[int]:
+    def as_u8(self) -> int | None:
         """Get option value as u8."""
         if len(self.data) != 1:
             return None
         return self.data[0]
 
-    def as_u32(self) -> Optional[int]:
+    def as_u32(self) -> int | None:
         """Get option value as u32."""
         if len(self.data) != 4:
             return None
         return struct.unpack("<I", self.data)[0]
 
-    def as_u64(self) -> Optional[int]:
+    def as_u64(self) -> int | None:
         """Get option value as u64."""
         if len(self.data) != 8:
             return None
@@ -150,7 +149,7 @@ class OptionsIterator:
 
         return Option(tag=tag, data=data)
 
-    def find(self, tag: OptionTag) -> Optional[Option]:
+    def find(self, tag: OptionTag) -> Option | None:
         """Find a specific option by tag."""
         self._offset = 0
         for opt in self:
@@ -205,7 +204,9 @@ def serialize_request(
     """
     # Validate sizes
     if len(namespace) > MAX_NAMESPACE_SIZE:
-        raise NamespaceTooLargeError(f"Namespace too large: {len(namespace)} > {MAX_NAMESPACE_SIZE}")
+        raise NamespaceTooLargeError(
+            f"Namespace too large: {len(namespace)} > {MAX_NAMESPACE_SIZE}"
+        )
     if len(key) > MAX_KEY_SIZE:
         raise KeyTooLargeError(f"Key too large: {len(key)} > {MAX_KEY_SIZE}")
     if len(value) > MAX_VALUE_SIZE:
@@ -406,7 +407,7 @@ def parse_scan_response(data: bytes) -> ScanResult:
         value_len = struct.unpack("<I", data[offset : offset + 4])[0]
         offset += 4
 
-        value: Optional[bytes] = None
+        value: bytes | None = None
         if value_len > 0:
             if len(data) < offset + value_len:
                 raise IncompleteResponseError("Scan response value incomplete")
@@ -611,13 +612,15 @@ def parse_stream_read_response(data: bytes) -> StreamReadResult:
             raise IncompleteResponseError("Stream record: missing header count")
         pos += 4
 
-        records.append(StreamRecord(
-            sequence=sequence,
-            timestamp_ms=timestamp_ms,
-            tier=tier,
-            payload=payload,
-            headers=None,
-        ))
+        records.append(
+            StreamRecord(
+                sequence=sequence,
+                timestamp_ms=timestamp_ms,
+                tier=tier,
+                payload=payload,
+                headers=None,
+            )
+        )
 
     return StreamReadResult(records=records)
 
@@ -679,7 +682,7 @@ def serialize_action_register_value(
     action_type: int,
     timeout_ms: int,
     max_retries: int,
-    description: Optional[str] = None,
+    description: str | None = None,
 ) -> bytes:
     """Serialize action register value.
 
@@ -728,7 +731,7 @@ def serialize_action_register_value(
 def serialize_action_invoke_value(
     input_data: bytes,
     priority: int = 10,
-    idempotency_key: Optional[str] = None,
+    idempotency_key: str | None = None,
 ) -> bytes:
     """Serialize action invoke value.
 

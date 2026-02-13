@@ -24,7 +24,6 @@ Example:
 """
 
 from .client import FloClient
-from .worker import ActionContext, Worker, WorkerConfig
 from .exceptions import (
     BadRequestError,
     ConflictError,
@@ -54,6 +53,17 @@ from .exceptions import (
 from .types import (
     # KV types
     AckOptions,
+    # Action types
+    ActionDeleteOptions,
+    ActionInfo,
+    ActionInvokeOptions,
+    ActionInvokeResult,
+    ActionListOptions,
+    ActionListResult,
+    ActionRegisterOptions,
+    ActionRunStatus,
+    ActionStatusOptions,
+    ActionType,
     DeleteOptions,
     DequeueOptions,
     DequeueResult,
@@ -72,8 +82,6 @@ from .types import (
     ScanOptions,
     ScanResult,
     StatusCode,
-    TouchOptions,
-    VersionEntry,
     # Stream types
     StorageTier,
     StreamAppendOptions,
@@ -88,19 +96,10 @@ from .types import (
     StreamReadResult,
     StreamRecord,
     StreamTrimOptions,
-    # Action types
-    ActionDeleteOptions,
-    ActionInfo,
-    ActionInvokeOptions,
-    ActionInvokeResult,
-    ActionListOptions,
-    ActionListResult,
-    ActionRegisterOptions,
-    ActionRunStatus,
-    ActionStatusOptions,
-    ActionType,
     # Worker types
     TaskAssignment,
+    TouchOptions,
+    VersionEntry,
     WorkerAwaitOptions,
     WorkerAwaitResult,
     WorkerCompleteOptions,
@@ -112,6 +111,7 @@ from .types import (
     WorkerTask,
     WorkerTouchOptions,
 )
+from .worker import ActionContext, Worker, WorkerConfig
 
 __version__ = "0.1.0"
 

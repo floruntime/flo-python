@@ -5,7 +5,6 @@ Async client for connecting to Flo servers.
 
 import asyncio
 import logging
-from typing import Optional
 
 from .exceptions import (
     ConnectionFailedError,
@@ -50,8 +49,8 @@ class FloClient:
         self._timeout = timeout_ms / 1000.0  # Convert to seconds
         self._debug = debug
 
-        self._reader: Optional[asyncio.StreamReader] = None
-        self._writer: Optional[asyncio.StreamWriter] = None
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
         self._request_id: int = 0
         self._lock = asyncio.Lock()
 
@@ -59,10 +58,10 @@ class FloClient:
         self._host, self._port = self._parse_endpoint(endpoint)
 
         # Initialize operation mixins (will be set after import to avoid circular deps)
+        from .actions import ActionOperations, WorkerOperations
         from .kv import KVOperations
         from .queue import QueueOperations
         from .streams import StreamOperations
-        from .actions import ActionOperations, WorkerOperations
 
         self.kv = KVOperations(self)
         self.queue = QueueOperations(self)
@@ -235,9 +234,7 @@ class FloClient:
             if computed_crc != crc:
                 from .exceptions import InvalidChecksumError
 
-                raise InvalidChecksumError(
-                    f"CRC32 mismatch: 0x{computed_crc:08X} != 0x{crc:08X}"
-                )
+                raise InvalidChecksumError(f"CRC32 mismatch: 0x{computed_crc:08X} != 0x{crc:08X}")
 
             return RawResponse(status=status, data=response_data, request_id=resp_request_id)
 
@@ -278,6 +275,6 @@ class FloClient:
         raise_for_status(response.status, response.data)
         return response  # Unreachable, but makes type checker happy
 
-    def get_namespace(self, override: Optional[str]) -> str:
+    def get_namespace(self, override: str | None) -> str:
         """Get effective namespace, using override if provided."""
         return override if override is not None else self._namespace
