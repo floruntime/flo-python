@@ -402,8 +402,8 @@ class StorageTier(IntEnum):
 class StreamRecord:
     """A record in a stream."""
 
-    seq: int
-    timestamp: int
+    sequence: int
+    timestamp_ms: int
     tier: StorageTier = StorageTier.HOT
     payload: bytes = b""
     headers: Optional[dict[str, str]] = None
@@ -413,9 +413,8 @@ class StreamRecord:
 class StreamAppendResult:
     """Result of appending to a stream."""
 
-    first_offset: int
-    last_offset: int
-    count: int
+    sequence: int
+    timestamp_ms: int
 
 
 @dataclass
@@ -423,7 +422,6 @@ class StreamReadResult:
     """Result of reading from a stream."""
 
     records: list[StreamRecord]
-    next_offset: int = 0  # Sequence offset for next read (for pagination)
 
 
 @dataclass

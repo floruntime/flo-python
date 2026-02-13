@@ -53,11 +53,11 @@ class StreamOperations:
             options: Optional append options.
 
         Returns:
-            StreamAppendResult with first_offset, last_offset, count.
+            StreamAppendResult with sequence and timestamp_ms.
 
         Example:
             result = await client.stream.append("events", b'{"event": "click"}')
-            print(f"Appended at offset {result.first_offset}")
+            print(f"Appended: sequence={result.sequence} timestamp_ms={result.timestamp_ms}")
         """
         opts = options or StreamAppendOptions()
         namespace = self._client.get_namespace(opts.namespace)
@@ -86,7 +86,7 @@ class StreamOperations:
             options: Optional read options (start, end, tail, partition, count, block_ms).
 
         Returns:
-            StreamReadResult with list of records and next_offset.
+            StreamReadResult with list of records.
 
         Example:
             # Read from beginning

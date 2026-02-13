@@ -524,24 +524,23 @@ def serialize_seqs(seqs: list[int]) -> bytes:
 def parse_stream_append_response(data: bytes) -> StreamAppendResult:
     """Parse stream append response data.
 
-    Format: [first_offset:u64][last_offset:u64][count:u32]
+    Format: [sequence:u64][timestamp_ms:i64]
     """
-    if len(data) < 20:
+    if len(data) < 16:
         raise IncompleteResponseError("Stream append response too short")
 
-    first_offset = struct.unpack("<Q", data[0:8])[0]
-    last_offset = struct.unpack("<Q", data[8:16])[0]
-    count = struct.unpack("<I", data[16:20])[0]
+    sequence = struct.unpack("<Q", data[0:8])[0]
+    timestamp_ms = struct.unpack("<q", data[8:16])[0]
 
-    return StreamAppendResult(first_offset=first_offset, last_offset=last_offset, count=count)
+    return StreamAppendResult(sequence=sequence, timestamp_ms=timestamp_ms)
 
 
 def parse_stream_read_response(data: bytes) -> StreamReadResult:
     """Parse stream read response data.
 
-    Wire format: [count:u32]([offset:u64][timestamp:i64][tier:u8][partition:u32]
+    Wire format: [count:u32]([sequence:u64][timestamp_ms:i64][tier:u8][partition:u32]
                  [key_present:u8][key_len:u32]?[key]?[payload_len:u32][payload]
-                 [header_count:u32])*[next_offset:u64]
+                 [header_count:u32])*
     """
     if len(data) < 4:
         # Empty response is valid (no records)
@@ -557,16 +556,16 @@ def parse_stream_read_response(data: bytes) -> StreamReadResult:
         if pos >= len(data):
             break
 
-        # Read offset (seq)
+        # Read sequence
         if pos + 8 > len(data):
-            raise IncompleteResponseError("Stream record: missing offset")
-        seq = struct.unpack("<Q", data[pos : pos + 8])[0]
+            raise IncompleteResponseError("Stream record: missing sequence")
+        sequence = struct.unpack("<Q", data[pos : pos + 8])[0]
         pos += 8
 
-        # Read timestamp
+        # Read timestamp_ms
         if pos + 8 > len(data):
-            raise IncompleteResponseError("Stream record: missing timestamp")
-        timestamp = struct.unpack("<q", data[pos : pos + 8])[0]
+            raise IncompleteResponseError("Stream record: missing timestamp_ms")
+        timestamp_ms = struct.unpack("<q", data[pos : pos + 8])[0]
         pos += 8
 
         # Read tier
@@ -613,19 +612,14 @@ def parse_stream_read_response(data: bytes) -> StreamReadResult:
         pos += 4
 
         records.append(StreamRecord(
-            seq=seq,
-            timestamp=timestamp,
+            sequence=sequence,
+            timestamp_ms=timestamp_ms,
             tier=tier,
             payload=payload,
             headers=None,
         ))
 
-    # Read next_offset (at end of response)
-    next_offset = 0
-    if pos + 8 <= len(data):
-        next_offset = struct.unpack("<Q", data[pos : pos + 8])[0]
-
-    return StreamReadResult(records=records, next_offset=next_offset)
+    return StreamReadResult(records=records)
 
 
 def parse_stream_info_response(data: bytes) -> StreamInfo:
