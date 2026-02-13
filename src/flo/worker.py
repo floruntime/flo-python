@@ -45,7 +45,7 @@ class WorkerConfig:
 
     endpoint: str
     namespace: str = "default"
-    worker_id: str | None = None
+    worker_id: str = ""
     concurrency: int = 10
     action_timeout: float = 300.0  # 5 minutes
     block_ms: int = 30000
@@ -170,7 +170,7 @@ class Worker:
         self._handlers: dict[str, ActionHandler] = {}
         self._running = False
         self._stop_event = asyncio.Event()
-        self._tasks: set[asyncio.Task] = set()
+        self._tasks: set[asyncio.Task[None]] = set()
         self._semaphore: asyncio.Semaphore | None = None
 
         if debug:
@@ -281,6 +281,8 @@ class Worker:
 
     async def _poll_loop(self, action_names: list[str]) -> None:
         """Main polling loop for tasks."""
+        assert self._client is not None
+        assert self._semaphore is not None
         while self._running and not self._stop_event.is_set():
             try:
                 # Wait for semaphore slot
@@ -317,6 +319,8 @@ class Worker:
 
     async def _execute_task(self, task: TaskAssignment) -> None:
         """Execute a task with error handling."""
+        assert self._client is not None
+        assert self._semaphore is not None
         try:
             logger.info(
                 f"Executing action: {task.task_type} (task={task.task_id}, attempt={task.attempt})"
@@ -387,7 +391,8 @@ class Worker:
             logger.error(f"Failed to report task result: {e}")
 
         finally:
-            self._semaphore.release()
+            if self._semaphore is not None:
+                self._semaphore.release()
 
     async def _touch_task(self, task_id: str, extend_ms: int) -> None:
         """Extend lease on a task (internal method)."""

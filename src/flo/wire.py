@@ -109,13 +109,15 @@ class Option:
         """Get option value as u32."""
         if len(self.data) != 4:
             return None
-        return struct.unpack("<I", self.data)[0]
+        result: int = struct.unpack("<I", self.data)[0]
+        return result
 
     def as_u64(self) -> int | None:
         """Get option value as u64."""
         if len(self.data) != 8:
             return None
-        return struct.unpack("<Q", self.data)[0]
+        result: int = struct.unpack("<Q", self.data)[0]
+        return result
 
     def as_string(self) -> str:
         """Get option value as UTF-8 string."""
@@ -504,7 +506,8 @@ def parse_enqueue_response(data: bytes) -> int:
     if len(data) < 8:
         raise IncompleteResponseError("Enqueue response too short")
 
-    return struct.unpack("<Q", data[:8])[0]
+    result: int = struct.unpack("<Q", data[:8])[0]
+    return result
 
 
 def serialize_seqs(seqs: list[int]) -> bytes:
@@ -547,7 +550,7 @@ def parse_stream_read_response(data: bytes) -> StreamReadResult:
     """
     if len(data) < 4:
         # Empty response is valid (no records)
-        return StreamReadResult(records=[], next_offset=0)
+        return StreamReadResult(records=[])
 
     pos = 0
 
