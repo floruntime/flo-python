@@ -3,6 +3,8 @@
 Exception classes for Flo client errors.
 """
 
+import contextlib
+
 from .types import StatusCode
 
 
@@ -204,10 +206,8 @@ def raise_for_status(status: StatusCode, data: bytes = b"") -> None:
     # Try to decode error message from data
     message = status.message()
     if data:
-        try:
+        with contextlib.suppress(UnicodeDecodeError, ValueError):
             message = data.decode("utf-8")
-        except (UnicodeDecodeError, ValueError):
-            pass
 
     error_map = {
         StatusCode.NOT_FOUND: NotFoundError,

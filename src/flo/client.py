@@ -4,6 +4,7 @@ Async client for connecting to Flo servers.
 """
 
 import asyncio
+import contextlib
 import logging
 
 from .exceptions import (
@@ -130,10 +131,8 @@ class FloClient:
         """Close the connection."""
         if self._writer:
             self._writer.close()
-            try:
+            with contextlib.suppress(Exception):
                 await self._writer.wait_closed()
-            except Exception:
-                pass
             self._writer = None
             self._reader = None
             if self._debug:

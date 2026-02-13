@@ -8,6 +8,7 @@ import struct
 from binascii import crc32
 from dataclasses import dataclass
 
+from . import types as types
 from .exceptions import (
     IncompleteResponseError,
     InvalidChecksumError,
@@ -39,7 +40,8 @@ from .types import (
     VersionEntry,
 )
 
-# Header format: magic(u32) + payload_len(u32) + request_id(u64) + crc32(u32) + version(u8) + op_code/status(u8) + flags(u8) + reserved(u8)
+# Header: magic(u32) + payload_len(u32) + request_id(u64)
+#   + crc32(u32) + version(u8) + status(u8) + flags(u8) + reserved(u8)
 REQUEST_HEADER_FORMAT = "<IIQIBBBB"
 RESPONSE_HEADER_FORMAT = "<IIQIBBBB"
 
@@ -868,14 +870,12 @@ def serialize_worker_list_value(limit: int = 100) -> bytes:
     return struct.pack("<I", limit)
 
 
-def parse_task_assignment(data: bytes) -> "TaskAssignment":
+def parse_task_assignment(data: bytes) -> "types.TaskAssignment":
     """Parse task assignment from server response.
 
     Format: [task_id_len:u16][task_id][task_type_len:u16][task_type]
             [created_at:i64][attempt:u32][payload...]
     """
-    from .types import TaskAssignment
-
     if len(data) < 10:
         raise ValueError("Incomplete task assignment response")
 
@@ -914,7 +914,7 @@ def parse_task_assignment(data: bytes) -> "TaskAssignment":
     # payload (rest of data)
     payload = data[pos:]
 
-    return TaskAssignment(
+    return types.TaskAssignment(
         task_id=task_id,
         task_type=task_type,
         payload=payload,

@@ -266,7 +266,7 @@ class OptionTag(IntEnum):
     WAIT_MS = 0x18  # u32: Watch timeout - wait for NEXT version change (0=forever)
 
     # Stream Options (0x20 - 0x2F) - StreamID-native ONLY
-    # All stream positioning uses StreamID (timestamp_ms + sequence) - no legacy offset/timestamp modes
+    # All stream positioning uses StreamID (timestamp_ms + sequence)
     # 0x20 reserved
     STREAM_START = 0x21  # [16]u8: Start StreamID for reads (inclusive)
     STREAM_END = 0x22  # [16]u8: End StreamID for reads (inclusive)
