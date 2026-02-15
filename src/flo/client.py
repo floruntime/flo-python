@@ -6,6 +6,7 @@ Async client for connecting to Flo servers.
 import asyncio
 import contextlib
 import logging
+from typing import TYPE_CHECKING
 
 from .exceptions import (
     ConnectionFailedError,
@@ -16,6 +17,9 @@ from .exceptions import (
 )
 from .types import HEADER_SIZE, OpCode, StatusCode
 from .wire import RawResponse, parse_response_header, serialize_request
+
+if TYPE_CHECKING:
+    from .worker import Worker
 
 logger = logging.getLogger("flo")
 
