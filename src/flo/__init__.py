@@ -96,6 +96,7 @@ from .types import (
     StreamAppendResult,
     StreamGroupAckOptions,
     StreamGroupJoinOptions,
+    StreamGroupNackOptions,
     StreamGroupReadOptions,
     StreamID,
     StreamInfo,
@@ -194,6 +195,7 @@ __all__ = [
     "StreamGroupJoinOptions",
     "StreamGroupReadOptions",
     "StreamGroupAckOptions",
+    "StreamGroupNackOptions",
     # Action types
     "ActionType",
     "ActionInfo",

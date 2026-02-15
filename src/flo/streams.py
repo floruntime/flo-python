@@ -13,6 +13,7 @@ from .types import (
     StreamAppendResult,
     StreamGroupAckOptions,
     StreamGroupJoinOptions,
+    StreamGroupNackOptions,
     StreamGroupReadOptions,
     StreamInfo,
     StreamInfoOptions,
@@ -351,14 +352,15 @@ class StreamOperations:
             stream: Stream name.
             group: Consumer group name.
             seqs: Sequence numbers of records to acknowledge.
-            options: Optional ack options.
+            options: Optional ack options (including consumer name).
 
         Example:
             result = await client.stream.group_read("events", "processors", "worker-1")
             for record in result.records:
                 try:
                     process(record.payload)
-                    await client.stream.group_ack("events", "processors", [record.seq])
+                    await client.stream.group_ack("events", "processors", [record.seq],
+                        StreamGroupAckOptions(consumer="worker-1"))
                 except Exception:
                     pass  # Record will be redelivered
         """
@@ -368,12 +370,57 @@ class StreamOperations:
         opts = options or StreamGroupAckOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        value = serialize_group_ack_value(group, seqs)
+        value = serialize_group_ack_value(group, seqs, consumer=opts.consumer)
 
         await self._client._send_and_check(
             OpCode.STREAM_GROUP_ACK,
             namespace,
             stream.encode("utf-8"),
             value,
+            allow_not_found=True,
+        )
+
+    async def group_nack(
+        self,
+        stream: str,
+        group: str,
+        seqs: list[int],
+        options: StreamGroupNackOptions | None = None,
+    ) -> None:
+        """Negatively acknowledge records in a consumer group for redelivery.
+
+        Args:
+            stream: Stream name.
+            group: Consumer group name.
+            seqs: Sequence numbers of records to negatively acknowledge.
+            options: Optional nack options (consumer name, redelivery delay).
+
+        Example:
+            result = await client.stream.group_read("events", "processors", "worker-1")
+            for record in result.records:
+                try:
+                    process(record.payload)
+                except Exception:
+                    await client.stream.group_nack("events", "processors", [record.seq],
+                        StreamGroupNackOptions(consumer="worker-1", redelivery_delay_ms=5000))
+        """
+        if not seqs:
+            return
+
+        opts = options or StreamGroupNackOptions()
+        namespace = self._client.get_namespace(opts.namespace)
+
+        value = serialize_group_ack_value(group, seqs, consumer=opts.consumer)
+
+        builder = OptionsBuilder()
+        if opts.redelivery_delay_ms is not None:
+            builder.add_u32(OptionTag.REDELIVERY_DELAY_MS, opts.redelivery_delay_ms)
+
+        await self._client._send_and_check(
+            OpCode.STREAM_GROUP_NACK,
+            namespace,
+            stream.encode("utf-8"),
+            value,
+            builder.build(),
             allow_not_found=True,
         )

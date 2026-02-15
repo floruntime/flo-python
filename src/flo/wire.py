@@ -633,17 +633,21 @@ def parse_stream_read_response(data: bytes) -> StreamReadResult:
 def parse_stream_info_response(data: bytes) -> StreamInfo:
     """Parse stream info response data.
 
-    Format: [first_seq:u64][last_seq:u64][count:u64][bytes:u64]
+    Format: [first_seq:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32]
     """
-    if len(data) < 32:
+    if len(data) < 36:
         raise IncompleteResponseError("Stream info response too short")
 
     first_seq = struct.unpack("<Q", data[0:8])[0]
     last_seq = struct.unpack("<Q", data[8:16])[0]
     count = struct.unpack("<Q", data[16:24])[0]
     bytes_size = struct.unpack("<Q", data[24:32])[0]
+    partition_count = struct.unpack("<I", data[32:36])[0]
 
-    return StreamInfo(first_seq=first_seq, last_seq=last_seq, count=count, bytes_size=bytes_size)
+    return StreamInfo(
+        first_seq=first_seq, last_seq=last_seq, count=count,
+        bytes_size=bytes_size, partition_count=partition_count,
+    )
 
 
 def serialize_group_value(group: str, consumer: str) -> bytes:
@@ -662,16 +666,19 @@ def serialize_group_value(group: str, consumer: str) -> bytes:
     return bytes(result)
 
 
-def serialize_group_ack_value(group: str, seqs: list[int]) -> bytes:
-    """Serialize group name and sequence numbers for group ack.
+def serialize_group_ack_value(group: str, seqs: list[int], consumer: str = "") -> bytes:
+    """Serialize group name, consumer, and sequence numbers for group ack/nack.
 
-    Format: [group_len:u16][group][count:u32][seq:u64]*
+    Format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][seq:u64]*
     """
     group_bytes = group.encode("utf-8")
+    consumer_bytes = consumer.encode("utf-8")
 
     result = bytearray()
     result.extend(struct.pack("<H", len(group_bytes)))
     result.extend(group_bytes)
+    result.extend(struct.pack("<H", len(consumer_bytes)))
+    result.extend(consumer_bytes)
     result.extend(struct.pack("<I", len(seqs)))
     for seq in seqs:
         result.extend(struct.pack("<Q", seq))

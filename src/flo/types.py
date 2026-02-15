@@ -368,15 +368,15 @@ class StreamID:
     sequence: int = 0
 
     def to_bytes(self) -> bytes:
-        """Serialize the StreamID to 16 bytes (little-endian)."""
-        return struct.pack("<QQ", self.timestamp_ms, self.sequence)
+        """Serialize the StreamID to 16 bytes (big-endian for lexicographic sorting)."""
+        return struct.pack(">QQ", self.timestamp_ms, self.sequence)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "StreamID":
-        """Parse a StreamID from 16 bytes (little-endian)."""
+        """Parse a StreamID from 16 bytes (big-endian)."""
         if len(data) < 16:
             raise ValueError(f"Invalid StreamID: expected 16 bytes, got {len(data)}")
-        ts, seq = struct.unpack("<QQ", data[:16])
+        ts, seq = struct.unpack(">QQ", data[:16])
         return cls(timestamp_ms=ts, sequence=seq)
 
     @classmethod
@@ -431,6 +431,7 @@ class StreamInfo:
     last_seq: int
     count: int
     bytes_size: int
+    partition_count: int = 1
 
 
 # =============================================================================
@@ -613,6 +614,16 @@ class StreamGroupAckOptions:
     """Options for acknowledging records in a consumer group."""
 
     namespace: str | None = None
+    consumer: str = ""  # Consumer ID (required for correct ack matching)
+
+
+@dataclass
+class StreamGroupNackOptions:
+    """Options for negatively acknowledging records in a consumer group."""
+
+    namespace: str | None = None
+    consumer: str = ""  # Consumer ID (required for correct nack matching)
+    redelivery_delay_ms: int | None = None  # Delay before message becomes visible again
 
 
 # =============================================================================
