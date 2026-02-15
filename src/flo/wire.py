@@ -645,8 +645,11 @@ def parse_stream_info_response(data: bytes) -> StreamInfo:
     partition_count = struct.unpack("<I", data[32:36])[0]
 
     return StreamInfo(
-        first_seq=first_seq, last_seq=last_seq, count=count,
-        bytes_size=bytes_size, partition_count=partition_count,
+        first_seq=first_seq,
+        last_seq=last_seq,
+        count=count,
+        bytes_size=bytes_size,
+        partition_count=partition_count,
     )
 
 
