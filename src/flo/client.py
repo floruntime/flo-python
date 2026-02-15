@@ -282,3 +282,41 @@ class FloClient:
     def get_namespace(self, override: str | None) -> str:
         """Get effective namespace, using override if provided."""
         return override if override is not None else self._namespace
+
+    def new_worker(
+        self,
+        *,
+        worker_id: str | None = None,
+        concurrency: int = 10,
+        action_timeout: float = 300.0,
+        block_ms: int = 30000,
+    ) -> "Worker":
+        """Create a new Worker from this client.
+
+        The worker inherits the client's endpoint and namespace, and creates
+        a dedicated connection for polling tasks.
+
+        Args:
+            worker_id: Unique worker identifier (auto-generated if not provided).
+            concurrency: Maximum number of concurrent actions.
+            action_timeout: Timeout for action handlers in seconds.
+            block_ms: Timeout for blocking dequeue in milliseconds.
+
+        Returns:
+            A new Worker instance ready to register actions and start.
+
+        Example:
+            async with FloClient("localhost:3000", namespace="myapp") as client:
+                worker = client.new_worker(concurrency=5)
+                worker.register_action("process-order", process_order)
+                await worker.start()
+        """
+        from .worker import Worker
+
+        return Worker(
+            self,
+            worker_id=worker_id,
+            concurrency=concurrency,
+            action_timeout=action_timeout,
+            block_ms=block_ms,
+        )

@@ -2,23 +2,31 @@
 
 A Python client for the Flo distributed systems platform.
 
+All primitives are accessed as attributes on a connected FloClient:
+
 Example:
     import asyncio
     from flo import FloClient
 
     async def main():
-        async with FloClient("localhost:9000") as client:
+        async with FloClient("localhost:9000", namespace="myapp") as client:
             # KV operations
             await client.kv.put("key", b"value")
             value = await client.kv.get("key")
-            print(f"Got: {value}")
 
             # Queue operations
-            seq = await client.queue.enqueue("tasks", b'{"task": "process"}')
-            result = await client.queue.dequeue("tasks", 10)
-            for msg in result.messages:
-                print(f"Message: {msg.payload}")
-                await client.queue.ack("tasks", [msg.seq])
+            await client.queue.enqueue("tasks", b'{"task": "process"}')
+
+            # Stream operations
+            await client.stream.append("events", b'{"event": "click"}')
+
+            # Action operations
+            await client.action.invoke("process", b'{}')
+
+            # Worker (created from client)
+            worker = client.new_worker(concurrency=5)
+            worker.register_action("my-action", handler)
+            await worker.start()
 
     asyncio.run(main())
 """
@@ -111,7 +119,7 @@ from .types import (
     WorkerTask,
     WorkerTouchOptions,
 )
-from .worker import ActionContext, Worker, WorkerConfig
+from .worker import ActionContext, Worker, WorkerOptions
 
 __version__ = "0.1.0"
 
@@ -120,7 +128,7 @@ __all__ = [
     "FloClient",
     # High-level Worker API
     "Worker",
-    "WorkerConfig",
+    "WorkerOptions",
     "ActionContext",
     # Exceptions
     "FloError",

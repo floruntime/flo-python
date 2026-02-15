@@ -3,7 +3,7 @@
 Provides an easy-to-use Worker class for executing actions.
 
 Example:
-    from flo import Worker, ActionContext
+    from flo import FloClient, ActionContext
 
     async def process_order(ctx: ActionContext) -> bytes:
         order = ctx.json()
@@ -11,13 +11,10 @@ Example:
         return ctx.to_bytes({"status": "completed"})
 
     async def main():
-        worker = Worker(
-            endpoint="localhost:3000",
-            namespace="myapp",
-        )
-        worker.action("process-order")(process_order)
-
-        await worker.start()
+        async with FloClient("localhost:3000", namespace="myapp") as client:
+            worker = client.new_worker(concurrency=5)
+            worker.action("process-order")(process_order)
+            await worker.start()
 """
 
 import asyncio
@@ -40,16 +37,16 @@ ActionHandler = Callable[["ActionContext"], Awaitable[bytes]]
 
 
 @dataclass
-class WorkerConfig:
-    """Configuration for a Flo worker."""
+class WorkerOptions:
+    """Configuration for a Flo worker.
 
-    endpoint: str
-    namespace: str = "default"
+    Endpoint and namespace are inherited from the parent FloClient.
+    """
+
     worker_id: str = ""
     concurrency: int = 10
     action_timeout: float = 300.0  # 5 minutes
     block_ms: int = 30000
-    debug: bool = False
 
 
 @dataclass
@@ -122,48 +119,44 @@ class ActionContext:
 class Worker:
     """High-level Flo worker for executing actions.
 
+    Created from a FloClient via ``client.new_worker()``.
+
     Example:
-        worker = Worker(endpoint="localhost:3000", namespace="myapp")
+        async with FloClient("localhost:3000", namespace="myapp") as client:
+            worker = client.new_worker(concurrency=5)
 
-        @worker.action("process-order")
-        async def process_order(ctx: ActionContext) -> bytes:
-            order = ctx.json()
-            # Process the order...
-            return ctx.to_bytes({"status": "completed"})
+            @worker.action("process-order")
+            async def process_order(ctx: ActionContext) -> bytes:
+                order = ctx.json()
+                return ctx.to_bytes({"status": "completed"})
 
-        await worker.start()
+            await worker.start()
     """
 
     def __init__(
         self,
-        endpoint: str,
+        parent_client: "FloClient",
         *,
-        namespace: str = "default",
         worker_id: str | None = None,
         concurrency: int = 10,
         action_timeout: float = 300.0,
         block_ms: int = 30000,
-        debug: bool = False,
     ):
-        """Initialize a Flo worker.
+        """Initialize a Flo worker from a connected client.
 
         Args:
-            endpoint: Server endpoint in "host:port" format.
-            namespace: Namespace for operations.
+            parent_client: The parent FloClient whose endpoint and namespace are used.
             worker_id: Unique worker identifier (auto-generated if not provided).
             concurrency: Maximum number of concurrent actions.
             action_timeout: Timeout for action handlers in seconds.
             block_ms: Timeout for blocking dequeue in milliseconds.
-            debug: Enable debug logging.
         """
-        self.config = WorkerConfig(
-            endpoint=endpoint,
-            namespace=namespace,
+        self._parent_client = parent_client
+        self.config = WorkerOptions(
             worker_id=worker_id or self._generate_worker_id(),
             concurrency=concurrency,
             action_timeout=action_timeout,
             block_ms=block_ms,
-            debug=debug,
         )
 
         self._client: FloClient | None = None
@@ -172,9 +165,6 @@ class Worker:
         self._stop_event = asyncio.Event()
         self._tasks: set[asyncio.Task[None]] = set()
         self._semaphore: asyncio.Semaphore | None = None
-
-        if debug:
-            logging.basicConfig(level=logging.DEBUG)
 
     @staticmethod
     def _generate_worker_id() -> str:
@@ -235,14 +225,14 @@ class Worker:
 
         logger.info(
             f"Starting Flo worker (id={self.config.worker_id}, "
-            f"namespace={self.config.namespace}, concurrency={self.config.concurrency})"
+            f"namespace={self._parent_client.namespace}, concurrency={self.config.concurrency})"
         )
 
-        # Connect to server
+        # Create a dedicated connection using the parent client's endpoint and namespace
         self._client = FloClient(
-            self.config.endpoint,
-            namespace=self.config.namespace,
-            debug=self.config.debug,
+            self._parent_client._endpoint,
+            namespace=self._parent_client.namespace,
+            debug=self._parent_client._debug,
         )
         await self._client.connect()
 
@@ -344,7 +334,7 @@ class Worker:
                 payload=task.payload,
                 attempt=task.attempt,
                 created_at=task.created_at,
-                namespace=self.config.namespace,
+                namespace=self._parent_client.namespace,
                 _worker=self,
             )
 

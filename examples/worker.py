@@ -9,7 +9,7 @@ import os
 import signal
 from dataclasses import dataclass
 
-from flo import ActionContext, Worker
+from flo import ActionContext, FloClient
 
 # Configure logging
 logging.basicConfig(
@@ -158,13 +158,18 @@ async def generate_report(ctx: ActionContext) -> bytes:
 
 
 async def main():
-    # Create worker with configuration
-    worker = Worker(
-        endpoint=os.getenv("FLO_ENDPOINT", "localhost:3000"),
+    # Create and connect client (shared configuration)
+    client = FloClient(
+        os.getenv("FLO_ENDPOINT", "localhost:3000"),
         namespace=os.getenv("FLO_NAMESPACE", "myapp"),
+        debug=os.getenv("FLO_DEBUG", "").lower() in ("1", "true"),
+    )
+    await client.connect()
+
+    # Create a worker from the client
+    worker = client.new_worker(
         concurrency=5,
         action_timeout=300,  # 5 minutes
-        debug=os.getenv("FLO_DEBUG", "").lower() in ("1", "true"),
     )
 
     # Register action handlers using register_action()
@@ -202,6 +207,7 @@ async def main():
         logger.info("Interrupted")
     finally:
         await worker.close()
+        await client.close()
         logger.info("Worker shutdown complete")
 
 

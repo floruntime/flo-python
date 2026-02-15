@@ -423,39 +423,20 @@ await client.worker.touch(
 
 ```python
 import asyncio
-from flo import FloClient, WorkerAwaitOptions, WorkerFailOptions
+from flo import FloClient
 
 async def run_worker():
-    async with FloClient("localhost:9000") as client:
-        worker_id = "worker-1"
-        task_types = ["process-image"]
+    async with FloClient("localhost:9000", namespace="myapp") as client:
+        # Create a worker from the client
+        worker = client.new_worker(concurrency=5)
 
-        # Register the worker
-        await client.worker.register(worker_id, task_types)
+        @worker.action("process-image")
+        async def process_image(ctx):
+            data = ctx.json()
+            result = await do_processing(data)
+            return ctx.to_bytes({"status": "done"})
 
-        while True:
-            # Wait for tasks
-            result = await client.worker.await_task(
-                worker_id,
-                task_types,
-                WorkerAwaitOptions(block_ms=30000)
-            )
-
-            if not result.task:
-                continue
-
-            task = result.task
-            try:
-                # Process task
-                output = await process_image(task.input)
-                await client.worker.complete(worker_id, task.task_id, output)
-            except Exception as e:
-                await client.worker.fail(
-                    worker_id,
-                    task.task_id,
-                    str(e),
-                    WorkerFailOptions(retry=True)
-                )
+        await worker.start()
 
 asyncio.run(run_worker())
 ```
