@@ -231,11 +231,40 @@ class WorkerOperations:
         opts = options or WorkerRegisterOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        value = serialize_worker_register_value(task_types)
+        value = serialize_worker_register_value(
+            task_types,
+            max_concurrency=opts.concurrency,
+            metadata=opts.metadata,
+            machine_id=opts.machine_id,
+        )
 
         await self._client._send_and_check(
             OpCode.WORKER_REGISTER,
             namespace,
+            worker_id.encode("utf-8"),
+            value,
+        )
+
+    async def heartbeat(
+        self,
+        worker_id: str,
+        current_load: int = 0,
+        namespace: str | None = None,
+    ) -> None:
+        """Send a worker heartbeat to keep the registration alive.
+
+        Args:
+            worker_id: Worker identifier.
+            current_load: Current number of active tasks.
+            namespace: Optional namespace override.
+        """
+        import struct
+
+        ns = self._client.get_namespace(namespace)
+        value = struct.pack("<I", current_load)
+        await self._client._send_and_check(
+            OpCode.WORKER_HEARTBEAT,
+            ns,
             worker_id.encode("utf-8"),
             value,
         )
@@ -269,7 +298,7 @@ class WorkerOperations:
             options_builder.add_u32(OptionTag.TIMEOUT_MS, opts.timeout_ms)
 
         response = await self._client._send_and_check(
-            OpCode.WORKER_AWAIT,
+            OpCode.ACTION_AWAIT,
             namespace,
             worker_id.encode("utf-8"),
             value,
@@ -287,6 +316,7 @@ class WorkerOperations:
     async def touch(
         self,
         worker_id: str,
+        action_name: str,
         task_id: str,
         options: WorkerTouchOptions | None = None,
     ) -> None:
@@ -294,16 +324,17 @@ class WorkerOperations:
 
         Args:
             worker_id: Worker identifier.
+            action_name: Action name for routing.
             task_id: Task identifier to extend.
             options: Optional touch options (extend_ms).
         """
         opts = options or WorkerTouchOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        value = serialize_worker_touch_value(task_id, opts.extend_ms)
+        value = serialize_worker_touch_value(action_name, task_id, opts.extend_ms)
 
         await self._client._send_and_check(
-            OpCode.WORKER_TOUCH,
+            OpCode.ACTION_TOUCH,
             namespace,
             worker_id.encode("utf-8"),
             value,
@@ -312,6 +343,7 @@ class WorkerOperations:
     async def complete(
         self,
         worker_id: str,
+        action_name: str,
         task_id: str,
         result: bytes,
         options: WorkerCompleteOptions | None = None,
@@ -320,6 +352,7 @@ class WorkerOperations:
 
         Args:
             worker_id: Worker identifier.
+            action_name: Action name for routing.
             task_id: Task identifier to complete.
             result: Result data from the task.
             options: Optional complete options.
@@ -327,10 +360,10 @@ class WorkerOperations:
         opts = options or WorkerCompleteOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        value = serialize_worker_complete_value(task_id, result)
+        value = serialize_worker_complete_value(action_name, task_id, result)
 
         await self._client._send_and_check(
-            OpCode.WORKER_COMPLETE,
+            OpCode.ACTION_COMPLETE,
             namespace,
             worker_id.encode("utf-8"),
             value,
@@ -339,6 +372,7 @@ class WorkerOperations:
     async def fail(
         self,
         worker_id: str,
+        action_name: str,
         task_id: str,
         error_message: str,
         options: WorkerFailOptions | None = None,
@@ -347,6 +381,7 @@ class WorkerOperations:
 
         Args:
             worker_id: Worker identifier.
+            action_name: Action name for routing.
             task_id: Task identifier that failed.
             error_message: Error message describing the failure.
             options: Optional fail options (retry flag).
@@ -354,7 +389,7 @@ class WorkerOperations:
         opts = options or WorkerFailOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        value = serialize_worker_fail_value(task_id, error_message)
+        value = serialize_worker_fail_value(action_name, task_id, error_message)
 
         # Retry flag goes in TLV options (matches Go SDK)
         options_builder = OptionsBuilder()
@@ -362,7 +397,7 @@ class WorkerOperations:
             options_builder.add_flag(OptionTag.RETRY)
 
         await self._client._send_and_check(
-            OpCode.WORKER_FAIL,
+            OpCode.ACTION_FAIL,
             namespace,
             worker_id.encode("utf-8"),
             value,

@@ -19,7 +19,7 @@ from .types import HEADER_SIZE, OpCode, StatusCode
 from .wire import RawResponse, parse_response_header, serialize_request
 
 if TYPE_CHECKING:
-    from .worker import Worker
+    from .worker import ActionWorker, StreamRecordHandler, StreamWorker
 
 logger = logging.getLogger("flo")
 
@@ -287,15 +287,15 @@ class FloClient:
         """Get effective namespace, using override if provided."""
         return override if override is not None else self._namespace
 
-    def new_worker(
+    def new_action_worker(
         self,
         *,
         worker_id: str | None = None,
         concurrency: int = 10,
         action_timeout: float = 300.0,
         block_ms: int = 30000,
-    ) -> "Worker":
-        """Create a new Worker from this client.
+    ) -> "ActionWorker":
+        """Create a new ActionWorker from this client.
 
         The worker inherits the client's endpoint and namespace, and creates
         a dedicated connection for polling tasks.
@@ -307,20 +307,78 @@ class FloClient:
             block_ms: Timeout for blocking dequeue in milliseconds.
 
         Returns:
-            A new Worker instance ready to register actions and start.
+            A new ActionWorker instance ready to register actions and start.
 
         Example:
             async with FloClient("localhost:3000", namespace="myapp") as client:
-                worker = client.new_worker(concurrency=5)
+                worker = client.new_action_worker(concurrency=5)
                 worker.register_action("process-order", process_order)
                 await worker.start()
         """
-        from .worker import Worker
+        from .worker import ActionWorker
 
-        return Worker(
+        return ActionWorker(
             self,
             worker_id=worker_id,
             concurrency=concurrency,
             action_timeout=action_timeout,
             block_ms=block_ms,
+        )
+
+    def new_stream_worker(
+        self,
+        *,
+        stream: str,
+        group: str,
+        handler: "StreamRecordHandler",
+        consumer: str | None = None,
+        worker_id: str | None = None,
+        concurrency: int = 10,
+        batch_size: int = 10,
+        block_ms: int = 30000,
+        message_timeout: float = 300.0,
+    ) -> "StreamWorker":
+        """Create a new StreamWorker from this client.
+
+        The worker joins a consumer group on the specified stream, polls for
+        records, and dispatches them to the handler. Records are auto-acked
+        on success and auto-nacked on error.
+
+        Args:
+            stream: Stream name to consume from.
+            group: Consumer group name.
+            handler: Async callable that processes each StreamContext.
+            consumer: Consumer ID (auto-generated if not provided).
+            worker_id: Unique worker identifier (auto-generated if not provided).
+            concurrency: Maximum number of concurrent record handlers.
+            batch_size: Number of records to fetch per poll.
+            block_ms: Timeout for blocking read in milliseconds.
+            message_timeout: Timeout for record handlers in seconds.
+
+        Returns:
+            A new StreamWorker instance ready to start.
+
+        Example:
+            async def process_event(ctx):
+                event = ctx.json()
+                print(f"Got: {event}")
+
+            worker = client.new_stream_worker(
+                stream="events", group="processors", handler=process_event
+            )
+            await worker.start()
+        """
+        from .worker import StreamWorker
+
+        return StreamWorker(
+            self,
+            handler,
+            stream=stream,
+            group=group,
+            consumer=consumer,
+            worker_id=worker_id,
+            concurrency=concurrency,
+            batch_size=batch_size,
+            block_ms=block_ms,
+            message_timeout=message_timeout,
         )

@@ -291,7 +291,7 @@ for record in result.records:
     try:
         process(record.payload)
         # Acknowledge successful processing
-        await client.stream.group_ack("events", "processors", [record.offset])
+        await client.stream.group_ack("events", "processors", [record.id])
     except Exception:
         # Record will be redelivered to another consumer
         pass
@@ -427,8 +427,8 @@ from flo import FloClient
 
 async def run_worker():
     async with FloClient("localhost:9000", namespace="myapp") as client:
-        # Create a worker from the client
-        worker = client.new_worker(concurrency=5)
+        # Create an action worker from the client
+        worker = client.new_action_worker(concurrency=5)
 
         @worker.action("process-image")
         async def process_image(ctx):
@@ -439,6 +439,31 @@ async def run_worker():
         await worker.start()
 
 asyncio.run(run_worker())
+```
+
+### StreamWorker Example
+
+```python
+import asyncio
+from flo import FloClient, StreamContext
+
+async def process_event(ctx: StreamContext) -> None:
+    event = ctx.json()
+    print(f"Got event: {event}")
+    # Return normally → auto-ack
+    # Raise an exception → auto-nack (redelivery)
+
+async def run_stream_worker():
+    async with FloClient("localhost:9000", namespace="myapp") as client:
+        worker = client.new_stream_worker(
+            stream="events",
+            group="processors",
+            handler=process_event,
+            concurrency=5,
+        )
+        await worker.start()
+
+asyncio.run(run_stream_worker())
 ```
 
 ## Configuration

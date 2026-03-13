@@ -34,6 +34,7 @@ from .types import (
     StatusCode,
     StorageTier,
     StreamAppendResult,
+    StreamID,
     StreamInfo,
     StreamReadResult,
     StreamRecord,
@@ -538,7 +539,7 @@ def parse_stream_append_response(data: bytes) -> StreamAppendResult:
     sequence = struct.unpack("<Q", data[0:8])[0]
     timestamp_ms = struct.unpack("<q", data[8:16])[0]
 
-    return StreamAppendResult(sequence=sequence, timestamp_ms=timestamp_ms)
+    return StreamAppendResult(id=StreamID(timestamp_ms=timestamp_ms, sequence=sequence))
 
 
 def parse_stream_read_response(data: bytes) -> StreamReadResult:
@@ -619,8 +620,7 @@ def parse_stream_read_response(data: bytes) -> StreamReadResult:
 
         records.append(
             StreamRecord(
-                sequence=sequence,
-                timestamp_ms=timestamp_ms,
+                id=StreamID(timestamp_ms=timestamp_ms, sequence=sequence),
                 tier=tier,
                 payload=payload,
                 headers=None,
@@ -633,20 +633,22 @@ def parse_stream_read_response(data: bytes) -> StreamReadResult:
 def parse_stream_info_response(data: bytes) -> StreamInfo:
     """Parse stream info response data.
 
-    Format: [first_seq:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32]
+    Format: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32]
     """
-    if len(data) < 36:
+    if len(data) < 52:
         raise IncompleteResponseError("Stream info response too short")
 
-    first_seq = struct.unpack("<Q", data[0:8])[0]
-    last_seq = struct.unpack("<Q", data[8:16])[0]
-    count = struct.unpack("<Q", data[16:24])[0]
-    bytes_size = struct.unpack("<Q", data[24:32])[0]
-    partition_count = struct.unpack("<I", data[32:36])[0]
+    first_ts = struct.unpack("<Q", data[0:8])[0]
+    first_seq = struct.unpack("<Q", data[8:16])[0]
+    last_ts = struct.unpack("<Q", data[16:24])[0]
+    last_seq = struct.unpack("<Q", data[24:32])[0]
+    count = struct.unpack("<Q", data[32:40])[0]
+    bytes_size = struct.unpack("<Q", data[40:48])[0]
+    partition_count = struct.unpack("<I", data[48:52])[0]
 
     return StreamInfo(
-        first_seq=first_seq,
-        last_seq=last_seq,
+        first_id=StreamID(timestamp_ms=first_ts, sequence=first_seq),
+        last_id=StreamID(timestamp_ms=last_ts, sequence=last_seq),
         count=count,
         bytes_size=bytes_size,
         partition_count=partition_count,
@@ -669,10 +671,10 @@ def serialize_group_value(group: str, consumer: str) -> bytes:
     return bytes(result)
 
 
-def serialize_group_ack_value(group: str, seqs: list[int], consumer: str = "") -> bytes:
-    """Serialize group name, consumer, and sequence numbers for group ack/nack.
+def serialize_group_ack_value(group: str, ids: list, consumer: str = "") -> bytes:
+    """Serialize group name, consumer, and StreamIDs for group ack/nack.
 
-    Format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][seq:u64]*
+    Format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][ts:u64][seq:u64]*
     """
     group_bytes = group.encode("utf-8")
     consumer_bytes = consumer.encode("utf-8")
@@ -682,9 +684,10 @@ def serialize_group_ack_value(group: str, seqs: list[int], consumer: str = "") -
     result.extend(group_bytes)
     result.extend(struct.pack("<H", len(consumer_bytes)))
     result.extend(consumer_bytes)
-    result.extend(struct.pack("<I", len(seqs)))
-    for seq in seqs:
-        result.extend(struct.pack("<Q", seq))
+    result.extend(struct.pack("<I", len(ids)))
+    for sid in ids:
+        result.extend(struct.pack("<Q", sid.timestamp_ms))
+        result.extend(struct.pack("<Q", sid.sequence))
     return bytes(result)
 
 
@@ -787,24 +790,55 @@ def serialize_action_list_value(limit: int = 100) -> bytes:
     return struct.pack("<I", limit)
 
 
-def serialize_worker_register_value(task_types: list[str]) -> bytes:
+def serialize_worker_register_value(
+    task_types: list[str],
+    *,
+    worker_type: int = 0,
+    max_concurrency: int = 10,
+    metadata: str | None = None,
+    machine_id: str | None = None,
+) -> bytes:
     """Serialize worker register value.
 
-    Format: [count:u32][task_type_len:u16][task_type]...[has_caps:u8][caps]?
+    Server format:
+      [type:u8][max_concurrency:u32][process_count:u16]
+      ([name_len:u16][name][kind:u8])*
+      [has_metadata:u8]([metadata_len:u16][metadata])?
+      [has_machine_id:u8]([machine_id_len:u16][machine_id])?
     """
     result = bytearray()
 
-    # count
-    result.extend(struct.pack("<I", len(task_types)))
+    # worker type: 0=action, 1=stream
+    result.append(worker_type & 0xFF)
 
-    # task types
+    # max_concurrency
+    result.extend(struct.pack("<I", max_concurrency))
+
+    # process_count + process entries
+    result.extend(struct.pack("<H", len(task_types)))
     for tt in task_types:
         tt_bytes = tt.encode("utf-8")
         result.extend(struct.pack("<H", len(tt_bytes)))
         result.extend(tt_bytes)
+        result.append(worker_type & 0xFF)  # kind matches worker type
 
-    # capabilities (optional, none)
-    result.append(0)
+    # optional metadata
+    if metadata:
+        result.append(1)
+        meta_bytes = metadata.encode("utf-8")
+        result.extend(struct.pack("<H", len(meta_bytes)))
+        result.extend(meta_bytes)
+    else:
+        result.append(0)
+
+    # optional machine_id
+    if machine_id:
+        result.append(1)
+        mid_bytes = machine_id.encode("utf-8")
+        result.extend(struct.pack("<H", len(mid_bytes)))
+        result.extend(mid_bytes)
+    else:
+        result.append(0)
 
     return bytes(result)
 
@@ -828,48 +862,61 @@ def serialize_worker_await_value(task_types: list[str]) -> bytes:
     return bytes(result)
 
 
-def serialize_worker_touch_value(task_id: str, extend_ms: int = 30000) -> bytes:
+def serialize_worker_touch_value(action_name: str, task_id: str, extend_ms: int = 30000) -> bytes:
     """Serialize worker touch value.
 
-    Format: [task_id_len:u16][task_id][extend_ms:u32]
+    Format: [action_name_len:u16][action_name][task_id_len:u16][task_id]
     """
+    action_bytes = action_name.encode("utf-8")
     task_id_bytes = task_id.encode("utf-8")
 
     result = bytearray()
+    result.extend(struct.pack("<H", len(action_bytes)))
+    result.extend(action_bytes)
     result.extend(struct.pack("<H", len(task_id_bytes)))
     result.extend(task_id_bytes)
-    result.extend(struct.pack("<I", extend_ms))
 
     return bytes(result)
 
 
-def serialize_worker_complete_value(task_id: str, result_data: bytes) -> bytes:
+def serialize_worker_complete_value(action_name: str, task_id: str, result_data: bytes) -> bytes:
     """Serialize worker complete value.
 
-    Format: [task_id_len:u16][task_id][result...]
+    Format: [action_name_len:u16][action_name][task_id_len:u16][task_id][outcome_len:u16][outcome][result_len:u16][result]
     """
+    action_bytes = action_name.encode("utf-8")
     task_id_bytes = task_id.encode("utf-8")
+    outcome = b"success"
 
     result = bytearray()
+    result.extend(struct.pack("<H", len(action_bytes)))
+    result.extend(action_bytes)
     result.extend(struct.pack("<H", len(task_id_bytes)))
     result.extend(task_id_bytes)
+    result.extend(struct.pack("<H", len(outcome)))
+    result.extend(outcome)
+    result.extend(struct.pack("<H", len(result_data)))
     result.extend(result_data)
 
     return bytes(result)
 
 
-def serialize_worker_fail_value(task_id: str, error_message: str) -> bytes:
+def serialize_worker_fail_value(action_name: str, task_id: str, error_message: str) -> bytes:
     """Serialize worker fail value.
 
-    Format: [task_id_len:u16][task_id][error_message...]
-    Note: retry flag is handled via TLV options, not in payload (matches Go SDK).
+    Format: [action_name_len:u16][action_name][task_id_len:u16][task_id][retry:u8][error_message...]
+    Note: retry flag is handled via TLV options, not in the retry byte (set to 0).
     """
+    action_bytes = action_name.encode("utf-8")
     task_id_bytes = task_id.encode("utf-8")
     error_bytes = error_message.encode("utf-8")
 
     result = bytearray()
+    result.extend(struct.pack("<H", len(action_bytes)))
+    result.extend(action_bytes)
     result.extend(struct.pack("<H", len(task_id_bytes)))
     result.extend(task_id_bytes)
+    result.extend(struct.pack("<B", 0))  # retry=0 (retry flag via TLV options)
     result.extend(error_bytes)
 
     return bytes(result)

@@ -1,6 +1,7 @@
 """Flo High-Level Worker API
 
-Provides an easy-to-use Worker class for executing actions.
+Provides ActionWorker for executing actions and StreamWorker for
+processing stream records via consumer groups.
 
 Example:
     from flo import FloClient, ActionContext
@@ -12,7 +13,7 @@ Example:
 
     async def main():
         async with FloClient("localhost:3000", namespace="myapp") as client:
-            worker = client.new_worker(concurrency=5)
+            worker = client.new_action_worker(concurrency=5)
             worker.action("process-order")(process_order)
             await worker.start()
 """
@@ -27,7 +28,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .client import FloClient
-from .types import ActionType, TaskAssignment, WorkerAwaitOptions, WorkerTouchOptions
+from .types import (
+    ActionType,
+    StreamGroupAckOptions,
+    StreamGroupNackOptions,
+    StreamGroupReadOptions,
+    StreamID,
+    StreamRecord,
+    TaskAssignment,
+    WorkerAwaitOptions,
+    WorkerTouchOptions,
+)
 
 logger = logging.getLogger("flo.worker")
 
@@ -37,8 +48,8 @@ ActionHandler = Callable[["ActionContext"], Awaitable[bytes]]
 
 
 @dataclass
-class WorkerOptions:
-    """Configuration for a Flo worker.
+class ActionWorkerOptions:
+    """Configuration for a Flo action worker.
 
     Endpoint and namespace are inherited from the parent FloClient.
     """
@@ -63,7 +74,7 @@ class ActionContext:
     attempt: int
     created_at: int
     namespace: str
-    _worker: "Worker" = field(repr=False)
+    _worker: "ActionWorker" = field(repr=False)
     _cancel_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def input(self) -> bytes:
@@ -103,7 +114,7 @@ class ActionContext:
         Args:
             extend_ms: How long to extend the lease in milliseconds.
         """
-        await self._worker._touch_task(self.task_id, extend_ms)
+        await self._worker._touch_task(self.action_name, self.task_id, extend_ms)
 
     @property
     def cancelled(self) -> bool:
@@ -116,14 +127,14 @@ class ActionContext:
             raise asyncio.CancelledError("Task was cancelled")
 
 
-class Worker:
+class ActionWorker:
     """High-level Flo worker for executing actions.
 
-    Created from a FloClient via ``client.new_worker()``.
+    Created from a FloClient via ``client.new_action_worker()``.
 
     Example:
         async with FloClient("localhost:3000", namespace="myapp") as client:
-            worker = client.new_worker(concurrency=5)
+            worker = client.new_action_worker(concurrency=5)
 
             @worker.action("process-order")
             async def process_order(ctx: ActionContext) -> bytes:
@@ -152,7 +163,7 @@ class Worker:
             block_ms: Timeout for blocking dequeue in milliseconds.
         """
         self._parent_client = parent_client
-        self.config = WorkerOptions(
+        self.config = ActionWorkerOptions(
             worker_id=worker_id or self._generate_worker_id(),
             concurrency=concurrency,
             action_timeout=action_timeout,
@@ -165,6 +176,7 @@ class Worker:
         self._stop_event = asyncio.Event()
         self._tasks: set[asyncio.Task[None]] = set()
         self._semaphore: asyncio.Semaphore | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
 
     @staticmethod
     def _generate_worker_id() -> str:
@@ -228,11 +240,18 @@ class Worker:
             f"namespace={self._parent_client.namespace}, concurrency={self.config.concurrency})"
         )
 
-        # Create a dedicated connection using the parent client's endpoint and namespace
+        # Create a dedicated connection using the parent client's endpoint and namespace.
+        # Timeout must accommodate block_ms + action_timeout so blocking reads
+        # (ACTION_AWAIT with block_ms) don't get killed by socket-level timeout.
+        worker_timeout_ms = max(
+            self.config.block_ms + 5000,
+            int(self.config.action_timeout * 1000),
+        )
         self._client = FloClient(
             self._parent_client._endpoint,
             namespace=self._parent_client.namespace,
             debug=self._parent_client._debug,
+            timeout_ms=worker_timeout_ms,
         )
         await self._client.connect()
 
@@ -244,9 +263,15 @@ class Worker:
                 logger.debug(f"Registered action with server: {action_name}")
 
             # Register worker
+            from .types import WorkerRegisterOptions
+
             await self._client.worker.register(
                 self.config.worker_id,
                 action_names,
+                WorkerRegisterOptions(
+                    concurrency=self.config.concurrency,
+                    machine_id=socket.gethostname(),
+                ),
             )
             logger.info(f"Worker registered with {len(action_names)} actions")
 
@@ -255,10 +280,22 @@ class Worker:
             self._running = True
             self._stop_event.clear()
 
+            # Start heartbeat loop
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
             # Main polling loop
             await self._poll_loop(action_names)
 
         finally:
+            # Cancel heartbeat
+            if self._heartbeat_task is not None:
+                self._heartbeat_task.cancel()
+                try:
+                    await self._heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                self._heartbeat_task = None
+
             # Wait for running tasks
             if self._tasks:
                 logger.info(f"Waiting for {len(self._tasks)} tasks to complete...")
@@ -268,6 +305,25 @@ class Worker:
             self._client = None
             self._running = False
             logger.info("Worker stopped")
+
+    async def _heartbeat_loop(self) -> None:
+        """Send periodic heartbeats to keep the worker registration alive."""
+        assert self._client is not None
+        while self._running and not self._stop_event.is_set():
+            try:
+                await asyncio.sleep(30)
+                if not self._running:
+                    break
+                current_load = len(self._tasks)
+                await self._client.worker.heartbeat(
+                    self.config.worker_id,
+                    current_load=current_load,
+                )
+                logger.debug(f"Heartbeat sent (load={current_load})")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"Heartbeat failed: {e}")
 
     async def _poll_loop(self, action_names: list[str]) -> None:
         """Main polling loop for tasks."""
@@ -322,6 +378,7 @@ class Worker:
                 logger.error(f"No handler registered for action: {task.task_type}")
                 await self._client.worker.fail(
                     self.config.worker_id,
+                    task.task_type,
                     task.task_id,
                     f"No handler for: {task.task_type}",
                 )
@@ -348,6 +405,7 @@ class Worker:
                 # Success - complete the task
                 await self._client.worker.complete(
                     self.config.worker_id,
+                    task.task_type,
                     task.task_id,
                     result,
                 )
@@ -357,6 +415,7 @@ class Worker:
                 logger.error(f"Action timed out: {task.task_type}")
                 await self._client.worker.fail(
                     self.config.worker_id,
+                    task.task_type,
                     task.task_id,
                     "Action timed out",
                 )
@@ -365,6 +424,7 @@ class Worker:
                 logger.warning(f"Action cancelled: {task.task_type}")
                 await self._client.worker.fail(
                     self.config.worker_id,
+                    task.task_type,
                     task.task_id,
                     "Action cancelled",
                 )
@@ -373,6 +433,7 @@ class Worker:
                 logger.error(f"Action failed: {task.task_type} - {e}")
                 await self._client.worker.fail(
                     self.config.worker_id,
+                    task.task_type,
                     task.task_id,
                     str(e),
                 )
@@ -384,12 +445,13 @@ class Worker:
             if self._semaphore is not None:
                 self._semaphore.release()
 
-    async def _touch_task(self, task_id: str, extend_ms: int) -> None:
+    async def _touch_task(self, action_name: str, task_id: str, extend_ms: int) -> None:
         """Extend lease on a task (internal method)."""
         if self._client is None:
             raise RuntimeError("Worker not connected")
         await self._client.worker.touch(
             self.config.worker_id,
+            action_name,
             task_id,
             WorkerTouchOptions(extend_ms=extend_ms),
         )
@@ -406,6 +468,318 @@ class Worker:
 
     async def close(self) -> None:
         """Stop and close the worker."""
+        self.stop()
+        if self._client:
+            await self._client.close()
+
+
+# =============================================================================
+# Stream Worker
+# =============================================================================
+
+# Type alias for stream record handlers
+# Return normally to auto-ack, raise to auto-nack.
+StreamRecordHandler = Callable[["StreamContext"], Awaitable[None]]
+
+
+@dataclass
+class StreamWorkerOptions:
+    """Configuration for a Flo stream worker.
+
+    Endpoint and namespace are inherited from the parent FloClient.
+    """
+
+    stream: str
+    group: str = ""
+    consumer: str = ""
+    worker_id: str = ""
+    concurrency: int = 10
+    batch_size: int = 10
+    block_ms: int = 30000
+    message_timeout: float = 300.0  # 5 minutes
+
+
+@dataclass
+class StreamContext:
+    """Context passed to stream record handlers.
+
+    Provides access to record data and helper methods.
+    """
+
+    record: StreamRecord
+    namespace: str
+    stream: str
+    group: str
+    consumer: str
+
+    @property
+    def stream_id(self) -> StreamID:
+        """Get the record's StreamID."""
+        return self.record.id
+
+    @property
+    def payload(self) -> bytes:
+        """Get the raw record payload."""
+        return self.record.payload
+
+    def json(self) -> Any:
+        """Parse record payload as JSON."""
+        if not self.record.payload:
+            raise ValueError("No payload data")
+        return json.loads(self.record.payload.decode("utf-8"))
+
+    def into(self, cls: type) -> Any:
+        """Parse payload as JSON and instantiate the given class."""
+        data = self.json()
+        if isinstance(data, dict):
+            return cls(**data)
+        return cls(data)
+
+    @property
+    def headers(self) -> dict[str, str]:
+        """Get record headers."""
+        return self.record.headers if self.record.headers else {}
+
+
+class StreamWorker:
+    """High-level Flo worker for processing stream records via consumer groups.
+
+    Polls a consumer group with ``group_read()``, dispatches records to the
+    handler, and auto-acks on success or auto-nacks on error.
+
+    Created from a FloClient via ``client.new_stream_worker()``.
+
+    Example:
+        async with FloClient("localhost:3000", namespace="myapp") as client:
+            async def process_event(ctx: StreamContext) -> None:
+                event = ctx.json()
+                print(f"Got event: {event}")
+                # Return normally → auto-ack
+                # Raise → auto-nack
+
+            worker = client.new_stream_worker(
+                stream="events",
+                group="processors",
+                consumer="worker-1",
+                handler=process_event,
+                concurrency=5,
+            )
+            await worker.start()
+    """
+
+    def __init__(
+        self,
+        parent_client: "FloClient",
+        handler: StreamRecordHandler,
+        *,
+        stream: str,
+        group: str,
+        consumer: str | None = None,
+        worker_id: str | None = None,
+        concurrency: int = 10,
+        batch_size: int = 10,
+        block_ms: int = 30000,
+        message_timeout: float = 300.0,
+    ):
+        self._parent_client = parent_client
+        self._handler = handler
+        self.config = StreamWorkerOptions(
+            stream=stream,
+            group=group,
+            consumer=consumer or self._generate_consumer_id(),
+            worker_id=worker_id or self._generate_consumer_id(),
+            concurrency=concurrency,
+            batch_size=batch_size,
+            block_ms=block_ms,
+            message_timeout=message_timeout,
+        )
+
+        self._client: FloClient | None = None
+        self._running = False
+        self._stop_event = asyncio.Event()
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._semaphore: asyncio.Semaphore | None = None
+
+    @staticmethod
+    def _generate_consumer_id() -> str:
+        """Generate a unique consumer ID."""
+        try:
+            hostname = socket.gethostname()
+        except Exception:
+            hostname = "unknown"
+        return f"{hostname}-{secrets.token_hex(4)}"
+
+    async def start(self) -> None:
+        """Start the stream worker and begin processing records.
+
+        Joins the consumer group, then polls for records. Blocks until
+        ``stop()`` is called.
+        """
+        logger.info(
+            f"Starting stream worker (stream={self.config.stream}, "
+            f"group={self.config.group}, consumer={self.config.consumer}, "
+            f"concurrency={self.config.concurrency})"
+        )
+
+        # Timeout must accommodate block_ms + message_timeout so blocking reads
+        # (group_read with block_ms) don't get killed by socket-level timeout.
+        worker_timeout_ms = max(
+            self.config.block_ms + 5000,
+            int(self.config.message_timeout * 1000),
+        )
+        self._client = FloClient(
+            self._parent_client._endpoint,
+            namespace=self._parent_client.namespace,
+            debug=self._parent_client._debug,
+            timeout_ms=worker_timeout_ms,
+        )
+        await self._client.connect()
+
+        try:
+            # Join consumer group
+            await self._client.stream.group_join(
+                self.config.stream,
+                self.config.group,
+                self.config.consumer,
+            )
+            logger.info(
+                f"Joined consumer group {self.config.group} on stream {self.config.stream}"
+            )
+
+            self._semaphore = asyncio.Semaphore(self.config.concurrency)
+            self._running = True
+            self._stop_event.clear()
+
+            await self._poll_loop()
+
+        finally:
+            # Wait for in-flight tasks
+            if self._tasks:
+                logger.info(f"Waiting for {len(self._tasks)} tasks to complete...")
+                await asyncio.gather(*self._tasks, return_exceptions=True)
+
+            # Leave consumer group
+            if self._client:
+                try:
+                    await self._client.stream.group_leave(
+                        self.config.stream,
+                        self.config.group,
+                        self.config.consumer,
+                    )
+                    logger.info(f"Left consumer group {self.config.group}")
+                except Exception as e:
+                    logger.warning(f"Failed to leave consumer group: {e}")
+
+                await self._client.close()
+                self._client = None
+
+            self._running = False
+            logger.info("Stream worker stopped")
+
+    async def _poll_loop(self) -> None:
+        """Main polling loop for stream records."""
+        assert self._client is not None
+        assert self._semaphore is not None
+
+        while self._running and not self._stop_event.is_set():
+            try:
+                # Wait for a concurrency slot
+                await self._semaphore.acquire()
+
+                if self._stop_event.is_set():
+                    self._semaphore.release()
+                    break
+
+                result = await self._client.stream.group_read(
+                    self.config.stream,
+                    self.config.group,
+                    self.config.consumer,
+                    StreamGroupReadOptions(
+                        count=self.config.batch_size,
+                        block_ms=self.config.block_ms,
+                    ),
+                )
+
+                if not result.records:
+                    self._semaphore.release()
+                    continue
+
+                # Release semaphore before dispatching — each task will
+                # acquire its own slot via _process_record.
+                self._semaphore.release()
+
+                for record in result.records:
+                    await self._semaphore.acquire()
+                    if self._stop_event.is_set():
+                        self._semaphore.release()
+                        return
+                    task = asyncio.create_task(self._process_record(record))
+                    self._tasks.add(task)
+                    task.add_done_callback(self._tasks.discard)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._semaphore.release()
+                logger.error(f"Stream read error: {e}, retrying...")
+                await asyncio.sleep(1)
+
+    async def _process_record(self, record: StreamRecord) -> None:
+        """Process a single record: call handler, then ack or nack."""
+        assert self._client is not None
+        assert self._semaphore is not None
+        try:
+            ctx = StreamContext(
+                record=record,
+                namespace=self._parent_client.namespace,
+                stream=self.config.stream,
+                group=self.config.group,
+                consumer=self.config.consumer,
+            )
+
+            try:
+                await asyncio.wait_for(
+                    self._handler(ctx),
+                    timeout=self.config.message_timeout,
+                )
+
+                # Success — ack
+                await self._client.stream.group_ack(
+                    self.config.stream,
+                    self.config.group,
+                    [record.id],
+                    StreamGroupAckOptions(consumer=self.config.consumer),
+                )
+
+            except Exception as e:
+                logger.error(
+                    f"Record processing failed (stream={self.config.stream}, "
+                    f"id={record.id}): {e}"
+                )
+                try:
+                    await self._client.stream.group_nack(
+                        self.config.stream,
+                        self.config.group,
+                        [record.id],
+                        StreamGroupNackOptions(consumer=self.config.consumer),
+                    )
+                except Exception as nack_err:
+                    logger.error(f"Failed to nack record: {nack_err}")
+
+        except Exception as e:
+            logger.error(f"Failed to process record: {e}")
+
+        finally:
+            self._semaphore.release()
+
+    def stop(self) -> None:
+        """Signal the stream worker to stop."""
+        logger.info("Stopping stream worker...")
+        self._running = False
+        self._stop_event.set()
+
+    async def close(self) -> None:
+        """Stop and close the stream worker."""
         self.stop()
         if self._client:
             await self._client.close()

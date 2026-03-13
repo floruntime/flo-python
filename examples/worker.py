@@ -167,7 +167,7 @@ async def main():
     await client.connect()
 
     # Create a worker from the client
-    worker = client.new_worker(
+    worker = client.new_action_worker(
         concurrency=5,
         action_timeout=300,  # 5 minutes
     )

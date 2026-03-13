@@ -24,7 +24,7 @@ Example:
             await client.action.invoke("process", b'{}')
 
             # Worker (created from client)
-            worker = client.new_worker(concurrency=5)
+            worker = client.new_action_worker(concurrency=5)
             worker.register_action("my-action", handler)
             await worker.start()
 
@@ -120,7 +120,15 @@ from .types import (
     WorkerTask,
     WorkerTouchOptions,
 )
-from .worker import ActionContext, Worker, WorkerOptions
+from .worker import (
+    ActionContext,
+    ActionWorker,
+    ActionWorkerOptions,
+    StreamContext,
+    StreamRecordHandler,
+    StreamWorker,
+    StreamWorkerOptions,
+)
 
 __version__ = "0.1.0"
 
@@ -128,9 +136,13 @@ __all__ = [
     # Client
     "FloClient",
     # High-level Worker API
-    "Worker",
-    "WorkerOptions",
+    "ActionWorker",
+    "ActionWorkerOptions",
     "ActionContext",
+    "StreamWorker",
+    "StreamWorkerOptions",
+    "StreamContext",
+    "StreamRecordHandler",
     # Exceptions
     "FloError",
     "NotConnectedError",

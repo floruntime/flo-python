@@ -54,11 +54,11 @@ class StreamOperations:
             options: Optional append options.
 
         Returns:
-            StreamAppendResult with sequence and timestamp_ms.
+            StreamAppendResult with id (StreamID).
 
         Example:
             result = await client.stream.append("events", b'{"event": "click"}')
-            print(f"Appended: sequence={result.sequence} timestamp_ms={result.timestamp_ms}")
+            print(f"Appended: id={result.id}")
         """
         opts = options or StreamAppendOptions()
         namespace = self._client.get_namespace(opts.namespace)
@@ -99,12 +99,12 @@ class StreamOperations:
             # Read from specific StreamID
             from flo.types import StreamID
             result = await client.stream.read("events", StreamReadOptions(
-                start=StreamID.from_sequence(100), count=10
+                start=StreamID(timestamp_ms=0, sequence=100), count=10
             ))
 
             # Blocking read (long polling)
             result = await client.stream.read("events", StreamReadOptions(
-                start=StreamID.from_sequence(100), block_ms=30000
+                start=StreamID(timestamp_ms=0, sequence=100), block_ms=30000
             ))
         """
         opts = options or StreamReadOptions()
@@ -158,7 +158,7 @@ class StreamOperations:
             options: Optional info options.
 
         Returns:
-            StreamInfo with first_seq, last_seq, count, bytes_size.
+            StreamInfo with first_id, last_id, count, bytes_size.
 
         Example:
             info = await client.stream.info("events")
@@ -312,7 +312,7 @@ class StreamOperations:
             result = await client.stream.group_read("events", "processors", "worker-1")
             for record in result.records:
                 process(record.payload)
-                await client.stream.group_ack("events", "processors", [record.seq])
+                await client.stream.group_ack("events", "processors", [record.id])
         """
         opts = options or StreamGroupReadOptions()
         namespace = self._client.get_namespace(opts.namespace)
@@ -343,7 +343,7 @@ class StreamOperations:
         self,
         stream: str,
         group: str,
-        seqs: list[int],
+        ids: list,
         options: StreamGroupAckOptions | None = None,
     ) -> None:
         """Acknowledge records in a consumer group.
@@ -351,7 +351,7 @@ class StreamOperations:
         Args:
             stream: Stream name.
             group: Consumer group name.
-            seqs: Sequence numbers of records to acknowledge.
+            ids: StreamIDs of records to acknowledge.
             options: Optional ack options (including consumer name).
 
         Example:
@@ -359,18 +359,18 @@ class StreamOperations:
             for record in result.records:
                 try:
                     process(record.payload)
-                    await client.stream.group_ack("events", "processors", [record.seq],
+                    await client.stream.group_ack("events", "processors", [record.id],
                         StreamGroupAckOptions(consumer="worker-1"))
                 except Exception:
                     pass  # Record will be redelivered
         """
-        if not seqs:
+        if not ids:
             return
 
         opts = options or StreamGroupAckOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        value = serialize_group_ack_value(group, seqs, consumer=opts.consumer)
+        value = serialize_group_ack_value(group, ids, consumer=opts.consumer)
 
         await self._client._send_and_check(
             OpCode.STREAM_GROUP_ACK,
@@ -384,7 +384,7 @@ class StreamOperations:
         self,
         stream: str,
         group: str,
-        seqs: list[int],
+        ids: list,
         options: StreamGroupNackOptions | None = None,
     ) -> None:
         """Negatively acknowledge records in a consumer group for redelivery.
@@ -392,7 +392,7 @@ class StreamOperations:
         Args:
             stream: Stream name.
             group: Consumer group name.
-            seqs: Sequence numbers of records to negatively acknowledge.
+            ids: StreamIDs of records to negatively acknowledge.
             options: Optional nack options (consumer name, redelivery delay).
 
         Example:
@@ -401,16 +401,16 @@ class StreamOperations:
                 try:
                     process(record.payload)
                 except Exception:
-                    await client.stream.group_nack("events", "processors", [record.seq],
+                    await client.stream.group_nack("events", "processors", [record.id],
                         StreamGroupNackOptions(consumer="worker-1", redelivery_delay_ms=5000))
         """
-        if not seqs:
+        if not ids:
             return
 
         opts = options or StreamGroupNackOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        value = serialize_group_ack_value(group, seqs, consumer=opts.consumer)
+        value = serialize_group_ack_value(group, ids, consumer=opts.consumer)
 
         builder = OptionsBuilder()
         if opts.redelivery_delay_ms is not None:

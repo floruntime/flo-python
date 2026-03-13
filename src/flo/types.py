@@ -120,28 +120,35 @@ class OpCode(IntEnum):
     QUEUE_TOUCH_RESPONSE = 0x55
     QUEUE_BATCH_ENQUEUE_RESPONSE = 0x56
     QUEUE_PURGE_RESPONSE = 0x57
+    QUEUE_LIST = 0x58  # List all queues in namespace
+    QUEUE_LIST_RESPONSE = 0x59
 
-    # Actions (0x60 - 0x68)
+    # Actions (0x60 - 0x6D) — action definitions + task dispatch
     ACTION_REGISTER = 0x60
     ACTION_INVOKE = 0x61
     ACTION_STATUS = 0x62
     ACTION_LIST = 0x63
     ACTION_DELETE = 0x64
-    ACTION_REGISTER_RESPONSE = 0x65
-    ACTION_INVOKE_RESPONSE = 0x66
-    ACTION_STATUS_RESPONSE = 0x67
-    ACTION_LIST_RESPONSE = 0x68
+    ACTION_AWAIT = 0x65  # Worker blocks waiting for task assignment
+    ACTION_COMPLETE = 0x66  # Worker completes a task
+    ACTION_FAIL = 0x67  # Worker fails a task (with optional retry)
+    ACTION_TOUCH = 0x68  # Extend task lease
+    ACTION_REGISTER_RESPONSE = 0x69
+    ACTION_INVOKE_RESPONSE = 0x6A
+    ACTION_STATUS_RESPONSE = 0x6B
+    ACTION_LIST_RESPONSE = 0x6C
+    ACTION_TASK_ASSIGNMENT = 0x6D  # Push task to worker
 
-    # Workers (0x69 - 0x7F)
-    WORKER_REGISTER = 0x69
-    WORKER_TOUCH = 0x6A
-    WORKER_AWAIT = 0x6B
-    WORKER_COMPLETE = 0x6C
-    WORKER_FAIL = 0x6D
-    WORKER_LIST = 0x6E
-    WORKER_REGISTER_RESPONSE = 0x70
-    WORKER_TASK_ASSIGNMENT = 0x71
-    WORKER_LIST_RESPONSE = 0x72
+    # Workers (0x70 - 0x78) — physical worker tracking & health
+    WORKER_REGISTER = 0x70  # Register worker with type + metadata
+    WORKER_HEARTBEAT = 0x71  # Worker heartbeat / health ping
+    WORKER_DEREGISTER = 0x72  # Remove worker from registry
+    WORKER_LIST = 0x73  # List all workers (with health)
+    WORKER_INFO = 0x74  # Get single worker details
+    WORKER_REGISTER_RESPONSE = 0x75
+    WORKER_LIST_RESPONSE = 0x76
+    WORKER_INFO_RESPONSE = 0x77
+    WORKER_DRAIN = 0x78  # Drain a worker (stop new task assignments)
 
     # Workflows (0x80 - 0x91)
     WORKFLOW_CREATE = 0x80
@@ -162,6 +169,8 @@ class OpCode(IntEnum):
     WORKFLOW_ENABLE = 0x8F
     WORKFLOW_DISABLE_RESPONSE = 0x90
     WORKFLOW_ENABLE_RESPONSE = 0x91
+    WORKFLOW_LIST_DEFINITIONS = 0x92
+    WORKFLOW_LIST_DEFINITIONS_RESPONSE = 0x93
 
     # Cluster Management (0xA0 - 0xAF)
     CLUSTER_STATUS = 0xA0
@@ -184,6 +193,10 @@ class OpCode(IntEnum):
     NAMESPACE_DELETE_RESPONSE = 0xB5
     NAMESPACE_LIST_RESPONSE = 0xB6
     NAMESPACE_INFO_RESPONSE = 0xB7
+    NAMESPACE_CONFIG_SET = 0xB8  # Set namespace configuration (admin-only)
+    NAMESPACE_CONFIG_GET = 0xB9  # Get namespace configuration
+    NAMESPACE_CONFIG_SET_RESPONSE = 0xBA
+    NAMESPACE_CONFIG_GET_RESPONSE = 0xBB
 
     # Processing / Stream Processing (0xC0 - 0xD1)
     PROCESSING_SUBMIT = 0xC0
@@ -202,6 +215,22 @@ class OpCode(IntEnum):
     PROCESSING_SAVEPOINT_RESPONSE = 0xCF
     PROCESSING_RESTORE_RESPONSE = 0xD0
     PROCESSING_RESCALE_RESPONSE = 0xD1
+
+    # Time-Series Operations (0xE0 - 0xED)
+    TS_WRITE = 0xE0  # Write data point(s) to a time-series
+    TS_READ = 0xE1  # Read raw data points from a time-series
+    TS_QUERY = 0xE2  # Aggregated query over a time range
+    TS_FLOQL = 0xE3  # FloQL query string
+    TS_LIST = 0xE4  # List measurements or series
+    TS_DELETE = 0xE5  # Delete a series and its metadata
+    TS_RETENTION = 0xE6  # Configure retention / downsampling policy
+    TS_WRITE_RESPONSE = 0xE7
+    TS_READ_RESPONSE = 0xE8
+    TS_QUERY_RESPONSE = 0xE9
+    TS_FLOQL_RESPONSE = 0xEA
+    TS_LIST_RESPONSE = 0xEB
+    TS_DELETE_RESPONSE = 0xEC
+    TS_RETENTION_RESPONSE = 0xED
 
 
 class StatusCode(IntEnum):
@@ -253,6 +282,7 @@ class OptionTag(IntEnum):
     LIMIT = 0x05  # u32: Maximum number of results for scan/list operations
     KEYS_ONLY = 0x06  # u8: Skip values in scan response (0/1)
     CURSOR = 0x07  # bytes: Pagination cursor (ShardWalker format)
+    ROUTING_KEY = 0x08  # string: Explicit routing key for shard co-location
 
     # Queue Options (0x10 - 0x1F)
     PRIORITY = 0x10  # u8: Message priority (0-255, higher = more urgent)
@@ -304,6 +334,19 @@ class OptionTag(IntEnum):
     RETRY_POLICY = 0x51  # bytes: Serialized retry policy
     CORRELATION_ID = 0x52  # string: Correlation ID for tracing
     SUBSCRIPTION_ID = 0x53  # u64: Subscription ID for stream subscriptions
+
+    # Time-Series Options (0x60 - 0x6F)
+    TS_FROM_MS = 0x60  # i64: Start of time range (inclusive, unix ms)
+    TS_TO_MS = 0x61  # i64: End of time range (inclusive, 0 = now)
+    TS_WINDOW_MS = 0x62  # i64: Aggregation window size (ms)
+    TS_AGGREGATION = 0x63  # string: Aggregation function name (avg, sum, count, min, max)
+    TS_FIELD = 0x64  # string: Field name filter (empty = "value")
+    TS_TAGS = 0x65  # string: Comma-separated tag filters "key=val,key2=val2"
+    TS_PRECISION = 0x66  # u8: Timestamp precision (0=ns, 1=us, 2=ms, 3=s)
+    TS_TIMESTAMP = 0x67  # i64: Explicit timestamp for write (0 = server-assigned)
+    TS_RAW_TTL = 0x68  # string: Raw data TTL (e.g., "7d")
+    TS_DOWNSAMPLE = 0x69  # string: Downsample rule (e.g., "1m:avg:30d")
+    TS_BATCH = 0x6A  # void: Flag indicating batch/line-protocol mode
 
 
 # =============================================================================
@@ -379,14 +422,6 @@ class StreamID:
         ts, seq = struct.unpack(">QQ", data[:16])
         return cls(timestamp_ms=ts, sequence=seq)
 
-    @classmethod
-    def from_sequence(cls, seq: int) -> "StreamID":
-        """Create a StreamID with just a sequence number.
-
-        Used for backwards compatibility with offset-based reads.
-        """
-        return cls(timestamp_ms=0, sequence=seq)
-
 
 class StorageTier(IntEnum):
     """Storage tier of a stream record."""
@@ -401,8 +436,7 @@ class StorageTier(IntEnum):
 class StreamRecord:
     """A record in a stream."""
 
-    sequence: int
-    timestamp_ms: int
+    id: StreamID = None  # type: ignore[assignment]
     tier: StorageTier = StorageTier.HOT
     payload: bytes = b""
     headers: dict[str, str] | None = None
@@ -412,8 +446,7 @@ class StreamRecord:
 class StreamAppendResult:
     """Result of appending to a stream."""
 
-    sequence: int
-    timestamp_ms: int
+    id: StreamID = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -427,10 +460,10 @@ class StreamReadResult:
 class StreamInfo:
     """Stream metadata."""
 
-    first_seq: int
-    last_seq: int
     count: int
     bytes_size: int
+    first_id: StreamID = None  # type: ignore[assignment]
+    last_id: StreamID = None  # type: ignore[assignment]
     partition_count: int = 1
 
 
@@ -773,6 +806,9 @@ class WorkerRegisterOptions:
     """Options for registering a worker."""
 
     namespace: str | None = None
+    concurrency: int = 10
+    machine_id: str | None = None
+    metadata: str | None = None
 
 
 @dataclass
