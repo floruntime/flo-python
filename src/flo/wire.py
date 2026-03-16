@@ -865,7 +865,7 @@ def serialize_worker_await_value(task_types: list[str]) -> bytes:
 def serialize_worker_touch_value(action_name: str, task_id: str, extend_ms: int = 30000) -> bytes:
     """Serialize worker touch value.
 
-    Format: [action_name_len:u16][action_name][task_id_len:u16][task_id]
+    Format: [action_name_len:u16][action_name][task_id_len:u16][task_id][extend_ms:u32]
     """
     action_bytes = action_name.encode("utf-8")
     task_id_bytes = task_id.encode("utf-8")
@@ -875,37 +875,41 @@ def serialize_worker_touch_value(action_name: str, task_id: str, extend_ms: int 
     result.extend(action_bytes)
     result.extend(struct.pack("<H", len(task_id_bytes)))
     result.extend(task_id_bytes)
+    result.extend(struct.pack("<I", extend_ms))
 
     return bytes(result)
 
 
-def serialize_worker_complete_value(action_name: str, task_id: str, result_data: bytes) -> bytes:
+def serialize_worker_complete_value(
+    action_name: str, task_id: str, result_data: bytes, outcome: str = "success"
+) -> bytes:
     """Serialize worker complete value.
 
     Format: [action_name_len:u16][action_name][task_id_len:u16][task_id][outcome_len:u16][outcome][result_len:u16][result]
     """
     action_bytes = action_name.encode("utf-8")
     task_id_bytes = task_id.encode("utf-8")
-    outcome = b"success"
+    outcome_bytes = outcome.encode("utf-8")
 
     result = bytearray()
     result.extend(struct.pack("<H", len(action_bytes)))
     result.extend(action_bytes)
     result.extend(struct.pack("<H", len(task_id_bytes)))
     result.extend(task_id_bytes)
-    result.extend(struct.pack("<H", len(outcome)))
-    result.extend(outcome)
+    result.extend(struct.pack("<H", len(outcome_bytes)))
+    result.extend(outcome_bytes)
     result.extend(struct.pack("<H", len(result_data)))
     result.extend(result_data)
 
     return bytes(result)
 
 
-def serialize_worker_fail_value(action_name: str, task_id: str, error_message: str) -> bytes:
+def serialize_worker_fail_value(
+    action_name: str, task_id: str, error_message: str, retry: bool = True
+) -> bytes:
     """Serialize worker fail value.
 
     Format: [action_name_len:u16][action_name][task_id_len:u16][task_id][retry:u8][error_message...]
-    Note: retry flag is handled via TLV options, not in the retry byte (set to 0).
     """
     action_bytes = action_name.encode("utf-8")
     task_id_bytes = task_id.encode("utf-8")
@@ -916,7 +920,7 @@ def serialize_worker_fail_value(action_name: str, task_id: str, error_message: s
     result.extend(action_bytes)
     result.extend(struct.pack("<H", len(task_id_bytes)))
     result.extend(task_id_bytes)
-    result.extend(struct.pack("<B", 0))  # retry=0 (retry flag via TLV options)
+    result.extend(struct.pack("<B", 1 if retry else 0))
     result.extend(error_bytes)
 
     return bytes(result)

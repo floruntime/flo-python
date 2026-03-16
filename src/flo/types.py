@@ -833,6 +833,7 @@ class WorkerCompleteOptions:
     """Options for completing a task."""
 
     namespace: str | None = None
+    outcome: str = "success"
 
 
 @dataclass
@@ -849,3 +850,110 @@ class WorkerListOptions:
 
     namespace: str | None = None
     limit: int = 100
+
+
+# =============================================================================
+# Workflow Types
+# =============================================================================
+
+
+@dataclass
+class WorkflowCreateOptions:
+    """Options for creating a workflow."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class WorkflowGetDefinitionOptions:
+    """Options for getting a workflow definition."""
+
+    namespace: str | None = None
+    version: str | None = None
+
+
+@dataclass
+class WorkflowStartOptions:
+    """Options for starting a workflow run."""
+
+    namespace: str | None = None
+    idempotency_key: str | None = None
+    run_id: str | None = None
+    version: str | None = None
+
+
+@dataclass
+class WorkflowStatusOptions:
+    """Options for getting workflow status."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class WorkflowSignalOptions:
+    """Options for sending a signal to a workflow."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class WorkflowCancelOptions:
+    """Options for cancelling a workflow."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class WorkflowHistoryOptions:
+    """Options for getting workflow history."""
+
+    namespace: str | None = None
+    limit: int = 100
+
+
+@dataclass
+class WorkflowListRunsOptions:
+    """Options for listing workflow runs."""
+
+    namespace: str | None = None
+    workflow_name: str | None = None
+    status_filter: str | None = None
+    limit: int = 100
+
+
+@dataclass
+class WorkflowListDefinitionsOptions:
+    """Options for listing workflow definitions."""
+
+    namespace: str | None = None
+    limit: int = 100
+
+
+@dataclass
+class WorkflowDisableOptions:
+    """Options for disabling a workflow."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class WorkflowEnableOptions:
+    """Options for enabling a workflow."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class WorkflowSyncOptions:
+    """Options for syncing workflows."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class WorkflowSyncResult:
+    """Result of a workflow sync operation."""
+
+    name: str
+    version: str
+    action: str  # "created", "updated", "unchanged"

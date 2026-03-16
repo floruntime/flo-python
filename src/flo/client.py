@@ -67,12 +67,14 @@ class FloClient:
         from .kv import KVOperations
         from .queue import QueueOperations
         from .streams import StreamOperations
+        from .workflows import WorkflowOperations
 
         self.kv = KVOperations(self)
         self.queue = QueueOperations(self)
         self.stream = StreamOperations(self)
         self.action = ActionOperations(self)
         self.worker = WorkerOperations(self)
+        self.workflow = WorkflowOperations(self)
 
         if debug:
             logging.basicConfig(level=logging.DEBUG)

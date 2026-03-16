@@ -14,6 +14,19 @@ class FloError(Exception):
     pass
 
 
+class NonRetryableError(FloError):
+    """Marks an action error as non-retryable.
+
+    When raised from an action handler, the task will be failed with
+    retry=False, so the server will not re-queue it.
+
+    Example:
+        raise NonRetryableError("invalid input, will never succeed")
+    """
+
+    pass
+
+
 # =============================================================================
 # Connection Errors
 # =============================================================================

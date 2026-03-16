@@ -45,6 +45,7 @@ from .exceptions import (
     InvalidMagicError,
     KeyTooLargeError,
     NamespaceTooLargeError,
+    NonRetryableError,
     NotConnectedError,
     NotFoundError,
     OverloadedError,
@@ -119,9 +120,24 @@ from .types import (
     WorkerRegisterOptions,
     WorkerTask,
     WorkerTouchOptions,
+    # Workflow types
+    WorkflowCancelOptions,
+    WorkflowCreateOptions,
+    WorkflowDisableOptions,
+    WorkflowEnableOptions,
+    WorkflowGetDefinitionOptions,
+    WorkflowHistoryOptions,
+    WorkflowListDefinitionsOptions,
+    WorkflowListRunsOptions,
+    WorkflowSignalOptions,
+    WorkflowStartOptions,
+    WorkflowStatusOptions,
+    WorkflowSyncOptions,
+    WorkflowSyncResult,
 )
 from .worker import (
     ActionContext,
+    ActionResult,
     ActionWorker,
     ActionWorkerOptions,
     StreamContext,
@@ -129,6 +145,7 @@ from .worker import (
     StreamWorker,
     StreamWorkerOptions,
 )
+from .workflows import WorkflowOperations
 
 __version__ = "0.1.0"
 
@@ -139,12 +156,15 @@ __all__ = [
     "ActionWorker",
     "ActionWorkerOptions",
     "ActionContext",
+    "ActionResult",
     "StreamWorker",
     "StreamWorkerOptions",
     "StreamContext",
     "StreamRecordHandler",
+    "WorkflowOperations",
     # Exceptions
     "FloError",
+    "NonRetryableError",
     "NotConnectedError",
     "ConnectionFailedError",
     "InvalidEndpointError",
@@ -233,4 +253,19 @@ __all__ = [
     "WorkerCompleteOptions",
     "WorkerFailOptions",
     "WorkerListOptions",
+    # Workflow types
+    "WorkflowOperations",
+    "WorkflowCreateOptions",
+    "WorkflowGetDefinitionOptions",
+    "WorkflowStartOptions",
+    "WorkflowStatusOptions",
+    "WorkflowSignalOptions",
+    "WorkflowCancelOptions",
+    "WorkflowHistoryOptions",
+    "WorkflowListRunsOptions",
+    "WorkflowListDefinitionsOptions",
+    "WorkflowDisableOptions",
+    "WorkflowEnableOptions",
+    "WorkflowSyncOptions",
+    "WorkflowSyncResult",
 ]

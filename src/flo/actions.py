@@ -360,7 +360,7 @@ class WorkerOperations:
         opts = options or WorkerCompleteOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        value = serialize_worker_complete_value(action_name, task_id, result)
+        value = serialize_worker_complete_value(action_name, task_id, result, opts.outcome)
 
         await self._client._send_and_check(
             OpCode.ACTION_COMPLETE,
@@ -389,19 +389,13 @@ class WorkerOperations:
         opts = options or WorkerFailOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        value = serialize_worker_fail_value(action_name, task_id, error_message)
-
-        # Retry flag goes in TLV options (matches Go SDK)
-        options_builder = OptionsBuilder()
-        if opts.retry:
-            options_builder.add_flag(OptionTag.RETRY)
+        value = serialize_worker_fail_value(action_name, task_id, error_message, opts.retry)
 
         await self._client._send_and_check(
             OpCode.ACTION_FAIL,
             namespace,
             worker_id.encode("utf-8"),
             value,
-            options_builder.build(),
         )
 
     async def list(

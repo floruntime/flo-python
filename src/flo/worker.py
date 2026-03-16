@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .client import FloClient
+from .exceptions import NonRetryableError
 from .types import (
     ActionType,
     StreamGroupAckOptions,
@@ -43,8 +44,25 @@ from .types import (
 logger = logging.getLogger("flo.worker")
 
 
-# Type alias for action handlers
-ActionHandler = Callable[["ActionContext"], Awaitable[bytes]]
+class ActionResult:
+    """Represents the result of an action with a named outcome.
+
+    Use ``ActionContext.result()`` to create instances.
+
+    Attributes:
+        outcome: Named outcome (e.g. "approved", "rejected").
+        data: Result data as bytes.
+    """
+
+    __slots__ = ("outcome", "data")
+
+    def __init__(self, outcome: str, data: bytes):
+        self.outcome = outcome
+        self.data = data
+
+
+# Type alias for action handlers — can return bytes, dict, or ActionResult
+ActionHandler = Callable[["ActionContext"], Awaitable[bytes | dict | ActionResult]]
 
 
 @dataclass
@@ -125,6 +143,24 @@ class ActionContext:
         """Check if cancelled and raise asyncio.CancelledError if so."""
         if self._cancel_event.is_set():
             raise asyncio.CancelledError("Task was cancelled")
+
+    def result(self, outcome: str, value: Any = None) -> ActionResult:
+        """Create an ActionResult with a named outcome.
+
+        Args:
+            outcome: Named outcome (e.g. "approved", "rejected").
+            value: Result value — dict/list is JSON-encoded, bytes passed through.
+
+        Returns:
+            ActionResult to return from the handler.
+        """
+        if isinstance(value, bytes):
+            data = value
+        elif value is not None:
+            data = json.dumps(value).encode("utf-8")
+        else:
+            data = b""
+        return ActionResult(outcome=outcome, data=data)
 
 
 class ActionWorker:
@@ -402,13 +438,35 @@ class ActionWorker:
                     timeout=self.config.action_timeout,
                 )
 
-                # Success - complete the task
-                await self._client.worker.complete(
-                    self.config.worker_id,
-                    task.task_type,
-                    task.task_id,
-                    result,
-                )
+                # 3-way dispatch based on result type
+                from .types import WorkerCompleteOptions as WCO
+
+                if isinstance(result, ActionResult):
+                    # Named outcome
+                    await self._client.worker.complete(
+                        self.config.worker_id,
+                        task.task_type,
+                        task.task_id,
+                        result.data,
+                        WCO(outcome=result.outcome),
+                    )
+                elif isinstance(result, dict):
+                    # Plain dict → JSON serialize
+                    result_bytes = json.dumps(result).encode("utf-8")
+                    await self._client.worker.complete(
+                        self.config.worker_id,
+                        task.task_type,
+                        task.task_id,
+                        result_bytes,
+                    )
+                else:
+                    # bytes or other → pass through
+                    await self._client.worker.complete(
+                        self.config.worker_id,
+                        task.task_type,
+                        task.task_id,
+                        result if isinstance(result, bytes) else b"",
+                    )
                 logger.info(f"Action completed: {task.task_type}")
 
             except asyncio.TimeoutError:
@@ -431,11 +489,15 @@ class ActionWorker:
 
             except Exception as e:
                 logger.error(f"Action failed: {task.task_type} - {e}")
+                from .types import WorkerFailOptions as WFO
+
+                retry = not isinstance(e, NonRetryableError)
                 await self._client.worker.fail(
                     self.config.worker_id,
                     task.task_type,
                     task.task_id,
                     str(e),
+                    WFO(retry=retry),
                 )
 
         except Exception as e:
