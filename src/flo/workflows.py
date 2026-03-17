@@ -381,7 +381,7 @@ class WorkflowOperations:
         - Different version → updates (upsert)
         """
         opts = options or WorkflowSyncOptions()
-        name, version = _extract_workflow_meta(yaml)
+        name, version, description = _extract_workflow_meta(yaml)
         namespace = self._client.get_namespace(opts.namespace)
 
         existing = await self.get_definition(
@@ -391,12 +391,12 @@ class WorkflowOperations:
         if existing is not None:
             existing_version = _extract_yaml_field(existing, "version")
             if existing_version == version:
-                return WorkflowSyncResult(name=name, version=version, action="unchanged")
+                return WorkflowSyncResult(name=name, version=version, description=description, action="unchanged")
 
         await self.create(name, yaml, WorkflowCreateOptions(namespace=namespace))
 
         action = "updated" if existing is not None else "created"
-        return WorkflowSyncResult(name=name, version=version, action=action)
+        return WorkflowSyncResult(name=name, version=version, description=description, action=action)
 
     async def sync_bytes(
         self, yaml: bytes, options: WorkflowSyncOptions | None = None
@@ -435,12 +435,13 @@ def _extract_yaml_field(yaml: str, field: str) -> str | None:
     return None
 
 
-def _extract_workflow_meta(yaml: str) -> tuple[str, str]:
-    """Extract name and version from workflow YAML."""
+def _extract_workflow_meta(yaml: str) -> tuple[str, str, str]:
+    """Extract name, version, and description from workflow YAML."""
     name = _extract_yaml_field(yaml, "name")
     version = _extract_yaml_field(yaml, "version")
+    description = _extract_yaml_field(yaml, "description") or ""
     if not name:
         raise ValueError("flo: workflow YAML missing required 'name' field")
     if not version:
         raise ValueError("flo: workflow YAML missing required 'version' field")
-    return name, version
+    return name, version, description

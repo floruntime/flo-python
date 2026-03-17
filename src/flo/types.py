@@ -956,4 +956,5 @@ class WorkflowSyncResult:
 
     name: str
     version: str
+    description: str
     action: str  # "created", "updated", "unchanged"
