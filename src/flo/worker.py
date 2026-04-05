@@ -19,6 +19,7 @@ Example:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import secrets
@@ -62,7 +63,7 @@ class ActionResult:
 
 
 # Type alias for action handlers — can return bytes, dict, or ActionResult
-ActionHandler = Callable[["ActionContext"], Awaitable[bytes | dict | ActionResult]]
+ActionHandler = Callable[["ActionContext"], Awaitable[bytes | dict[str, Any] | ActionResult]]
 
 
 @dataclass
@@ -338,10 +339,8 @@ class ActionWorker:
             # Cancel heartbeat
             if self._heartbeat_task is not None:
                 self._heartbeat_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await self._heartbeat_task
-                except asyncio.CancelledError:
-                    pass
                 self._heartbeat_task = None
 
             # Wait for running tasks
@@ -424,6 +423,7 @@ class ActionWorker:
                         # Re-register worker after reconnect
                         try:
                             from .types import WorkerRegisterOptions
+
                             await self._client.worker.register(
                                 self.config.worker_id,
                                 action_names,
@@ -442,7 +442,7 @@ class ActionWorker:
                     logger.error(f"Await error: {e}, retrying...")
                     await asyncio.sleep(1)
 
-    async def _send_with_retry(self, op: str, fn) -> None:
+    async def _send_with_retry(self, op: str, fn: Callable[[], Awaitable[None]]) -> None:
         """Attempt to send a result (Complete/Fail), reconnecting on connection error."""
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -474,12 +474,15 @@ class ActionWorker:
             handler = self._handlers.get(task.task_type)
             if handler is None:
                 logger.error(f"No handler registered for action: {task.task_type}")
-                await self._send_with_retry("fail", lambda: rc.worker.fail(
-                    self.config.worker_id,
-                    task.task_type,
-                    task.task_id,
-                    f"No handler for: {task.task_type}",
-                ))
+                await self._send_with_retry(
+                    "fail",
+                    lambda: rc.worker.fail(
+                        self.config.worker_id,
+                        task.task_type,
+                        task.task_id,
+                        f"No handler for: {task.task_type}",
+                    ),
+                )
                 return
 
             # Create action context
@@ -501,66 +504,85 @@ class ActionWorker:
                 )
 
                 # 3-way dispatch based on result type
-                from .types import WorkerCompleteOptions as WCO
+                from .types import WorkerCompleteOptions
 
                 if isinstance(result, ActionResult):
                     # Named outcome
-                    await self._send_with_retry("complete", lambda: rc.worker.complete(
-                        self.config.worker_id,
-                        task.task_type,
-                        task.task_id,
-                        result.data,
-                        WCO(outcome=result.outcome),
-                    ))
+                    await self._send_with_retry(
+                        "complete",
+                        lambda: rc.worker.complete(
+                            self.config.worker_id,
+                            task.task_type,
+                            task.task_id,
+                            result.data,
+                            WorkerCompleteOptions(outcome=result.outcome),
+                        ),
+                    )
                 elif isinstance(result, dict):
                     # Plain dict → JSON serialize
                     result_bytes = json.dumps(result).encode("utf-8")
-                    await self._send_with_retry("complete", lambda: rc.worker.complete(
-                        self.config.worker_id,
-                        task.task_type,
-                        task.task_id,
-                        result_bytes,
-                    ))
+                    await self._send_with_retry(
+                        "complete",
+                        lambda: rc.worker.complete(
+                            self.config.worker_id,
+                            task.task_type,
+                            task.task_id,
+                            result_bytes,
+                        ),
+                    )
                 else:
                     # bytes or other → pass through
-                    await self._send_with_retry("complete", lambda: rc.worker.complete(
-                        self.config.worker_id,
-                        task.task_type,
-                        task.task_id,
-                        result if isinstance(result, bytes) else b"",
-                    ))
+                    await self._send_with_retry(
+                        "complete",
+                        lambda: rc.worker.complete(
+                            self.config.worker_id,
+                            task.task_type,
+                            task.task_id,
+                            result if isinstance(result, bytes) else b"",
+                        ),
+                    )
                 logger.info(f"Action completed: {task.task_type}")
 
             except asyncio.TimeoutError:
                 logger.error(f"Action timed out: {task.task_type}")
-                await self._send_with_retry("fail", lambda: rc.worker.fail(
-                    self.config.worker_id,
-                    task.task_type,
-                    task.task_id,
-                    "Action timed out",
-                ))
+                await self._send_with_retry(
+                    "fail",
+                    lambda: rc.worker.fail(
+                        self.config.worker_id,
+                        task.task_type,
+                        task.task_id,
+                        "Action timed out",
+                    ),
+                )
 
             except asyncio.CancelledError:
                 logger.warning(f"Action cancelled: {task.task_type}")
-                await self._send_with_retry("fail", lambda: rc.worker.fail(
-                    self.config.worker_id,
-                    task.task_type,
-                    task.task_id,
-                    "Action cancelled",
-                ))
+                await self._send_with_retry(
+                    "fail",
+                    lambda: rc.worker.fail(
+                        self.config.worker_id,
+                        task.task_type,
+                        task.task_id,
+                        "Action cancelled",
+                    ),
+                )
 
-            except Exception as e:
-                logger.error(f"Action failed: {task.task_type} - {e}")
-                from .types import WorkerFailOptions as WFO
+            except Exception as exc:
+                logger.error(f"Action failed: {task.task_type} - {exc}")
+                from .types import WorkerFailOptions
 
-                retry = not isinstance(e, NonRetryableError)
-                await self._send_with_retry("fail", lambda: rc.worker.fail(
-                    self.config.worker_id,
-                    task.task_type,
-                    task.task_id,
-                    str(e),
-                    WFO(retry=retry),
-                ))
+                retry = not isinstance(exc, NonRetryableError)
+                err_msg = str(exc)
+                await self._send_with_retry(
+                    "fail",
+                    lambda: rc.worker.fail(
+                        self.config.worker_id,
+                        task.task_type,
+                        task.task_id,
+                        err_msg,
+                        WorkerFailOptions(retry=retry),
+                    ),
+                )
 
         except Exception as e:
             logger.error(f"Failed to report task result: {e}")
@@ -774,9 +796,7 @@ class StreamWorker:
                 self.config.group,
                 self.config.consumer,
             )
-            logger.info(
-                f"Joined consumer group {self.config.group} on stream {self.config.stream}"
-            )
+            logger.info(f"Joined consumer group {self.config.group} on stream {self.config.stream}")
 
             self._semaphore = asyncio.Semaphore(self.config.concurrency)
             self._running = True
@@ -875,7 +895,9 @@ class StreamWorker:
             self.config.consumer,
         )
 
-    async def _ack_with_retry(self, record_ids: list, options: StreamGroupAckOptions) -> None:
+    async def _ack_with_retry(
+        self, record_ids: list[StreamID], options: StreamGroupAckOptions
+    ) -> None:
         """Ack with retry on connection error."""
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -892,7 +914,8 @@ class StreamWorker:
                 if not is_connection_error(e) or not self._running:
                     raise
                 logger.warning(
-                    f"Connection lost while acking (attempt {attempt}/{max_attempts}), reconnecting..."
+                    "Connection lost while acking "
+                    f"(attempt {attempt}/{max_attempts}), reconnecting..."
                 )
                 await self._handle_reconnect()
 
@@ -923,8 +946,7 @@ class StreamWorker:
 
             except Exception as e:
                 logger.error(
-                    f"Record processing failed (stream={self.config.stream}, "
-                    f"id={record.id}): {e}"
+                    f"Record processing failed (stream={self.config.stream}, id={record.id}): {e}"
                 )
                 try:
                     await self._client.stream.group_nack(

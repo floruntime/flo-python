@@ -60,10 +60,9 @@ from .exceptions import (
     ValueTooLargeError,
     is_connection_error,
 )
+from .processing import ProcessingOperations
 from .types import (
-    # KV types
     AckOptions,
-    # Action types
     ActionDeleteOptions,
     ActionInfo,
     ActionInvokeOptions,
@@ -88,11 +87,22 @@ from .types import (
     OpCode,
     OptionTag,
     PeekOptions,
+    ProcessingCancelOptions,
+    ProcessingListEntry,
+    ProcessingListOptions,
+    ProcessingRescaleOptions,
+    ProcessingRestoreOptions,
+    ProcessingSavepointOptions,
+    ProcessingStatusOptions,
+    ProcessingStatusResult,
+    ProcessingStopOptions,
+    ProcessingSubmitOptions,
+    ProcessingSyncOptions,
+    ProcessingSyncResult,
     PutOptions,
     ScanOptions,
     ScanResult,
     StatusCode,
-    # Stream types
     StorageTier,
     StreamAppendOptions,
     StreamAppendResult,
@@ -107,7 +117,6 @@ from .types import (
     StreamReadResult,
     StreamRecord,
     StreamTrimOptions,
-    # Worker types
     TaskAssignment,
     TouchOptions,
     VersionEntry,
@@ -121,7 +130,6 @@ from .types import (
     WorkerRegisterOptions,
     WorkerTask,
     WorkerTouchOptions,
-    # Workflow types
     WorkflowCancelOptions,
     WorkflowCreateOptions,
     WorkflowDisableOptions,
@@ -135,19 +143,6 @@ from .types import (
     WorkflowStatusOptions,
     WorkflowSyncOptions,
     WorkflowSyncResult,
-    # Processing types
-    ProcessingCancelOptions,
-    ProcessingListEntry,
-    ProcessingListOptions,
-    ProcessingRescaleOptions,
-    ProcessingRestoreOptions,
-    ProcessingSavepointOptions,
-    ProcessingStatusOptions,
-    ProcessingStatusResult,
-    ProcessingStopOptions,
-    ProcessingSubmitOptions,
-    ProcessingSyncOptions,
-    ProcessingSyncResult,
 )
 from .worker import (
     ActionContext,
@@ -160,7 +155,6 @@ from .worker import (
     StreamWorkerOptions,
 )
 from .workflows import WorkflowOperations
-from .processing import ProcessingOperations
 
 __version__ = "0.1.0"
 

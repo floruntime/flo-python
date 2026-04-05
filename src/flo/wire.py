@@ -638,7 +638,8 @@ def parse_stream_read_response(data: bytes) -> StreamReadResult:
 def parse_stream_info_response(data: bytes) -> StreamInfo:
     """Parse stream info response data.
 
-    Format: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64][count:u64][bytes:u64][partition_count:u32]
+    Format: [first_ts:u64][first_seq:u64][last_ts:u64][last_seq:u64]
+            [count:u64][bytes:u64][partition_count:u32]
     """
     if len(data) < 52:
         raise IncompleteResponseError("Stream info response too short")
@@ -676,7 +677,7 @@ def serialize_group_value(group: str, consumer: str) -> bytes:
     return bytes(result)
 
 
-def serialize_group_ack_value(group: str, ids: list, consumer: str = "") -> bytes:
+def serialize_group_ack_value(group: str, ids: list[StreamID], consumer: str = "") -> bytes:
     """Serialize group name, consumer, and StreamIDs for group ack/nack.
 
     Format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][ts:u64][seq:u64]*
@@ -890,7 +891,8 @@ def serialize_worker_complete_value(
 ) -> bytes:
     """Serialize worker complete value.
 
-    Format: [action_name_len:u16][action_name][task_id_len:u16][task_id][outcome_len:u16][outcome][result_len:u16][result]
+    Format: [action_name_len:u16][action_name][task_id_len:u16][task_id]
+            [outcome_len:u16][outcome][result_len:u16][result]
     """
     action_bytes = action_name.encode("utf-8")
     task_id_bytes = task_id.encode("utf-8")

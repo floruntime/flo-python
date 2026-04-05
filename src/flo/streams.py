@@ -15,6 +15,7 @@ from .types import (
     StreamGroupJoinOptions,
     StreamGroupNackOptions,
     StreamGroupReadOptions,
+    StreamID,
     StreamInfo,
     StreamInfoOptions,
     StreamReadOptions,
@@ -343,7 +344,7 @@ class StreamOperations:
         self,
         stream: str,
         group: str,
-        ids: list,
+        ids: list[StreamID],
         options: StreamGroupAckOptions | None = None,
     ) -> None:
         """Acknowledge records in a consumer group.
@@ -384,7 +385,7 @@ class StreamOperations:
         self,
         stream: str,
         group: str,
-        ids: list,
+        ids: list[StreamID],
         options: StreamGroupNackOptions | None = None,
     ) -> None:
         """Negatively acknowledge records in a consumer group for redelivery.

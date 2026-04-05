@@ -6,12 +6,12 @@ savepoint, restore, rescale, sync.
 
 from __future__ import annotations
 
+import builtins
 import os
 import re
 import struct
 from typing import TYPE_CHECKING
 
-from .exceptions import raise_for_status
 from .types import (
     OpCode,
     ProcessingCancelOptions,
@@ -84,9 +84,7 @@ class ProcessingOperations:
 
         return _parse_processing_status(resp.data)
 
-    async def list(
-        self, options: ProcessingListOptions | None = None
-    ) -> list[ProcessingListEntry]:
+    async def list(self, options: ProcessingListOptions | None = None) -> list[ProcessingListEntry]:
         """List processing jobs."""
         opts = options or ProcessingListOptions()
         namespace = self._client.get_namespace(opts.namespace)
@@ -104,9 +102,7 @@ class ProcessingOperations:
 
         return _parse_processing_list(resp.data)
 
-    async def stop(
-        self, job_id: str, options: ProcessingStopOptions | None = None
-    ) -> None:
+    async def stop(self, job_id: str, options: ProcessingStopOptions | None = None) -> None:
         """Gracefully stop a processing job."""
         opts = options or ProcessingStopOptions()
         namespace = self._client.get_namespace(opts.namespace)
@@ -118,9 +114,7 @@ class ProcessingOperations:
             b"",
         )
 
-    async def cancel(
-        self, job_id: str, options: ProcessingCancelOptions | None = None
-    ) -> None:
+    async def cancel(self, job_id: str, options: ProcessingCancelOptions | None = None) -> None:
         """Force-cancel a processing job."""
         opts = options or ProcessingCancelOptions()
         namespace = self._client.get_namespace(opts.namespace)
@@ -210,9 +204,9 @@ class ProcessingOperations:
 
     async def sync_dir(
         self, dir_path: str, options: ProcessingSyncOptions | None = None
-    ) -> list[ProcessingSyncResult]:
+    ) -> builtins.list[ProcessingSyncResult]:
         """Sync all YAML files in a directory."""
-        results: list[ProcessingSyncResult] = []
+        results: builtins.list[ProcessingSyncResult] = []
         for entry in sorted(os.listdir(dir_path)):
             if entry.endswith((".yaml", ".yml")):
                 file_path = os.path.join(dir_path, entry)
@@ -236,7 +230,7 @@ def _parse_processing_status(data: bytes) -> ProcessingStatusResult:
 
     def read_u16() -> int:
         nonlocal pos
-        (v,) = struct.unpack_from("<H", data, pos)
+        v: int = struct.unpack_from("<H", data, pos)[0]
         pos += 2
         return v
 
@@ -295,7 +289,7 @@ def _parse_processing_list(data: bytes) -> list[ProcessingListEntry]:
 
     def read_u16() -> int:
         nonlocal pos
-        (v,) = struct.unpack_from("<H", data, pos)
+        v: int = struct.unpack_from("<H", data, pos)[0]
         pos += 2
         return v
 
@@ -334,9 +328,7 @@ def _parse_processing_list(data: bytes) -> list[ProcessingListEntry]:
 # YAML Metadata Extraction
 # =============================================================================
 
-_YAML_FIELD_RE = re.compile(
-    r"""^\s*['"]?(\w+)['"]?\s*:\s*['"]?([^'"#\n]+?)['"]?\s*(?:#.*)?$"""
-)
+_YAML_FIELD_RE = re.compile(r"""^\s*['"]?(\w+)['"]?\s*:\s*['"]?([^'"#\n]+?)['"]?\s*(?:#.*)?$""")
 
 
 def _extract_processing_meta(data: bytes) -> str:

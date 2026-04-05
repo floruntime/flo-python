@@ -11,7 +11,6 @@ import re
 import struct
 from typing import TYPE_CHECKING, Any
 
-from .exceptions import raise_for_status
 from .types import (
     OpCode,
     StatusCode,
@@ -94,9 +93,7 @@ class WorkflowOperations:
 
         input_bytes = b""
         if input_data is not None:
-            input_bytes = (
-                input_data.encode("utf-8") if isinstance(input_data, str) else input_data
-            )
+            input_bytes = input_data.encode("utf-8") if isinstance(input_data, str) else input_data
 
         # Wire format: [ver_len:u16][ver]?[has_idem:u8][idem_len:u16]?[idem]?
         #              [has_rid:u8][rid_len:u16]?[rid]?[input...]
@@ -159,13 +156,18 @@ class WorkflowOperations:
         data = resp.data
         pos = 0
         status_names = [
-            "pending", "running", "waiting", "completed",
-            "failed", "cancelled", "timed_out",
+            "pending",
+            "running",
+            "waiting",
+            "completed",
+            "failed",
+            "cancelled",
+            "timed_out",
         ]
 
         def read_u16() -> int:
             nonlocal pos
-            (v,) = struct.unpack_from("<H", data, pos)
+            v: int = struct.unpack_from("<H", data, pos)[0]
             pos += 2
             return v
 
@@ -182,7 +184,11 @@ class WorkflowOperations:
 
         status_byte = data[pos]
         pos += 1
-        status_str = status_names[status_byte] if status_byte < len(status_names) else f"unknown({status_byte})"
+        status_str = (
+            status_names[status_byte]
+            if status_byte < len(status_names)
+            else f"unknown({status_byte})"
+        )
 
         current_step = read_str()
 
@@ -276,9 +282,7 @@ class WorkflowOperations:
             value,
         )
 
-    async def history(
-        self, run_id: str, options: WorkflowHistoryOptions | None = None
-    ) -> bytes:
+    async def history(self, run_id: str, options: WorkflowHistoryOptions | None = None) -> bytes:
         """Get the execution history of a workflow run. Returns raw response bytes."""
         opts = options or WorkflowHistoryOptions()
         namespace = self._client.get_namespace(opts.namespace)
@@ -295,9 +299,7 @@ class WorkflowOperations:
 
         return resp.data
 
-    async def list_runs(
-        self, options: WorkflowListRunsOptions | None = None
-    ) -> bytes:
+    async def list_runs(self, options: WorkflowListRunsOptions | None = None) -> bytes:
         """List workflow runs. Returns raw response bytes."""
         opts = options or WorkflowListRunsOptions()
         namespace = self._client.get_namespace(opts.namespace)
@@ -346,9 +348,7 @@ class WorkflowOperations:
 
         return resp.data
 
-    async def disable(
-        self, name: str, options: WorkflowDisableOptions | None = None
-    ) -> None:
+    async def disable(self, name: str, options: WorkflowDisableOptions | None = None) -> None:
         """Disable a workflow definition (prevents new runs)."""
         opts = options or WorkflowDisableOptions()
         namespace = self._client.get_namespace(opts.namespace)
@@ -360,9 +360,7 @@ class WorkflowOperations:
             b"",
         )
 
-    async def enable(
-        self, name: str, options: WorkflowEnableOptions | None = None
-    ) -> None:
+    async def enable(self, name: str, options: WorkflowEnableOptions | None = None) -> None:
         """Re-enable a disabled workflow definition."""
         opts = options or WorkflowEnableOptions()
         namespace = self._client.get_namespace(opts.namespace)
@@ -399,12 +397,22 @@ class WorkflowOperations:
         if existing is not None:
             existing_version = _extract_yaml_field(existing, "version")
             if existing_version == version:
-                return WorkflowSyncResult(name=name, version=version, description=description, action="unchanged")
+                return WorkflowSyncResult(
+                    name=name,
+                    version=version,
+                    description=description,
+                    action="unchanged",
+                )
 
         await self.create(name, yaml, WorkflowCreateOptions(namespace=namespace))
 
         action = "updated" if existing is not None else "created"
-        return WorkflowSyncResult(name=name, version=version, description=description, action=action)
+        return WorkflowSyncResult(
+            name=name,
+            version=version,
+            description=description,
+            action=action,
+        )
 
     async def sync_bytes(
         self, yaml: bytes, options: WorkflowSyncOptions | None = None

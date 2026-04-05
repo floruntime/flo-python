@@ -13,7 +13,6 @@ from .exceptions import (
     InvalidEndpointError,
     NotConnectedError,
     UnexpectedEofError,
-    is_connection_error,
     raise_for_status,
 )
 from .types import HEADER_SIZE, OpCode, StatusCode
@@ -198,7 +197,10 @@ class FloClient:
                         f"Failed to reconnect to {self._endpoint} after {attempt} attempts"
                     ) from exc
                 logger.warning(
-                    f"[flo] Reconnect attempt {attempt} failed: {exc}, retrying in {backoff:.0f}s..."
+                    "[flo] Reconnect attempt %d failed: %s, retrying in %.0fs...",
+                    attempt,
+                    exc,
+                    backoff,
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
