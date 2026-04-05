@@ -14,7 +14,7 @@ from typing import Optional
 
 MAGIC: int = 0x004F4C46  # "FLO\0" in little-endian
 VERSION: int = 0x01
-HEADER_SIZE: int = 24
+HEADER_SIZE: int = 32
 
 # Size limits (for client-side validation)
 MAX_NAMESPACE_SIZE: int = 255
@@ -28,209 +28,211 @@ MAX_VALUE_SIZE: int = 16 * 1024 * 1024  # 16 MB practical limit
 
 
 class OpCode(IntEnum):
-    """Operation codes for Flo protocol requests."""
+    """Operation codes for Flo protocol requests.
 
-    # System Operations (0x00 - 0x0F)
-    PING = 0x00
-    PONG = 0x01
-    ERROR_RESPONSE = 0x02
-    AUTH = 0x03
-    SET_DURABILITY = 0x04
-    OK = 0x05
+    Three-layer layout: Infra(0x000-0x0FF), Data(0x100-0x2FF), Compute(0x300-0x3FF)
+    """
 
-    # Streams (0x10 - 0x1F)
-    STREAM_APPEND = 0x10
-    STREAM_READ = 0x11
-    STREAM_TRIM = 0x12
-    STREAM_INFO = 0x13
-    STREAM_APPEND_RESPONSE = 0x14
-    STREAM_READ_RESPONSE = 0x15
-    STREAM_EVENT = 0x16
-    STREAM_SUBSCRIBE = 0x17
-    STREAM_UNSUBSCRIBE = 0x18
-    STREAM_SUBSCRIBED = 0x19
-    STREAM_UNSUBSCRIBED = 0x1A
-    STREAM_LIST = 0x1B
-    STREAM_LIST_RESPONSE = 0x1C
-    STREAM_CREATE = 0x1D
-    STREAM_CREATE_RESPONSE = 0x1E
-    STREAM_ALTER = 0x1F
+    # ── System (0x000 – 0x00F) ──
+    PING = 0x000
+    PONG = 0x001
+    ERROR_RESPONSE = 0x002
+    AUTH = 0x003
+    SET_DURABILITY = 0x004
+    OK = 0x005
 
-    # Stream Consumer Groups (0x20 - 0x2F)
-    STREAM_GROUP_CREATE = 0x20
-    STREAM_GROUP_JOIN = 0x21
-    STREAM_GROUP_LEAVE = 0x22
-    STREAM_GROUP_READ = 0x23
-    STREAM_GROUP_ACK = 0x24
-    STREAM_GROUP_CLAIM = 0x25
-    STREAM_GROUP_PENDING = 0x26
-    STREAM_GROUP_CONFIGURE_SWEEPER = 0x27
-    STREAM_GROUP_READ_RESPONSE = 0x28
-    STREAM_GROUP_NACK = 0x29
-    STREAM_GROUP_TOUCH = 0x2A
-    STREAM_GROUP_INFO = 0x2B
-    STREAM_GROUP_DELETE = 0x2C
+    # ── Namespace (0x010 – 0x02F) ──
+    NAMESPACE_CREATE = 0x010
+    NAMESPACE_DELETE = 0x011
+    NAMESPACE_LIST = 0x012
+    NAMESPACE_INFO = 0x013
+    NAMESPACE_CONFIG_SET = 0x014
+    NAMESPACE_CONFIG_GET = 0x015
+    NAMESPACE_CREATE_RESPONSE = 0x020
+    NAMESPACE_DELETE_RESPONSE = 0x021
+    NAMESPACE_LIST_RESPONSE = 0x022
+    NAMESPACE_INFO_RESPONSE = 0x023
+    NAMESPACE_CONFIG_SET_RESPONSE = 0x024
+    NAMESPACE_CONFIG_GET_RESPONSE = 0x025
 
-    # KV Operations (0x30 - 0x3F)
-    KV_PUT = 0x30
-    KV_GET = 0x31
-    KV_DELETE = 0x32
-    KV_SCAN = 0x33
-    KV_HISTORY = 0x34
-    KV_GET_RESPONSE = 0x35
-    KV_PUT_RESPONSE = 0x36
-    KV_SCAN_RESPONSE = 0x37
-    KV_HISTORY_RESPONSE = 0x38
+    # ── Cluster (0x030 – 0x04F) ──
+    CLUSTER_STATUS = 0x030
+    CLUSTER_MEMBERS = 0x031
+    CLUSTER_JOIN = 0x032
+    CLUSTER_LEAVE = 0x033
+    CLUSTER_TRANSFER_LEADER = 0x034
+    CLUSTER_ADD_NODE = 0x035
+    CLUSTER_REMOVE_NODE = 0x036
+    CLUSTER_STATUS_RESPONSE = 0x040
+    CLUSTER_MEMBERS_RESPONSE = 0x041
+    CLUSTER_JOIN_RESPONSE = 0x042
 
-    # Transactions (0x39 - 0x3B)
-    KV_BEGIN_TXN = 0x39
-    KV_COMMIT_TXN = 0x3A
-    KV_ROLLBACK_TXN = 0x3B
+    # ── KV + Transactions + Snapshots (0x100 – 0x12F) ──
+    KV_PUT = 0x100
+    KV_GET = 0x101
+    KV_MGET = 0x102
+    KV_DELETE = 0x103
+    KV_SCAN = 0x104
+    KV_HISTORY = 0x105
+    KV_GET_RESPONSE = 0x106
+    KV_MGET_RESPONSE = 0x107
+    KV_PUT_RESPONSE = 0x108
+    KV_SCAN_RESPONSE = 0x109
+    KV_HISTORY_RESPONSE = 0x10A
+    KV_BEGIN_TXN = 0x110
+    KV_COMMIT_TXN = 0x111
+    KV_ROLLBACK_TXN = 0x112
+    KV_SNAPSHOT_CREATE = 0x120
+    KV_SNAPSHOT_GET = 0x121
+    KV_SNAPSHOT_RELEASE = 0x122
+    KV_SNAPSHOT_CREATE_RESPONSE = 0x123
 
-    # Snapshots (0x3C - 0x3F)
-    KV_SNAPSHOT_CREATE = 0x3C
-    KV_SNAPSHOT_GET = 0x3D
-    KV_SNAPSHOT_RELEASE = 0x3E
-    KV_SNAPSHOT_CREATE_RESPONSE = 0x3F
+    # ── Streams (0x130 – 0x14F) ──
+    STREAM_APPEND = 0x130
+    STREAM_READ = 0x131
+    STREAM_TRIM = 0x132
+    STREAM_INFO = 0x133
+    STREAM_APPEND_RESPONSE = 0x134
+    STREAM_READ_RESPONSE = 0x135
+    STREAM_EVENT = 0x136
+    STREAM_SUBSCRIBE = 0x137
+    STREAM_UNSUBSCRIBE = 0x138
+    STREAM_SUBSCRIBED = 0x139
+    STREAM_UNSUBSCRIBED = 0x13A
+    STREAM_LIST = 0x13B
+    STREAM_LIST_RESPONSE = 0x13C
+    STREAM_CREATE = 0x13D
+    STREAM_CREATE_RESPONSE = 0x13E
+    STREAM_ALTER = 0x13F
 
-    # Queues (0x40 - 0x5F)
-    QUEUE_ENQUEUE = 0x40
-    QUEUE_DEQUEUE = 0x41
-    QUEUE_COMPLETE = 0x42
-    QUEUE_EXTEND_LEASE = 0x43
-    QUEUE_FAIL = 0x44
-    QUEUE_FAIL_AUTO = 0x45
-    QUEUE_DLQ_LIST = 0x46
-    QUEUE_DLQ_DELETE = 0x47
-    QUEUE_DLQ_REQUEUE = 0x48
-    QUEUE_DLQ_STATS = 0x49
-    QUEUE_PROMOTE_DUE = 0x4A
-    QUEUE_STATS = 0x4B
-    QUEUE_PEEK = 0x4C
-    QUEUE_TOUCH = 0x4D
-    QUEUE_BATCH_ENQUEUE = 0x4E
-    QUEUE_PURGE = 0x4F
+    # ── Stream Consumer Groups (0x150 – 0x16F) ──
+    STREAM_GROUP_CREATE = 0x150
+    STREAM_GROUP_JOIN = 0x151
+    STREAM_GROUP_LEAVE = 0x152
+    STREAM_GROUP_READ = 0x153
+    STREAM_GROUP_ACK = 0x154
+    STREAM_GROUP_CLAIM = 0x155
+    STREAM_GROUP_PENDING = 0x156
+    STREAM_GROUP_CONFIGURE_SWEEPER = 0x157
+    STREAM_GROUP_READ_RESPONSE = 0x158
+    STREAM_GROUP_NACK = 0x159
+    STREAM_GROUP_TOUCH = 0x15A
+    STREAM_GROUP_INFO = 0x15B
+    STREAM_GROUP_DELETE = 0x15C
 
-    # Queue responses (0x50 - 0x5F)
-    QUEUE_ENQUEUE_RESPONSE = 0x50
-    QUEUE_DEQUEUE_RESPONSE = 0x51
-    QUEUE_DLQ_LIST_RESPONSE = 0x52
-    QUEUE_STATS_RESPONSE = 0x53
-    QUEUE_PEEK_RESPONSE = 0x54
-    QUEUE_TOUCH_RESPONSE = 0x55
-    QUEUE_BATCH_ENQUEUE_RESPONSE = 0x56
-    QUEUE_PURGE_RESPONSE = 0x57
-    QUEUE_LIST = 0x58  # List all queues in namespace
-    QUEUE_LIST_RESPONSE = 0x59
+    # ── Queues (0x170 – 0x19F) ──
+    QUEUE_ENQUEUE = 0x170
+    QUEUE_DEQUEUE = 0x171
+    QUEUE_COMPLETE = 0x172
+    QUEUE_EXTEND_LEASE = 0x173
+    QUEUE_FAIL = 0x174
+    QUEUE_FAIL_AUTO = 0x175
+    QUEUE_DLQ_LIST = 0x176
+    QUEUE_DLQ_DELETE = 0x177
+    QUEUE_DLQ_REQUEUE = 0x178
+    QUEUE_DLQ_STATS = 0x179
+    QUEUE_PROMOTE_DUE = 0x17A
+    QUEUE_STATS = 0x17B
+    QUEUE_PEEK = 0x17C
+    QUEUE_TOUCH = 0x17D
+    QUEUE_BATCH_ENQUEUE = 0x17E
+    QUEUE_PURGE = 0x17F
+    QUEUE_ENQUEUE_RESPONSE = 0x190
+    QUEUE_DEQUEUE_RESPONSE = 0x191
+    QUEUE_DLQ_LIST_RESPONSE = 0x192
+    QUEUE_STATS_RESPONSE = 0x193
+    QUEUE_PEEK_RESPONSE = 0x194
+    QUEUE_TOUCH_RESPONSE = 0x195
+    QUEUE_BATCH_ENQUEUE_RESPONSE = 0x196
+    QUEUE_PURGE_RESPONSE = 0x197
+    QUEUE_LIST = 0x198
+    QUEUE_LIST_RESPONSE = 0x199
 
-    # Actions (0x60 - 0x6D) — action definitions + task dispatch
-    ACTION_REGISTER = 0x60
-    ACTION_INVOKE = 0x61
-    ACTION_STATUS = 0x62
-    ACTION_LIST = 0x63
-    ACTION_DELETE = 0x64
-    ACTION_AWAIT = 0x65  # Worker blocks waiting for task assignment
-    ACTION_COMPLETE = 0x66  # Worker completes a task
-    ACTION_FAIL = 0x67  # Worker fails a task (with optional retry)
-    ACTION_TOUCH = 0x68  # Extend task lease
-    ACTION_REGISTER_RESPONSE = 0x69
-    ACTION_INVOKE_RESPONSE = 0x6A
-    ACTION_STATUS_RESPONSE = 0x6B
-    ACTION_LIST_RESPONSE = 0x6C
-    ACTION_TASK_ASSIGNMENT = 0x6D  # Push task to worker
+    # ── Time-Series (0x1A0 – 0x1BF) ──
+    TS_WRITE = 0x1A0
+    TS_READ = 0x1A1
+    TS_QUERY = 0x1A2
+    TS_FLOQL = 0x1A3
+    TS_LIST = 0x1A4
+    TS_DELETE = 0x1A5
+    TS_RETENTION = 0x1A6
+    TS_WRITE_RESPONSE = 0x1A7
+    TS_READ_RESPONSE = 0x1A8
+    TS_QUERY_RESPONSE = 0x1A9
+    TS_FLOQL_RESPONSE = 0x1AA
+    TS_LIST_RESPONSE = 0x1AB
+    TS_DELETE_RESPONSE = 0x1AC
+    TS_RETENTION_RESPONSE = 0x1AD
 
-    # Workers (0x70 - 0x78) — physical worker tracking & health
-    WORKER_REGISTER = 0x70  # Register worker with type + metadata
-    WORKER_HEARTBEAT = 0x71  # Worker heartbeat / health ping
-    WORKER_DEREGISTER = 0x72  # Remove worker from registry
-    WORKER_LIST = 0x73  # List all workers (with health)
-    WORKER_INFO = 0x74  # Get single worker details
-    WORKER_REGISTER_RESPONSE = 0x75
-    WORKER_LIST_RESPONSE = 0x76
-    WORKER_INFO_RESPONSE = 0x77
-    WORKER_DRAIN = 0x78  # Drain a worker (stop new task assignments)
+    # ── Actions (0x300 – 0x31F) ──
+    ACTION_REGISTER = 0x300
+    ACTION_INVOKE = 0x301
+    ACTION_STATUS = 0x302
+    ACTION_LIST = 0x303
+    ACTION_LIST_RUNS = 0x304
+    ACTION_DELETE = 0x305
+    ACTION_AWAIT = 0x306
+    ACTION_COMPLETE = 0x307
+    ACTION_FAIL = 0x308
+    ACTION_TOUCH = 0x309
+    ACTION_REGISTER_RESPONSE = 0x310
+    ACTION_INVOKE_RESPONSE = 0x311
+    ACTION_STATUS_RESPONSE = 0x312
+    ACTION_LIST_RESPONSE = 0x313
+    ACTION_LIST_RUNS_RESPONSE = 0x314
+    ACTION_TASK_ASSIGNMENT = 0x315
 
-    # Workflows (0x80 - 0x91)
-    WORKFLOW_CREATE = 0x80
-    WORKFLOW_START = 0x81
-    WORKFLOW_SIGNAL = 0x82
-    WORKFLOW_CANCEL = 0x83
-    WORKFLOW_STATUS = 0x84
-    WORKFLOW_HISTORY = 0x85
-    WORKFLOW_LIST_RUNS = 0x86
-    WORKFLOW_GET_DEFINITION = 0x87
-    WORKFLOW_CREATE_RESPONSE = 0x88
-    WORKFLOW_START_RESPONSE = 0x89
-    WORKFLOW_STATUS_RESPONSE = 0x8A
-    WORKFLOW_HISTORY_RESPONSE = 0x8B
-    WORKFLOW_LIST_RUNS_RESPONSE = 0x8C
-    WORKFLOW_GET_DEFINITION_RESPONSE = 0x8D
-    WORKFLOW_DISABLE = 0x8E
-    WORKFLOW_ENABLE = 0x8F
-    WORKFLOW_DISABLE_RESPONSE = 0x90
-    WORKFLOW_ENABLE_RESPONSE = 0x91
-    WORKFLOW_LIST_DEFINITIONS = 0x92
-    WORKFLOW_LIST_DEFINITIONS_RESPONSE = 0x93
+    # ── Workers (0x320 – 0x33F) ──
+    WORKER_REGISTER = 0x320
+    WORKER_HEARTBEAT = 0x321
+    WORKER_DEREGISTER = 0x322
+    WORKER_LIST = 0x323
+    WORKER_INFO = 0x324
+    WORKER_DRAIN = 0x325
+    WORKER_REGISTER_RESPONSE = 0x330
+    WORKER_LIST_RESPONSE = 0x331
+    WORKER_INFO_RESPONSE = 0x332
+    WORKER_DRAIN_RESPONSE = 0x333
 
-    # Cluster Management (0xA0 - 0xAF)
-    CLUSTER_STATUS = 0xA0
-    CLUSTER_MEMBERS = 0xA1
-    CLUSTER_JOIN = 0xA2
-    CLUSTER_LEAVE = 0xA3
-    CLUSTER_TRANSFER_LEADER = 0xA4
-    CLUSTER_ADD_NODE = 0xA5
-    CLUSTER_REMOVE_NODE = 0xA6
-    CLUSTER_STATUS_RESPONSE = 0xA8
-    CLUSTER_MEMBERS_RESPONSE = 0xA9
-    CLUSTER_JOIN_RESPONSE = 0xAA
+    # ── Workflows (0x340 – 0x35F) ──
+    WORKFLOW_CREATE = 0x340
+    WORKFLOW_START = 0x341
+    WORKFLOW_SIGNAL = 0x342
+    WORKFLOW_CANCEL = 0x343
+    WORKFLOW_STATUS = 0x344
+    WORKFLOW_HISTORY = 0x345
+    WORKFLOW_LIST_RUNS = 0x346
+    WORKFLOW_GET_DEFINITION = 0x347
+    WORKFLOW_DISABLE = 0x348
+    WORKFLOW_ENABLE = 0x349
+    WORKFLOW_LIST_DEFINITIONS = 0x34A
+    WORKFLOW_CREATE_RESPONSE = 0x350
+    WORKFLOW_START_RESPONSE = 0x351
+    WORKFLOW_STATUS_RESPONSE = 0x352
+    WORKFLOW_HISTORY_RESPONSE = 0x353
+    WORKFLOW_LIST_RUNS_RESPONSE = 0x354
+    WORKFLOW_GET_DEFINITION_RESPONSE = 0x355
+    WORKFLOW_DISABLE_RESPONSE = 0x356
+    WORKFLOW_ENABLE_RESPONSE = 0x357
+    WORKFLOW_LIST_DEFINITIONS_RESPONSE = 0x358
 
-    # Namespace Management (0xB0 - 0xBF)
-    NAMESPACE_CREATE = 0xB0
-    NAMESPACE_DELETE = 0xB1
-    NAMESPACE_LIST = 0xB2
-    NAMESPACE_INFO = 0xB3
-    NAMESPACE_CREATE_RESPONSE = 0xB4
-    NAMESPACE_DELETE_RESPONSE = 0xB5
-    NAMESPACE_LIST_RESPONSE = 0xB6
-    NAMESPACE_INFO_RESPONSE = 0xB7
-    NAMESPACE_CONFIG_SET = 0xB8  # Set namespace configuration (admin-only)
-    NAMESPACE_CONFIG_GET = 0xB9  # Get namespace configuration
-    NAMESPACE_CONFIG_SET_RESPONSE = 0xBA
-    NAMESPACE_CONFIG_GET_RESPONSE = 0xBB
-
-    # Processing / Stream Processing (0xC0 - 0xD1)
-    PROCESSING_SUBMIT = 0xC0
-    PROCESSING_STOP = 0xC1
-    PROCESSING_CANCEL = 0xC2
-    PROCESSING_STATUS = 0xC3
-    PROCESSING_LIST = 0xC4
-    PROCESSING_SAVEPOINT = 0xC6
-    PROCESSING_RESTORE = 0xC7
-    PROCESSING_RESCALE = 0xC8
-    PROCESSING_SUBMIT_RESPONSE = 0xC9
-    PROCESSING_STOP_RESPONSE = 0xCA
-    PROCESSING_CANCEL_RESPONSE = 0xCB
-    PROCESSING_STATUS_RESPONSE = 0xCC
-    PROCESSING_LIST_RESPONSE = 0xCD
-    PROCESSING_SAVEPOINT_RESPONSE = 0xCF
-    PROCESSING_RESTORE_RESPONSE = 0xD0
-    PROCESSING_RESCALE_RESPONSE = 0xD1
-
-    # Time-Series Operations (0xE0 - 0xED)
-    TS_WRITE = 0xE0  # Write data point(s) to a time-series
-    TS_READ = 0xE1  # Read raw data points from a time-series
-    TS_QUERY = 0xE2  # Aggregated query over a time range
-    TS_FLOQL = 0xE3  # FloQL query string
-    TS_LIST = 0xE4  # List measurements or series
-    TS_DELETE = 0xE5  # Delete a series and its metadata
-    TS_RETENTION = 0xE6  # Configure retention / downsampling policy
-    TS_WRITE_RESPONSE = 0xE7
-    TS_READ_RESPONSE = 0xE8
-    TS_QUERY_RESPONSE = 0xE9
-    TS_FLOQL_RESPONSE = 0xEA
-    TS_LIST_RESPONSE = 0xEB
-    TS_DELETE_RESPONSE = 0xEC
-    TS_RETENTION_RESPONSE = 0xED
+    # ── Processing (0x360 – 0x37F) ──
+    PROCESSING_SUBMIT = 0x360
+    PROCESSING_STOP = 0x361
+    PROCESSING_CANCEL = 0x362
+    PROCESSING_STATUS = 0x363
+    PROCESSING_LIST = 0x364
+    PROCESSING_SAVEPOINT = 0x365
+    PROCESSING_RESTORE = 0x366
+    PROCESSING_RESCALE = 0x367
+    PROCESSING_SUBMIT_RESPONSE = 0x370
+    PROCESSING_STOP_RESPONSE = 0x371
+    PROCESSING_CANCEL_RESPONSE = 0x372
+    PROCESSING_STATUS_RESPONSE = 0x373
+    PROCESSING_LIST_RESPONSE = 0x374
+    PROCESSING_SAVEPOINT_RESPONSE = 0x375
+    PROCESSING_RESTORE_RESPONSE = 0x376
+    PROCESSING_RESCALE_RESPONSE = 0x377
 
 
 class StatusCode(IntEnum):
@@ -668,7 +670,6 @@ class ActionType(IntEnum):
     """Type of action."""
 
     USER = 0  # External worker-based action
-    WASM = 1  # WebAssembly action
 
 
 @dataclass
@@ -918,6 +919,7 @@ class WorkflowListRunsOptions:
     namespace: str | None = None
     workflow_name: str | None = None
     status_filter: str | None = None
+    cursor: bytes | None = None
     limit: int = 100
 
 
@@ -927,6 +929,7 @@ class WorkflowListDefinitionsOptions:
 
     namespace: str | None = None
     limit: int = 100
+    cursor: bytes | None = None
 
 
 @dataclass
@@ -958,3 +961,105 @@ class WorkflowSyncResult:
     version: str
     description: str
     action: str  # "created", "updated", "unchanged"
+
+
+# =============================================================================
+# Processing Types
+# =============================================================================
+
+
+@dataclass
+class ProcessingSubmitOptions:
+    """Options for submitting a processing job."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class ProcessingStatusOptions:
+    """Options for getting processing job status."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class ProcessingListOptions:
+    """Options for listing processing jobs."""
+
+    namespace: str | None = None
+    limit: int = 100
+    cursor: bytes | None = None
+
+
+@dataclass
+class ProcessingStopOptions:
+    """Options for stopping a processing job."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class ProcessingCancelOptions:
+    """Options for cancelling a processing job."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class ProcessingSavepointOptions:
+    """Options for triggering a savepoint."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class ProcessingRestoreOptions:
+    """Options for restoring from a savepoint."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class ProcessingRescaleOptions:
+    """Options for rescaling a processing job."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class ProcessingSyncOptions:
+    """Options for declarative processing sync."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class ProcessingStatusResult:
+    """Status of a processing job."""
+
+    job_id: str
+    name: str
+    status: str
+    parallelism: int
+    batch_size: int
+    records_processed: int
+    created_at: int
+
+
+@dataclass
+class ProcessingListEntry:
+    """A single entry in a processing job list."""
+
+    name: str
+    job_id: str
+    status: str
+    parallelism: int
+    created_at: int
+
+
+@dataclass
+class ProcessingSyncResult:
+    """Result of a processing sync operation."""
+
+    name: str
+    job_id: str

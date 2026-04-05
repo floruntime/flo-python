@@ -68,7 +68,7 @@ class ActionOperations:
 
         Args:
             name: Action name.
-            action_type: Type of action (USER or WASM).
+            action_type: Type of action (USER only).
             options: Optional registration options.
         """
         opts = options or ActionRegisterOptions()

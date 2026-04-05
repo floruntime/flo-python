@@ -304,12 +304,18 @@ class WorkflowOperations:
 
         key = opts.workflow_name.encode("utf-8") if opts.workflow_name else b""
 
-        # Value: [limit:u32][status_len:u16][status]?
+        # Value: [limit:u32][status_len:u16][status][cursor_len:u16][cursor][search_len:u16][search]
         status_bytes = opts.status_filter.encode("utf-8") if opts.status_filter else b""
+        cursor_bytes = opts.cursor if opts.cursor else b""
+        search_bytes = b""  # search not exposed yet
         value = bytearray()
         value.extend(struct.pack("<I", opts.limit))
         value.extend(struct.pack("<H", len(status_bytes)))
         value.extend(status_bytes)
+        value.extend(struct.pack("<H", len(cursor_bytes)))
+        value.extend(cursor_bytes)
+        value.extend(struct.pack("<H", len(search_bytes)))
+        value.extend(search_bytes)
 
         resp = await self._client._send_and_check(
             OpCode.WORKFLOW_LIST_RUNS,
@@ -327,7 +333,9 @@ class WorkflowOperations:
         opts = options or WorkflowListDefinitionsOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        value = struct.pack("<I", opts.limit)
+        # Wire format: [limit:u32][cursor...]
+        cursor = opts.cursor or b""
+        value = struct.pack("<I", opts.limit) + cursor
 
         resp = await self._client._send_and_check(
             OpCode.WORKFLOW_LIST_DEFINITIONS,

@@ -3,6 +3,7 @@
 Key-value store operations for Flo client.
 """
 
+import struct
 from typing import TYPE_CHECKING
 
 from .types import (
@@ -194,17 +195,16 @@ class KVOperations:
 
         prefix_bytes = prefix.encode("utf-8") if isinstance(prefix, str) else prefix
 
-        # Build TLV options
+        # Build TLV options (keys_only only — limit is in value now)
         builder = OptionsBuilder()
-
-        if opts.limit is not None:
-            builder.add_u32(OptionTag.LIMIT, opts.limit)
 
         if opts.keys_only:
             builder.add_u8(OptionTag.KEYS_ONLY, 1)
 
-        # Cursor goes in value field
-        value = opts.cursor if opts.cursor is not None else b""
+        # Value: [limit:u32][cursor...]
+        limit = opts.limit if opts.limit is not None else 0  # 0 = server default
+        cursor = opts.cursor if opts.cursor is not None else b""
+        value = struct.pack("<I", limit) + cursor
 
         response = await self._client._send_and_check(
             OpCode.KV_SCAN,

@@ -153,8 +153,8 @@ class TestSerializeRequest:
         assert len(request) > HEADER_SIZE
 
         # Check header
-        magic, payload_len, request_id, crc, version, op_code, flags, reserved = struct.unpack(
-            "<IIQIBBBB", request[:HEADER_SIZE]
+        magic, payload_len, request_id, crc, op_code, version, flags, reserved = struct.unpack(
+            "<IIQIHBB8s", request[:HEADER_SIZE]
         )
 
         assert magic == MAGIC
@@ -162,7 +162,7 @@ class TestSerializeRequest:
         assert request_id == 42
         assert op_code == OpCode.KV_GET
         assert flags == 0
-        assert reserved == 0
+        assert reserved == b"\x00" * 8
 
     def test_request_with_value(self) -> None:
         request = serialize_request(
@@ -243,7 +243,7 @@ class TestParseResponse:
     ) -> bytes:
         """Helper to create a valid response."""
         header_without_crc = struct.pack(
-            "<IIQIBBBB",
+            "<IIQIBBBB8s",
             MAGIC,
             len(data),
             request_id,
@@ -251,13 +251,14 @@ class TestParseResponse:
             VERSION,
             status,
             0,  # flags
-            0,  # reserved
+            0,  # _pad
+            b"\x00" * 8,  # reserved
         )
 
         crc = compute_crc32(header_without_crc, data)
 
         header = struct.pack(
-            "<IIQIBBBB",
+            "<IIQIBBBB8s",
             MAGIC,
             len(data),
             request_id,
@@ -266,6 +267,7 @@ class TestParseResponse:
             status,
             0,
             0,
+            b"\x00" * 8,
         )
 
         return header + data

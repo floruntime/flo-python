@@ -203,6 +203,14 @@ class GenericServerError(ServerError):
         super().__init__(message, StatusCode.ERROR_GENERIC)
 
 
+def is_connection_error(exc: BaseException) -> bool:
+    """Return True if the exception indicates a broken connection.
+
+    Connection errors may be resolved by reconnecting.
+    """
+    return isinstance(exc, (UnexpectedEofError, NotConnectedError))
+
+
 def raise_for_status(status: StatusCode, data: bytes = b"") -> None:
     """Raise appropriate exception for non-OK status codes.
 

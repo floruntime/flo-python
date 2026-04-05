@@ -13,6 +13,7 @@ from .exceptions import (
     InvalidEndpointError,
     NotConnectedError,
     UnexpectedEofError,
+    is_connection_error,
     raise_for_status,
 )
 from .types import HEADER_SIZE, OpCode, StatusCode
@@ -65,6 +66,7 @@ class FloClient:
         # Initialize operation mixins (will be set after import to avoid circular deps)
         from .actions import ActionOperations, WorkerOperations
         from .kv import KVOperations
+        from .processing import ProcessingOperations
         from .queue import QueueOperations
         from .streams import StreamOperations
         from .workflows import WorkflowOperations
@@ -75,6 +77,7 @@ class FloClient:
         self.action = ActionOperations(self)
         self.worker = WorkerOperations(self)
         self.workflow = WorkflowOperations(self)
+        self.processing = ProcessingOperations(self)
 
         if debug:
             logging.basicConfig(level=logging.DEBUG)
@@ -135,14 +138,70 @@ class FloClient:
 
     async def close(self) -> None:
         """Close the connection."""
-        if self._writer:
-            self._writer.close()
-            with contextlib.suppress(Exception):
-                await self._writer.wait_closed()
-            self._writer = None
-            self._reader = None
-            if self._debug:
-                logger.debug("[flo] Disconnected")
+        async with self._lock:
+            if self._writer:
+                self._writer.close()
+                with contextlib.suppress(Exception):
+                    await self._writer.wait_closed()
+                self._writer = None
+                self._reader = None
+                if self._debug:
+                    logger.debug("[flo] Disconnected")
+
+    def interrupt(self) -> None:
+        """Forcibly close the underlying connection without acquiring the lock.
+
+        This unblocks any in-flight ``_send_request`` that is holding the lock
+        (e.g. a blocking Await). The interrupted call will raise an error, and
+        the caller should reconnect before reusing the client.
+        """
+        writer = self._writer
+        if writer is not None:
+            writer.close()
+
+    async def reconnect(self, *, timeout: float = 300.0) -> None:
+        """Close and re-establish the connection with exponential back-off.
+
+        Retries from 1 s up to 30 s intervals until *timeout* seconds elapse.
+
+        Args:
+            timeout: Maximum total time to keep retrying (default 5 min).
+        """
+        async with self._lock:
+            # Close existing connection
+            if self._writer:
+                self._writer.close()
+                with contextlib.suppress(Exception):
+                    await self._writer.wait_closed()
+                self._writer = None
+                self._reader = None
+
+        backoff = 1.0
+        max_backoff = 30.0
+        deadline = asyncio.get_event_loop().time() + timeout
+        attempt = 0
+
+        while True:
+            attempt += 1
+            try:
+                self._reader, self._writer = await asyncio.wait_for(
+                    asyncio.open_connection(self._host, self._port),
+                    timeout=self._timeout,
+                )
+                if self._debug:
+                    logger.debug(f"[flo] Reconnected to {self._endpoint} (attempt {attempt})")
+                return
+            except (asyncio.TimeoutError, OSError) as exc:
+                now = asyncio.get_event_loop().time()
+                if now >= deadline:
+                    raise ConnectionFailedError(
+                        f"Failed to reconnect to {self._endpoint} after {attempt} attempts"
+                    ) from exc
+                logger.warning(
+                    f"[flo] Reconnect attempt {attempt} failed: {exc}, retrying in {backoff:.0f}s..."
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
 
     async def __aenter__(self) -> "FloClient":
         """Async context manager entry."""

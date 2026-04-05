@@ -58,6 +58,7 @@ from .exceptions import (
     UnsupportedVersionError,
     ValidationError,
     ValueTooLargeError,
+    is_connection_error,
 )
 from .types import (
     # KV types
@@ -134,6 +135,19 @@ from .types import (
     WorkflowStatusOptions,
     WorkflowSyncOptions,
     WorkflowSyncResult,
+    # Processing types
+    ProcessingCancelOptions,
+    ProcessingListEntry,
+    ProcessingListOptions,
+    ProcessingRescaleOptions,
+    ProcessingRestoreOptions,
+    ProcessingSavepointOptions,
+    ProcessingStatusOptions,
+    ProcessingStatusResult,
+    ProcessingStopOptions,
+    ProcessingSubmitOptions,
+    ProcessingSyncOptions,
+    ProcessingSyncResult,
 )
 from .worker import (
     ActionContext,
@@ -146,6 +160,7 @@ from .worker import (
     StreamWorkerOptions,
 )
 from .workflows import WorkflowOperations
+from .processing import ProcessingOperations
 
 __version__ = "0.1.0"
 
@@ -162,6 +177,7 @@ __all__ = [
     "StreamContext",
     "StreamRecordHandler",
     "WorkflowOperations",
+    "ProcessingOperations",
     # Exceptions
     "FloError",
     "NonRetryableError",
@@ -188,6 +204,7 @@ __all__ = [
     "RateLimitedError",
     "InternalServerError",
     "GenericServerError",
+    "is_connection_error",
     # Types
     "OpCode",
     "StatusCode",
@@ -268,4 +285,18 @@ __all__ = [
     "WorkflowEnableOptions",
     "WorkflowSyncOptions",
     "WorkflowSyncResult",
+    # Processing types
+    "ProcessingOperations",
+    "ProcessingSubmitOptions",
+    "ProcessingStatusOptions",
+    "ProcessingListOptions",
+    "ProcessingStopOptions",
+    "ProcessingCancelOptions",
+    "ProcessingSavepointOptions",
+    "ProcessingRestoreOptions",
+    "ProcessingRescaleOptions",
+    "ProcessingSyncOptions",
+    "ProcessingStatusResult",
+    "ProcessingListEntry",
+    "ProcessingSyncResult",
 ]

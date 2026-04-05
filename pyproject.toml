@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flo-python"
-version = "0.1.0.dev2"
+version = "0.1.0.dev3"
 description = "Python SDK for the Flo distributed systems platform"
 readme = "README.md"
 license = "MIT"
@@ -45,6 +45,8 @@ packages = ["src/flo"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
 
 [tool.mypy]

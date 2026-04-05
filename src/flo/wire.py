@@ -1,7 +1,7 @@
 """Flo Wire Protocol
 
 Binary serialization/deserialization for the Flo protocol.
-Header: 24 bytes, little-endian, CRC32 validated.
+Header: 32 bytes, little-endian, CRC32 validated.
 """
 
 import struct
@@ -41,10 +41,15 @@ from .types import (
     VersionEntry,
 )
 
-# Header: magic(u32) + payload_len(u32) + request_id(u64)
-#   + crc32(u32) + version(u8) + status(u8) + flags(u8) + reserved(u8)
-REQUEST_HEADER_FORMAT = "<IIQIBBBB"
-RESPONSE_HEADER_FORMAT = "<IIQIBBBB"
+# Request header (32 bytes):
+#   magic(u32) + payload_len(u32) + request_id(u64)
+#   + crc32(u32) + op_code(u16) + version(u8) + flags(u8) + reserved(8s)
+REQUEST_HEADER_FORMAT = "<IIQIHBB8s"
+
+# Response header (32 bytes):
+#   magic(u32) + data_len(u32) + request_id(u64)
+#   + crc32(u32) + version(u8) + status(u8) + flags(u8) + _pad(u8) + reserved(8s)
+RESPONSE_HEADER_FORMAT = "<IIQIBBBB8s"
 
 
 # =============================================================================
@@ -173,11 +178,11 @@ def compute_crc32(header_bytes: bytes, payload: bytes) -> int:
 
     The CRC32 is computed over:
     - Header bytes 0-15 (magic, payload_length, request_id)
-    - Header bytes 20-23 (version, op_code/status, flags, reserved)
+    - Header bytes 20-31 (op_code/version/flags/reserved or version/status/flags/pad/reserved)
     - Payload bytes
     """
-    # Hash bytes 0-15 and 20-23 of header (skip crc32 field at 16-19)
-    crc_data = header_bytes[0:16] + header_bytes[20:24] + payload
+    # Hash bytes 0-15 and 20-31 of header (skip crc32 field at 16-19)
+    crc_data = header_bytes[0:16] + header_bytes[20:32] + payload
     return crc32(crc_data) & 0xFFFFFFFF
 
 
@@ -245,10 +250,10 @@ def serialize_request(
         len(payload_bytes),
         request_id,
         0,  # CRC32 placeholder
-        VERSION,
         op_code,
+        VERSION,
         0,  # flags
-        0,  # reserved
+        b"\x00" * 8,  # reserved
     )
 
     # Compute CRC32
@@ -261,10 +266,10 @@ def serialize_request(
         len(payload_bytes),
         request_id,
         crc,
-        VERSION,
         op_code,
+        VERSION,
         0,  # flags
-        0,  # reserved
+        b"\x00" * 8,  # reserved
     )
 
     return header + payload_bytes
@@ -310,7 +315,7 @@ def parse_response_header(data: bytes) -> tuple[StatusCode, int, int, int]:
     if len(data) < HEADER_SIZE:
         raise IncompleteResponseError(f"Response too short: {len(data)} < {HEADER_SIZE}")
 
-    magic, data_len, request_id, crc, version, status, flags, reserved = struct.unpack(
+    magic, data_len, request_id, crc, version, status, flags, _pad, reserved = struct.unpack(
         RESPONSE_HEADER_FORMAT, data[:HEADER_SIZE]
     )
 
@@ -706,7 +711,7 @@ def serialize_action_register_value(
 
     Format: [action_type:u8][timeout_ms:u32][max_retries:u32]
             [has_desc:u8][desc_len:u16]?[desc]?
-            [has_wasm_module:u8]...(all optional fields as u8=0)
+            [has_wasm_module:u8=0]...(reserved zero fields for wire compat)
     """
     result = bytearray()
 
@@ -728,13 +733,13 @@ def serialize_action_register_value(
     else:
         result.append(0)
 
-    # wasm_module (optional, not used)
+    # wasm_module (reserved, always zero)
     result.append(0)
 
-    # wasm_entrypoint (optional, not used)
+    # wasm_entrypoint (reserved, always zero)
     result.append(0)
 
-    # wasm_memory_limit (optional, not used)
+    # wasm_memory_limit (reserved, always zero)
     result.append(0)
 
     # trigger_stream (optional, not used)

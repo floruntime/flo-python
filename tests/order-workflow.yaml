@@ -1,0 +1,74 @@
+kind: Workflow
+name: order-processing
+version: "1.4.0"
+
+searchAttributes:
+  - name: customer_id
+    type: string
+    from: "$.input.customerId"
+  - name: order_amount
+    type: number
+    from: "$.input.amount"
+  - name: order_id
+    type: string
+    from: "$.input.orderId"
+
+plans:
+  payment:
+    selection: health-weighted
+    executors:
+      - name: stripe
+        run: "@actions/process-payment"
+        priority: 1
+        retry:
+          maxAttempts: 3
+          backoffMs: 1000
+        breaker:
+          failureThreshold: 5
+          cooldownMs: 30000
+      - name: paypal
+        run: "@actions/process-payment-fallback"
+        priority: 2
+        retry:
+          maxAttempts: 2
+          backoffMs: 2000
+
+start:
+  run: "@actions/validate-payment"
+  transitions:
+    success: charge
+    failure: rejected
+
+steps:
+  charge:
+    run: "@plan/payment"
+    transitions:
+      success: fulfill
+      failure: rejected
+
+  fulfill:
+    run: "@actions/fulfill-order"
+    transitions:
+      success: notify
+      failure: manual_review
+
+  notify:
+    run: "@actions/send-confirmation"
+    transitions:
+      success: flo.Completed
+      failure: flo.Failed
+
+  rejected:
+    run: "@actions/send-rejection"
+    transitions:
+      success: flo.Completed
+      failure: flo.Failed
+
+  manual_review:
+    waitForSignal:
+      type: "review_decision"
+      timeoutMs: 86400000
+      onTimeout: flo.Failed
+    transitions:
+      success: fulfill
+      failure: rejected

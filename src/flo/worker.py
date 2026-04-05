@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .client import FloClient
-from .exceptions import NonRetryableError
+from .exceptions import NonRetryableError, is_connection_error
 from .types import (
     ActionType,
     StreamGroupAckOptions,
@@ -207,6 +207,7 @@ class ActionWorker:
         )
 
         self._client: FloClient | None = None
+        self._result_client: FloClient | None = None
         self._handlers: dict[str, ActionHandler] = {}
         self._running = False
         self._stop_event = asyncio.Event()
@@ -291,6 +292,17 @@ class ActionWorker:
         )
         await self._client.connect()
 
+        # Create a second connection for sending Complete/Fail results.
+        # The polling connection holds its lock during blocking Await calls
+        # (up to block_ms), so a separate connection prevents contention.
+        self._result_client = FloClient(
+            self._parent_client._endpoint,
+            namespace=self._parent_client.namespace,
+            debug=self._parent_client._debug,
+            timeout_ms=worker_timeout_ms,
+        )
+        await self._result_client.connect()
+
         try:
             # Register actions with the server
             action_names = list(self._handlers.keys())
@@ -337,6 +349,9 @@ class ActionWorker:
                 logger.info(f"Waiting for {len(self._tasks)} tasks to complete...")
                 await asyncio.gather(*self._tasks, return_exceptions=True)
 
+            if self._result_client:
+                await self._result_client.close()
+                self._result_client = None
             await self._client.close()
             self._client = None
             self._running = False
@@ -396,13 +411,60 @@ class ActionWorker:
                 break
             except Exception as e:
                 self._semaphore.release()
-                logger.error(f"Await error: {e}, retrying...")
-                await asyncio.sleep(1)
+                if is_connection_error(e):
+                    logger.warning("Connection lost, reconnecting...")
+                    try:
+                        await self._client.reconnect()
+                        # Also reconnect result client
+                        if self._result_client is not None:
+                            try:
+                                await self._result_client.reconnect()
+                            except Exception as rc_err:
+                                logger.warning(f"Failed to reconnect result client: {rc_err}")
+                        # Re-register worker after reconnect
+                        try:
+                            from .types import WorkerRegisterOptions
+                            await self._client.worker.register(
+                                self.config.worker_id,
+                                action_names,
+                                WorkerRegisterOptions(
+                                    concurrency=self.config.concurrency,
+                                    machine_id=socket.gethostname(),
+                                ),
+                            )
+                        except Exception as reg_err:
+                            logger.warning(f"Failed to re-register worker: {reg_err}")
+                        logger.info("Reconnected, resuming work")
+                    except Exception as recon_err:
+                        logger.error(f"Reconnect failed: {recon_err}, retrying...")
+                        await asyncio.sleep(1)
+                else:
+                    logger.error(f"Await error: {e}, retrying...")
+                    await asyncio.sleep(1)
+
+    async def _send_with_retry(self, op: str, fn) -> None:
+        """Attempt to send a result (Complete/Fail), reconnecting on connection error."""
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await fn()
+                return
+            except Exception as e:
+                if not is_connection_error(e) or not self._running:
+                    raise
+                logger.warning(
+                    f"Connection lost while sending {op} result "
+                    f"(attempt {attempt}/{max_attempts}), reconnecting..."
+                )
+                if self._result_client is not None:
+                    await self._result_client.reconnect()
+        raise RuntimeError(f"Failed to send {op} result after {max_attempts} attempts")
 
     async def _execute_task(self, task: TaskAssignment) -> None:
         """Execute a task with error handling."""
         assert self._client is not None
         assert self._semaphore is not None
+        rc = self._result_client or self._client
         try:
             logger.info(
                 f"Executing action: {task.task_type} (task={task.task_id}, attempt={task.attempt})"
@@ -412,12 +474,12 @@ class ActionWorker:
             handler = self._handlers.get(task.task_type)
             if handler is None:
                 logger.error(f"No handler registered for action: {task.task_type}")
-                await self._client.worker.fail(
+                await self._send_with_retry("fail", lambda: rc.worker.fail(
                     self.config.worker_id,
                     task.task_type,
                     task.task_id,
                     f"No handler for: {task.task_type}",
-                )
+                ))
                 return
 
             # Create action context
@@ -443,62 +505,62 @@ class ActionWorker:
 
                 if isinstance(result, ActionResult):
                     # Named outcome
-                    await self._client.worker.complete(
+                    await self._send_with_retry("complete", lambda: rc.worker.complete(
                         self.config.worker_id,
                         task.task_type,
                         task.task_id,
                         result.data,
                         WCO(outcome=result.outcome),
-                    )
+                    ))
                 elif isinstance(result, dict):
                     # Plain dict → JSON serialize
                     result_bytes = json.dumps(result).encode("utf-8")
-                    await self._client.worker.complete(
+                    await self._send_with_retry("complete", lambda: rc.worker.complete(
                         self.config.worker_id,
                         task.task_type,
                         task.task_id,
                         result_bytes,
-                    )
+                    ))
                 else:
                     # bytes or other → pass through
-                    await self._client.worker.complete(
+                    await self._send_with_retry("complete", lambda: rc.worker.complete(
                         self.config.worker_id,
                         task.task_type,
                         task.task_id,
                         result if isinstance(result, bytes) else b"",
-                    )
+                    ))
                 logger.info(f"Action completed: {task.task_type}")
 
             except asyncio.TimeoutError:
                 logger.error(f"Action timed out: {task.task_type}")
-                await self._client.worker.fail(
+                await self._send_with_retry("fail", lambda: rc.worker.fail(
                     self.config.worker_id,
                     task.task_type,
                     task.task_id,
                     "Action timed out",
-                )
+                ))
 
             except asyncio.CancelledError:
                 logger.warning(f"Action cancelled: {task.task_type}")
-                await self._client.worker.fail(
+                await self._send_with_retry("fail", lambda: rc.worker.fail(
                     self.config.worker_id,
                     task.task_type,
                     task.task_id,
                     "Action cancelled",
-                )
+                ))
 
             except Exception as e:
                 logger.error(f"Action failed: {task.task_type} - {e}")
                 from .types import WorkerFailOptions as WFO
 
                 retry = not isinstance(e, NonRetryableError)
-                await self._client.worker.fail(
+                await self._send_with_retry("fail", lambda: rc.worker.fail(
                     self.config.worker_id,
                     task.task_type,
                     task.task_id,
                     str(e),
                     WFO(retry=retry),
-                )
+                ))
 
         except Exception as e:
             logger.error(f"Failed to report task result: {e}")
@@ -522,15 +584,23 @@ class ActionWorker:
         """Signal the worker to stop.
 
         This sets a flag that will cause the polling loop to exit
-        after the current iteration completes.
+        after the current iteration completes. Also interrupts in-flight
+        connections to unblock any blocking Await call immediately.
         """
         logger.info("Stopping worker...")
         self._running = False
         self._stop_event.set()
+        # Interrupt connections to unblock any blocking Await
+        if self._client:
+            self._client.interrupt()
+        if self._result_client:
+            self._result_client.interrupt()
 
     async def close(self) -> None:
         """Stop and close the worker."""
         self.stop()
+        if self._result_client:
+            await self._result_client.close()
         if self._client:
             await self._client.close()
 
@@ -783,8 +853,48 @@ class StreamWorker:
                 break
             except Exception as e:
                 self._semaphore.release()
-                logger.error(f"Stream read error: {e}, retrying...")
-                await asyncio.sleep(1)
+                if is_connection_error(e):
+                    logger.warning("Stream worker lost connection, reconnecting...")
+                    try:
+                        await self._handle_reconnect()
+                        logger.info("Stream worker reconnected, resuming")
+                    except Exception as recon_err:
+                        logger.error(f"Stream worker reconnect failed: {recon_err}, retrying...")
+                        await asyncio.sleep(1)
+                else:
+                    logger.error(f"Stream read error: {e}, retrying...")
+                    await asyncio.sleep(1)
+
+    async def _handle_reconnect(self) -> None:
+        """Reconnect and re-join the consumer group."""
+        assert self._client is not None
+        await self._client.reconnect()
+        await self._client.stream.group_join(
+            self.config.stream,
+            self.config.group,
+            self.config.consumer,
+        )
+
+    async def _ack_with_retry(self, record_ids: list, options: StreamGroupAckOptions) -> None:
+        """Ack with retry on connection error."""
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                assert self._client is not None
+                await self._client.stream.group_ack(
+                    self.config.stream,
+                    self.config.group,
+                    record_ids,
+                    options,
+                )
+                return
+            except Exception as e:
+                if not is_connection_error(e) or not self._running:
+                    raise
+                logger.warning(
+                    f"Connection lost while acking (attempt {attempt}/{max_attempts}), reconnecting..."
+                )
+                await self._handle_reconnect()
 
     async def _process_record(self, record: StreamRecord) -> None:
         """Process a single record: call handler, then ack or nack."""
@@ -805,10 +915,8 @@ class StreamWorker:
                     timeout=self.config.message_timeout,
                 )
 
-                # Success — ack
-                await self._client.stream.group_ack(
-                    self.config.stream,
-                    self.config.group,
+                # Success — ack with retry
+                await self._ack_with_retry(
                     [record.id],
                     StreamGroupAckOptions(consumer=self.config.consumer),
                 )
@@ -839,6 +947,8 @@ class StreamWorker:
         logger.info("Stopping stream worker...")
         self._running = False
         self._stop_event.set()
+        if self._client:
+            self._client.interrupt()
 
     async def close(self) -> None:
         """Stop and close the stream worker."""
