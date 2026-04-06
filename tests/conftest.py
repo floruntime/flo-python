@@ -4,6 +4,7 @@ Requires a running Flo server. Set FLO_ENDPOINT env var (default: localhost:4453
 """
 
 import asyncio
+import contextlib
 import json
 import os
 
@@ -19,6 +20,7 @@ FLO_ENDPOINT = os.environ.get("FLO_ENDPOINT", "localhost:4453")
 # ---------------------------------------------------------------------------
 # Action handlers — mirrors Go examples/workflows/workflows_test.go
 # ---------------------------------------------------------------------------
+
 
 def _safe_json(ctx: ActionContext) -> dict:
     """Parse JSON payload, returning empty dict on empty/invalid payload."""
@@ -153,11 +155,18 @@ def register_all_actions(worker: ActionWorker) -> None:
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest_asyncio.fixture(scope="session")
 async def client():
-    """Session-scoped Flo client connected to the test server."""
+    """Session-scoped Flo client connected to the test server.
+
+    Skips all dependent tests if the server is unreachable (e.g. CI).
+    """
     c = FloClient(FLO_ENDPOINT, namespace="default", timeout_ms=35000)
-    await c.connect()
+    try:
+        await c.connect()
+    except Exception:
+        pytest.skip(f"Flo server not reachable at {FLO_ENDPOINT}")
     yield c
     await c.close()
 
@@ -173,7 +182,5 @@ async def worker(client: FloClient):
     yield w
     w.stop()
     # Wait for the worker task to finish (with timeout)
-    try:
+    with contextlib.suppress(asyncio.TimeoutError, Exception):
         await asyncio.wait_for(task, timeout=10.0)
-    except (asyncio.TimeoutError, Exception):
-        pass

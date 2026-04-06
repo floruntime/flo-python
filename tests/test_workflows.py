@@ -11,7 +11,6 @@ Run:
 
 import asyncio
 import json
-import os
 import struct
 import tempfile
 from dataclasses import dataclass
@@ -20,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from flo import FloClient
+from flo.exceptions import FloError
 from flo.worker import ActionWorker
 
 # ---------------------------------------------------------------------------
@@ -123,6 +123,7 @@ ORDER_WORKFLOW_PATH = str(Path(__file__).parent / "order-workflow.yaml")
 # Binary response parsers (matching Go parseHistory/parseListRuns/etc.)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class HistoryEvent:
     type: str
@@ -146,7 +147,10 @@ class DefinitionEntry:
 
 
 def parse_history(data: bytes) -> list[HistoryEvent]:
-    """Parse binary history response: [count:u32]([type_len:u16][type][detail_len:u16][detail][ts:i64])*"""
+    """Parse binary history response.
+
+    Format: [count:u32]([type_len:u16][type][detail_len:u16][detail][ts:i64])*
+    """
     if len(data) < 4:
         return []
     count = struct.unpack_from("<I", data, 0)[0]
@@ -159,7 +163,7 @@ def parse_history(data: bytes) -> list[HistoryEvent]:
         pos += 2
         if pos + type_len > len(data):
             break
-        typ = data[pos:pos + type_len].decode("utf-8")
+        typ = data[pos : pos + type_len].decode("utf-8")
         pos += type_len
 
         if pos + 2 > len(data):
@@ -168,7 +172,7 @@ def parse_history(data: bytes) -> list[HistoryEvent]:
         pos += 2
         if pos + detail_len > len(data):
             break
-        detail = data[pos:pos + detail_len].decode("utf-8")
+        detail = data[pos : pos + detail_len].decode("utf-8")
         pos += detail_len
 
         if pos + 8 > len(data):
@@ -181,7 +185,10 @@ def parse_history(data: bytes) -> list[HistoryEvent]:
 
 
 def parse_list_runs(data: bytes) -> list[RunEntry]:
-    """Parse binary list-runs response: [count:u32]([rid_len:u16][rid][wf_len:u16][wf][st_len:u16][st][ts:i64])*"""
+    """Parse binary list-runs response.
+
+    Format: [count:u32]([rid_len:u16][rid][wf_len:u16][wf][st_len:u16][st][ts:i64])*
+    """
     if len(data) < 4:
         return []
     count = struct.unpack_from("<I", data, 0)[0]
@@ -194,7 +201,7 @@ def parse_list_runs(data: bytes) -> list[RunEntry]:
         pos += 2
         if pos + rid_len > len(data):
             break
-        run_id = data[pos:pos + rid_len].decode("utf-8")
+        run_id = data[pos : pos + rid_len].decode("utf-8")
         pos += rid_len
 
         if pos + 2 > len(data):
@@ -203,7 +210,7 @@ def parse_list_runs(data: bytes) -> list[RunEntry]:
         pos += 2
         if pos + wf_len > len(data):
             break
-        workflow = data[pos:pos + wf_len].decode("utf-8")
+        workflow = data[pos : pos + wf_len].decode("utf-8")
         pos += wf_len
 
         if pos + 2 > len(data):
@@ -212,7 +219,7 @@ def parse_list_runs(data: bytes) -> list[RunEntry]:
         pos += 2
         if pos + st_len > len(data):
             break
-        status = data[pos:pos + st_len].decode("utf-8")
+        status = data[pos : pos + st_len].decode("utf-8")
         pos += st_len
 
         if pos + 8 > len(data):
@@ -225,7 +232,10 @@ def parse_list_runs(data: bytes) -> list[RunEntry]:
 
 
 def parse_list_definitions(data: bytes) -> list[DefinitionEntry]:
-    """Parse binary list-definitions response: [count:u32]([name_len:u16][name][ver_len:u16][ver][ts:i64])*"""
+    """Parse binary list-definitions response.
+
+    Format: [count:u32]([name_len:u16][name][ver_len:u16][ver][ts:i64])*
+    """
     if len(data) < 4:
         return []
     count = struct.unpack_from("<I", data, 0)[0]
@@ -238,7 +248,7 @@ def parse_list_definitions(data: bytes) -> list[DefinitionEntry]:
         pos += 2
         if pos + name_len > len(data):
             break
-        name = data[pos:pos + name_len].decode("utf-8")
+        name = data[pos : pos + name_len].decode("utf-8")
         pos += name_len
 
         if pos + 2 > len(data):
@@ -247,7 +257,7 @@ def parse_list_definitions(data: bytes) -> list[DefinitionEntry]:
         pos += 2
         if pos + ver_len > len(data):
             break
-        version = data[pos:pos + ver_len].decode("utf-8")
+        version = data[pos : pos + ver_len].decode("utf-8")
         pos += ver_len
 
         if pos + 8 > len(data):
@@ -262,6 +272,7 @@ def parse_list_definitions(data: bytes) -> list[DefinitionEntry]:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 async def poll_status(
     client: FloClient,
@@ -300,6 +311,7 @@ async def sync_test_workflows(client: FloClient) -> None:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 class TestDeclarativeSync:
     """Test declarative workflow sync operations."""
@@ -376,17 +388,20 @@ class TestHappyPath:
     async def test_happy_path(self, client: FloClient, worker: ActionWorker):
         await sync_test_workflows(client)
 
-        input_data = json.dumps({
-            "orderId": "ORD-100",
-            "amount": 49.99,
-            "customerId": "CUST-1",
-        })
+        input_data = json.dumps(
+            {
+                "orderId": "ORD-100",
+                "amount": 49.99,
+                "customerId": "CUST-1",
+            }
+        )
 
         run_id = await client.workflow.start("order-processing", input_data)
         assert run_id, "Expected a non-empty run ID"
 
         final = await poll_status(
-            client, run_id,
+            client,
+            run_id,
             lambda s: s["status"] in ("completed", "failed"),
             timeout_sec=30,
         )
@@ -401,17 +416,20 @@ class TestRejectionPath:
     async def test_rejection_path(self, client: FloClient, worker: ActionWorker):
         await sync_test_workflows(client)
 
-        input_data = json.dumps({
-            "orderId": "ORD-REJECT",
-            "amount": 6000,
-            "customerId": "CUST-2",
-        })
+        input_data = json.dumps(
+            {
+                "orderId": "ORD-REJECT",
+                "amount": 6000,
+                "customerId": "CUST-2",
+            }
+        )
 
         run_id = await client.workflow.start("order-processing", input_data)
         assert run_id
 
         final = await poll_status(
-            client, run_id,
+            client,
+            run_id,
             lambda s: s["status"] in ("completed", "failed"),
             timeout_sec=30,
         )
@@ -426,17 +444,20 @@ class TestPlanFallback:
     async def test_plan_fallback(self, client: FloClient, worker: ActionWorker):
         await sync_test_workflows(client)
 
-        input_data = json.dumps({
-            "orderId": "FB-1001",
-            "amount": 100,
-            "customerId": "CUST-3",
-        })
+        input_data = json.dumps(
+            {
+                "orderId": "FB-1001",
+                "amount": 100,
+                "customerId": "CUST-3",
+            }
+        )
 
         run_id = await client.workflow.start("order-processing", input_data)
         assert run_id
 
         final = await poll_status(
-            client, run_id,
+            client,
+            run_id,
             lambda s: s["status"] in ("completed", "failed"),
             timeout_sec=30,
         )
@@ -458,7 +479,8 @@ class TestSignalAdvances:
 
         # Wait for workflow to reach the signal wait step
         await poll_status(
-            client, run_id,
+            client,
+            run_id,
             lambda s: s["status"] == "waiting",
             timeout_sec=15,
         )
@@ -468,7 +490,8 @@ class TestSignalAdvances:
 
         # Should proceed to completion
         final = await poll_status(
-            client, run_id,
+            client,
+            run_id,
             lambda s: s["status"] in ("completed", "failed"),
             timeout_sec=15,
         )
@@ -487,7 +510,8 @@ class TestSignalTimeout:
 
         # Wait for workflow to reach signal wait
         await poll_status(
-            client, run_id,
+            client,
+            run_id,
             lambda s: s["status"] == "waiting",
             timeout_sec=15,
         )
@@ -496,7 +520,8 @@ class TestSignalTimeout:
         await asyncio.sleep(5)
 
         final = await poll_status(
-            client, run_id,
+            client,
+            run_id,
             lambda s: s["status"] in ("failed", "timed_out", "completed"),
             timeout_sec=15,
         )
@@ -511,18 +536,21 @@ class TestHistory:
     async def test_history(self, client: FloClient, worker: ActionWorker):
         await sync_test_workflows(client)
 
-        input_data = json.dumps({
-            "orderId": "ORD-HIST",
-            "amount": 25.00,
-            "customerId": "CUST-HIST",
-        })
+        input_data = json.dumps(
+            {
+                "orderId": "ORD-HIST",
+                "amount": 25.00,
+                "customerId": "CUST-HIST",
+            }
+        )
 
         run_id = await client.workflow.start("order-processing", input_data)
         assert run_id
 
         # Wait for completion
         await poll_status(
-            client, run_id,
+            client,
+            run_id,
             lambda s: s["status"] in ("completed", "failed"),
             timeout_sec=30,
         )
@@ -546,16 +574,19 @@ class TestListRuns:
         await sync_test_workflows(client)
 
         # Start a run so there's at least one
-        input_data = json.dumps({
-            "orderId": "ORD-LIST",
-            "amount": 10.00,
-            "customerId": "CUST-LIST",
-        })
+        input_data = json.dumps(
+            {
+                "orderId": "ORD-LIST",
+                "amount": 10.00,
+                "customerId": "CUST-LIST",
+            }
+        )
         run_id = await client.workflow.start("order-processing", input_data)
         # Give server time to register the run
         await asyncio.sleep(0.5)
 
         from flo.types import WorkflowListRunsOptions
+
         data = await client.workflow.list_runs(
             WorkflowListRunsOptions(workflow_name="order-processing", limit=50)
         )
@@ -578,7 +609,7 @@ class TestDisableEnable:
 
         # Starting should fail
         input_data = json.dumps({"orderId": "ORD-DIS", "amount": 10, "customerId": "C"})
-        with pytest.raises(Exception):
+        with pytest.raises(FloError):
             await client.workflow.start("order-processing", input_data)
 
         # Re-enable
@@ -602,7 +633,8 @@ class TestCancel:
 
         # Wait for it to be waiting
         await poll_status(
-            client, run_id,
+            client,
+            run_id,
             lambda s: s["status"] in ("waiting", "running"),
             timeout_sec=15,
         )
@@ -612,9 +644,7 @@ class TestCancel:
 
         # Verify cancelled
         status = await client.workflow.status(run_id)
-        assert status["status"] == "cancelled", (
-            f"Expected cancelled, got {status['status']}"
-        )
+        assert status["status"] == "cancelled", f"Expected cancelled, got {status['status']}"
 
 
 class TestOutcomeRouting:
@@ -628,7 +658,8 @@ class TestOutcomeRouting:
         run_id = await client.workflow.start("order-review", input_data)
 
         final = await poll_status(
-            client, run_id,
+            client,
+            run_id,
             lambda s: s["status"] in ("completed", "failed"),
             timeout_sec=15,
         )
@@ -642,7 +673,8 @@ class TestOutcomeRouting:
         run_id = await client.workflow.start("order-review", input_data)
 
         final = await poll_status(
-            client, run_id,
+            client,
+            run_id,
             lambda s: s["status"] in ("completed", "failed"),
             timeout_sec=15,
         )
@@ -656,7 +688,8 @@ class TestOutcomeRouting:
         run_id = await client.workflow.start("order-review", input_data)
 
         final = await poll_status(
-            client, run_id,
+            client,
+            run_id,
             lambda s: s["status"] in ("completed", "failed"),
             timeout_sec=15,
         )
@@ -672,9 +705,7 @@ class TestSyncDir:
             # Write YAML files
             (Path(tmpdir) / "approval.yaml").write_text(APPROVAL_WORKFLOW_YAML)
             (Path(tmpdir) / "outcome.yaml").write_text(OUTCOME_WORKFLOW_YAML)
-            (Path(tmpdir) / "order.yaml").write_text(
-                Path(ORDER_WORKFLOW_PATH).read_text()
-            )
+            (Path(tmpdir) / "order.yaml").write_text(Path(ORDER_WORKFLOW_PATH).read_text())
 
             results = await client.workflow.sync_dir(tmpdir)
             assert len(results) == 3, f"Expected 3 sync results, got {len(results)}"
@@ -692,9 +723,7 @@ class TestSyncDir:
             # Re-sync — all should be unchanged
             results2 = await client.workflow.sync_dir(tmpdir)
             for r in results2:
-                assert r.action == "unchanged", (
-                    f"Expected unchanged for {r.name}, got {r.action}"
-                )
+                assert r.action == "unchanged", f"Expected unchanged for {r.name}, got {r.action}"
 
 
 class TestActionInvoke:
@@ -711,7 +740,7 @@ class TestActionInvoke:
 
     async def test_invoke_nonexistent_action(self, client: FloClient, worker: ActionWorker):
         """Invoking a nonexistent action should fail."""
-        with pytest.raises(Exception):
+        with pytest.raises(FloError):
             await client.action.invoke(
                 "nonexistent-action-xyz",
                 b"{}",
