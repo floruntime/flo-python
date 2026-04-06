@@ -760,7 +760,8 @@ def serialize_action_invoke_value(
     """Serialize action invoke value.
 
     Format: [priority:u8][delay_ms:i64][has_caller:u8]
-            [has_idempotency_key:u8][key_len:u16]?[key]?[input...]
+            [has_idempotency_key:u8][key_len:u16]?[key]?
+            [has_labels:u8][labels_len:u16]?[labels]?[input...]
     """
     result = bytearray()
 
@@ -781,6 +782,9 @@ def serialize_action_invoke_value(
         result.extend(key_bytes)
     else:
         result.append(0)
+
+    # labels (none)
+    result.append(0)
 
     # input
     result.extend(input_data)
