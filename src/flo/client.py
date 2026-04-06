@@ -372,11 +372,13 @@ class FloClient:
         Returns:
             A new ActionWorker instance ready to register actions and start.
 
-        Example:
+        Example::
+
             async with FloClient("localhost:3000", namespace="myapp") as client:
                 worker = client.new_action_worker(concurrency=5)
                 worker.register_action("process-order", process_order)
-                await worker.start()
+                async with worker:
+                    await worker.start()
         """
         from .worker import ActionWorker
 

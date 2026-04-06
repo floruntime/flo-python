@@ -3,7 +3,8 @@
 Provides ActionWorker for executing actions and StreamWorker for
 processing stream records via consumer groups.
 
-Example:
+Example::
+
     from flo import FloClient, ActionContext
 
     async def process_order(ctx: ActionContext) -> bytes:
@@ -14,8 +15,9 @@ Example:
     async def main():
         async with FloClient("localhost:3000", namespace="myapp") as client:
             worker = client.new_action_worker(concurrency=5)
-            worker.action("process-order")(process_order)
-            await worker.start()
+            worker.register_action("process-order", process_order)
+            async with worker:
+                await worker.start()
 """
 
 import asyncio
@@ -626,6 +628,19 @@ class ActionWorker:
         if self._client:
             await self._client.close()
 
+    async def __aenter__(self) -> "ActionWorker":
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
+        """Async context manager exit — closes the worker."""
+        await self.close()
+
 
 # =============================================================================
 # Stream Worker
@@ -977,3 +992,16 @@ class StreamWorker:
         self.stop()
         if self._client:
             await self._client.close()
+
+    async def __aenter__(self) -> "StreamWorker":
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
+        """Async context manager exit — closes the stream worker."""
+        await self.close()

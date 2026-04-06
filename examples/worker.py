@@ -158,56 +158,34 @@ async def generate_report(ctx: ActionContext) -> bytes:
 
 
 async def main():
-    # Create and connect client (shared configuration)
-    client = FloClient(
+    async with FloClient(
         os.getenv("FLO_ENDPOINT", "localhost:3000"),
         namespace=os.getenv("FLO_NAMESPACE", "myapp"),
         debug=os.getenv("FLO_DEBUG", "").lower() in ("1", "true"),
-    )
-    await client.connect()
+    ) as client:
+        worker = client.new_action_worker(
+            concurrency=5,
+            action_timeout=300,  # 5 minutes
+        )
 
-    # Create a worker from the client
-    worker = client.new_action_worker(
-        concurrency=5,
-        action_timeout=300,  # 5 minutes
-    )
+        # Register action handlers
+        worker.register_action("process-order", process_order)
+        worker.register_action("send-notification", send_notification)
+        worker.register_action("generate-report", generate_report)
 
-    # Register action handlers using register_action()
-    worker.register_action("process-order", process_order)
-    worker.register_action("send-notification", send_notification)
-    worker.register_action("generate-report", generate_report)
+        # Handle shutdown signals
+        def signal_handler():
+            logger.info("Received shutdown signal")
+            worker.stop()
 
-    # Register using decorator syntax
-    @worker.action("health-check")
-    async def health_check(ctx: ActionContext) -> bytes:
-        """Simple health check action."""
-        return ctx.to_bytes({
-            "status": "healthy",
-            "worker_id": ctx.task_id,
-            "timestamp": ctx.created_at,
-        })
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, signal_handler)
 
-    # Handle shutdown signals
-    stop_event = asyncio.Event()
-
-    def signal_handler():
-        logger.info("Received shutdown signal")
-        worker.stop()
-        stop_event.set()
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, signal_handler)
-
-    # Start worker (blocks until stopped)
-    logger.info("Starting worker...")
-    try:
-        await worker.start()
-    except KeyboardInterrupt:
-        logger.info("Interrupted")
-    finally:
-        await worker.close()
-        await client.close()
+        # Start worker (blocks until stopped)
+        logger.info("Starting worker...")
+        async with worker:
+            await worker.start()
         logger.info("Worker shutdown complete")
 
 
