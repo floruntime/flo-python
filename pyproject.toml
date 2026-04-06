@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flo-python"
-version = "0.1.0.dev3"
+version = "0.1.0.dev4"
 description = "Python SDK for the Flo distributed systems platform"
 readme = "README.md"
 license = "MIT"

@@ -159,7 +159,7 @@ async def generate_report(ctx: ActionContext) -> bytes:
 
 async def main():
     async with FloClient(
-        os.getenv("FLO_ENDPOINT", "localhost:3000"),
+        os.getenv("FLO_ENDPOINT", "localhost:4455"),
         namespace=os.getenv("FLO_NAMESPACE", "myapp"),
         debug=os.getenv("FLO_DEBUG", "").lower() in ("1", "true"),
     ) as client:
@@ -172,6 +172,11 @@ async def main():
         worker.register_action("process-order", process_order)
         worker.register_action("send-notification", send_notification)
         worker.register_action("generate-report", generate_report)
+
+        # Register using decorator syntax
+        @worker.action("health-check")
+        async def health_check(ctx: ActionContext) -> bytes:
+            return ctx.to_bytes({"status": "healthy", "worker_id": ctx.task_id})
 
         # Handle shutdown signals
         def signal_handler():
