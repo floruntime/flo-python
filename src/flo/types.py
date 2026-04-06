@@ -769,6 +769,8 @@ class TaskAssignment:
     payload: bytes
     created_at: int
     attempt: int
+    caller_run_id: str = ""
+    caller_workflow_name: str = ""
 
 
 # Alias for backwards compatibility

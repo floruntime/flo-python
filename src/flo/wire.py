@@ -945,7 +945,9 @@ def parse_task_assignment(data: bytes) -> "types.TaskAssignment":
     """Parse task assignment from server response.
 
     Format: [task_id_len:u16][task_id][task_type_len:u16][task_type]
-            [created_at:i64][attempt:u32][payload...]
+            [created_at:i64][attempt:u32]
+            [has_caller:u8]([run_id_len:u16][run_id][wf_name_len:u16][wf_name])?
+            [payload...]
     """
     if len(data) < 10:
         raise ValueError("Incomplete task assignment response")
@@ -982,6 +984,32 @@ def parse_task_assignment(data: bytes) -> "types.TaskAssignment":
     attempt = struct.unpack_from("<I", data, pos)[0]
     pos += 4
 
+    # caller block: [has_caller:u8][run_id_len:u16][run_id][wf_name_len:u16][wf_name]
+    if pos + 1 > len(data):
+        raise ValueError("Incomplete task assignment: missing has_caller")
+    has_caller = data[pos]
+    pos += 1
+    caller_run_id = ""
+    caller_workflow_name = ""
+    if has_caller == 1:
+        if pos + 2 > len(data):
+            raise ValueError("Incomplete task assignment: missing caller_run_id length")
+        crid_len = struct.unpack_from("<H", data, pos)[0]
+        pos += 2
+        if pos + crid_len > len(data):
+            raise ValueError("Incomplete task assignment: missing caller_run_id")
+        caller_run_id = data[pos : pos + crid_len].decode("utf-8")
+        pos += crid_len
+
+        if pos + 2 > len(data):
+            raise ValueError("Incomplete task assignment: missing caller_workflow_name length")
+        cwf_len = struct.unpack_from("<H", data, pos)[0]
+        pos += 2
+        if pos + cwf_len > len(data):
+            raise ValueError("Incomplete task assignment: missing caller_workflow_name")
+        caller_workflow_name = data[pos : pos + cwf_len].decode("utf-8")
+        pos += cwf_len
+
     # payload (rest of data)
     payload = data[pos:]
 
@@ -991,4 +1019,6 @@ def parse_task_assignment(data: bytes) -> "types.TaskAssignment":
         payload=payload,
         created_at=created_at,
         attempt=attempt,
+        caller_run_id=caller_run_id,
+        caller_workflow_name=caller_workflow_name,
     )
