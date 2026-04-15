@@ -440,6 +440,7 @@ class StreamRecord:
 
     id: StreamID = None  # type: ignore[assignment]
     tier: StorageTier = StorageTier.HOT
+    stream: str = ""
     payload: bytes = b""
     headers: dict[str, str] | None = None
 

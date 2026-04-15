@@ -597,7 +597,8 @@ def parse_stream_read_response(data: bytes) -> StreamReadResult:
         key_present = data[pos]
         pos += 1
 
-        # Skip key if present
+        # Read key (stream name) if present
+        stream_name = ""
         if key_present != 0:
             if pos + 4 > len(data):
                 raise IncompleteResponseError("Stream record: missing key length")
@@ -605,6 +606,7 @@ def parse_stream_read_response(data: bytes) -> StreamReadResult:
             pos += 4
             if pos + key_len > len(data):
                 raise IncompleteResponseError("Stream record: missing key data")
+            stream_name = data[pos : pos + key_len].decode("utf-8")
             pos += key_len
 
         # Read payload
@@ -618,17 +620,41 @@ def parse_stream_read_response(data: bytes) -> StreamReadResult:
         payload = data[pos : pos + payload_len]
         pos += payload_len
 
-        # Skip header_count (TODO: parse headers)
+        # Read headers: [header_count:u32]([key_len:u32][key][val_len:u32][val])*
         if pos + 4 > len(data):
             raise IncompleteResponseError("Stream record: missing header count")
+        header_count = struct.unpack("<I", data[pos : pos + 4])[0]
         pos += 4
+
+        headers = None
+        if header_count > 0:
+            headers = {}
+            for _ in range(header_count):
+                if pos + 4 > len(data):
+                    raise IncompleteResponseError("Stream record: missing header key length")
+                hkey_len = struct.unpack("<I", data[pos : pos + 4])[0]
+                pos += 4
+                if pos + hkey_len > len(data):
+                    raise IncompleteResponseError("Stream record: missing header key")
+                hkey = data[pos : pos + hkey_len].decode("utf-8")
+                pos += hkey_len
+                if pos + 4 > len(data):
+                    raise IncompleteResponseError("Stream record: missing header value length")
+                hval_len = struct.unpack("<I", data[pos : pos + 4])[0]
+                pos += 4
+                if pos + hval_len > len(data):
+                    raise IncompleteResponseError("Stream record: missing header value")
+                hval = data[pos : pos + hval_len].decode("utf-8")
+                pos += hval_len
+                headers[hkey] = hval
 
         records.append(
             StreamRecord(
                 id=StreamID(timestamp_ms=timestamp_ms, sequence=sequence),
                 tier=tier,
+                stream=stream_name,
                 payload=payload,
-                headers=None,
+                headers=headers,
             )
         )
 
