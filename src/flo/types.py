@@ -67,7 +67,7 @@ class OpCode(IntEnum):
     CLUSTER_MEMBERS_RESPONSE = 0x041
     CLUSTER_JOIN_RESPONSE = 0x042
 
-    # ── KV + Transactions + Snapshots (0x100 – 0x12F) ──
+    # ── KV (0x100 – 0x12F) ──
     KV_PUT = 0x100
     KV_GET = 0x101
     KV_MGET = 0x102
@@ -79,13 +79,23 @@ class OpCode(IntEnum):
     KV_PUT_RESPONSE = 0x108
     KV_SCAN_RESPONSE = 0x109
     KV_HISTORY_RESPONSE = 0x10A
+    # KV Extended (atomic counters, JSON ops)
+    KV_INCR = 0x10B
+    KV_JSON_GET = 0x10C
+    KV_JSON_SET = 0x10D
+    KV_JSON_DEL = 0x10E
+    # KV Per-Shard Transactions
     KV_BEGIN_TXN = 0x110
     KV_COMMIT_TXN = 0x111
     KV_ROLLBACK_TXN = 0x112
-    KV_SNAPSHOT_CREATE = 0x120
-    KV_SNAPSHOT_GET = 0x121
-    KV_SNAPSHOT_RELEASE = 0x122
-    KV_SNAPSHOT_CREATE_RESPONSE = 0x123
+    # KV Extended (TTL lifecycle, exists)
+    KV_TOUCH = 0x113
+    KV_PERSIST = 0x114
+    KV_EXISTS = 0x115
+    KV_INCR_RESPONSE = 0x116
+    KV_JSON_RESPONSE = 0x117
+    KV_EXISTS_RESPONSE = 0x118
+    KV_TXN_RESPONSE = 0x119
 
     # ── Streams (0x130 – 0x14F) ──
     STREAM_APPEND = 0x130
@@ -285,6 +295,7 @@ class OptionTag(IntEnum):
     KEYS_ONLY = 0x06  # u8: Skip values in scan response (0/1)
     CURSOR = 0x07  # bytes: Pagination cursor (ShardWalker format)
     ROUTING_KEY = 0x08  # string: Explicit routing key for shard co-location
+    TXN_ID = 0x09  # u64: Transaction ID for per-shard transactions
 
     # Queue Options (0x10 - 0x1F)
     PRIORITY = 0x10  # u8: Message priority (0-255, higher = more urgent)
@@ -380,6 +391,68 @@ class VersionEntry:
     version: int
     timestamp: int
     value: bytes
+
+
+@dataclass
+class PutResult:
+    """Result of a successful KV put.
+
+    The ``version`` field is the new version assigned by the server, suitable
+    for CAS on the next write via :class:`PutOptions.cas_version`.
+    """
+
+    version: int
+
+
+@dataclass
+class KVBeginResult:
+    """Result of a successful KV transaction begin.
+
+    ``txn_id`` is the server-assigned transaction handle. ``pinned_hash`` is
+    the partition hash this transaction is bound to — every key written or
+    read inside the transaction must hash to the same partition.
+    """
+
+    txn_id: int
+    pinned_hash: int
+
+
+@dataclass
+class KVCommitResult:
+    """Result of a successful KV transaction commit.
+
+    ``commit_index`` is the Raft log index of the committed batch and
+    ``op_count`` is the number of buffered operations applied atomically.
+    """
+
+    commit_index: int
+    op_count: int
+
+
+@dataclass
+class GetResult:
+    """Result of a KV get that found a key.
+
+    ``kv.get`` returns ``None`` when the key is missing; check for ``None``
+    before dereferencing.
+    """
+
+    value: bytes
+    version: int
+
+
+@dataclass
+class MGetEntry:
+    """One entry in a :meth:`KV.mget` response.
+
+    ``found`` is ``False`` when the key did not exist; in that case ``value``
+    is ``b''`` and ``version`` is ``0``.
+    """
+
+    key: str
+    value: bytes
+    version: int
+    found: bool
 
 
 @dataclass
@@ -517,6 +590,42 @@ class HistoryOptions:
 
     namespace: str | None = None
     limit: int | None = None
+
+
+@dataclass
+class KVIncrOptions:
+    """Options for KV incr operations."""
+
+    namespace: str | None = None
+    delta: int | None = None  # default +1 when None
+
+
+@dataclass
+class KVTouchOptions:
+    """Options for KV touch / persist operations."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class KVExistsOptions:
+    """Options for KV exists operations."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class KVJsonOptions:
+    """Options for KV JSON.* operations."""
+
+    namespace: str | None = None
+
+
+@dataclass
+class KVMGetOptions:
+    """Options for KV mget operations."""
+
+    namespace: str | None = None
 
 
 @dataclass

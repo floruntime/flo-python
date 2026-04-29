@@ -61,6 +61,7 @@ from .exceptions import (
     is_connection_error,
 )
 from .processing import ProcessingOperations
+from .kv_txn import Transaction, TxnFinishedError, TxnUnsupportedOpError
 from .types import (
     AckOptions,
     ActionDeleteOptions,
@@ -81,7 +82,17 @@ from .types import (
     EnqueueOptions,
     GetOptions,
     HistoryOptions,
+    KVBeginResult,
+    KVCommitResult,
     KVEntry,
+    KVExistsOptions,
+    KVIncrOptions,
+    KVJsonOptions,
+    KVMGetOptions,
+    KVTouchOptions,
+    GetResult,
+    MGetEntry,
+    PutResult,
     Message,
     NackOptions,
     OpCode,
