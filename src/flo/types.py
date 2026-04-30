@@ -572,6 +572,7 @@ class DeleteOptions:
     """Options for KV delete operations."""
 
     namespace: str | None = None
+    if_match: int | None = None  # CAS: only delete when current version equals if_match
 
 
 @dataclass
@@ -605,6 +606,7 @@ class KVTouchOptions:
     """Options for KV touch / persist operations."""
 
     namespace: str | None = None
+    if_match: int | None = None  # CAS: only succeed when current version equals if_match
 
 
 @dataclass

@@ -150,23 +150,33 @@ class KVOperations:
             options: Optional operation options.
 
         Note:
-            This operation succeeds even if the key doesn't exist.
+            This operation succeeds even if the key doesn't exist (unless
+            ``if_match`` is set, in which case a missing key is treated as a
+            CAS mismatch).
 
         Example:
             await client.kv.delete("user:123")
+            # CAS-protected release — only the owner deletes:
+            await client.kv.delete("lock:resource",
+                                   DeleteOptions(if_match=tag_version))
         """
         opts = options or DeleteOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
         key_bytes = key.encode("utf-8") if isinstance(key, str) else key
 
-        # Delete succeeds for both OK and NOT_FOUND
+        builder = OptionsBuilder()
+        if opts.if_match is not None:
+            builder.add_u64(OptionTag.CAS_VERSION, opts.if_match)
+
+        # Delete succeeds for both OK and NOT_FOUND (when if_match is unset).
         await self._client._send_and_check(
             OpCode.KV_DELETE,
             namespace,
             key_bytes,
             b"",
-            allow_not_found=True,
+            builder.build(),
+            allow_not_found=opts.if_match is None,
         )
 
     async def mget(
@@ -388,16 +398,23 @@ class KVOperations:
         ttl_seconds: int,
         options: KVTouchOptions | None = None,
     ) -> None:
-        """Update the TTL on an existing key. ``ttl_seconds=0`` clears the TTL."""
+        """Update the TTL on an existing key. ``ttl_seconds=0`` clears the TTL.
+
+        When ``options.if_match`` is set, the touch only succeeds if the
+        current key version equals it — enabling race-free lease renewal.
+        """
         opts = options or KVTouchOptions()
         namespace = self._client.get_namespace(opts.namespace)
         key_bytes = key.encode("utf-8") if isinstance(key, str) else key
+        builder = OptionsBuilder()
+        if opts.if_match is not None:
+            builder.add_u64(OptionTag.CAS_VERSION, opts.if_match)
         await self._client._send_and_check(
             OpCode.KV_TOUCH,
             namespace,
             key_bytes,
             struct.pack("<Q", ttl_seconds),
-            b"",
+            builder.build(),
         )
 
     async def persist(
@@ -405,16 +422,23 @@ class KVOperations:
         key: str | bytes,
         options: KVTouchOptions | None = None,
     ) -> None:
-        """Clear the TTL on an existing key, making it permanent."""
+        """Clear the TTL on an existing key, making it permanent.
+
+        When ``options.if_match`` is set, the persist only succeeds if the
+        current key version equals it.
+        """
         opts = options or KVTouchOptions()
         namespace = self._client.get_namespace(opts.namespace)
         key_bytes = key.encode("utf-8") if isinstance(key, str) else key
+        builder = OptionsBuilder()
+        if opts.if_match is not None:
+            builder.add_u64(OptionTag.CAS_VERSION, opts.if_match)
         await self._client._send_and_check(
             OpCode.KV_PERSIST,
             namespace,
             key_bytes,
             b"",
-            b"",
+            builder.build(),
         )
 
     async def exists(
