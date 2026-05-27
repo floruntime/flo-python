@@ -24,6 +24,7 @@ from .types import (
 )
 from .wire import (
     OptionsBuilder,
+    build_stream_batch_value,
     parse_stream_append_response,
     parse_stream_info_response,
     parse_stream_read_response,
@@ -63,12 +64,13 @@ class StreamOperations:
         """
         opts = options or StreamAppendOptions()
         namespace = self._client.get_namespace(opts.namespace)
+        value = build_stream_batch_value(payload, opts.headers)
 
         response = await self._client._send_and_check(
             OpCode.STREAM_APPEND,
             namespace,
             stream.encode("utf-8"),
-            payload,
+            value,
             allow_not_found=True,
         )
 

@@ -15,6 +15,7 @@ from flo.types import (
 from flo.wire import (
     OptionsBuilder,
     OptionsIterator,
+    build_stream_batch_value,
     compute_crc32,
     parse_dequeue_response,
     parse_enqueue_response,
@@ -389,3 +390,15 @@ class TestSerializeSeqs:
     def test_serialize_empty_seqs(self) -> None:
         result = serialize_seqs([])
         assert result == struct.pack("<I", 0)
+
+
+class TestBuildStreamBatchValue:
+    """Tests for stream append batch framing."""
+
+    def test_payload_and_headers(self) -> None:
+        value = build_stream_batch_value(b"hello", {"k1": "v1"})
+
+        assert struct.unpack("<I", value[0:4])[0] == 1
+        assert struct.unpack("<I", value[4:8])[0] == 5
+        assert value[8:13] == b"hello"
+        assert struct.unpack("<H", value[13:15])[0] == 1

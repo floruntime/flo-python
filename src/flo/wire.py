@@ -687,6 +687,33 @@ def parse_stream_info_response(data: bytes) -> StreamInfo:
     )
 
 
+def build_stream_batch_value(
+    payload: bytes,
+    headers: dict[str, str] | None = None,
+) -> bytes:
+    """Frame a single record for stream_append (batch of one).
+
+    Wire format:
+    [record_count:u32=1][payload_len:u32][payload]
+    [header_count:u16]([key_len:u16][key][val_len:u16][val])*
+    """
+    hdrs = headers or {}
+    parts: list[bytes] = [
+        struct.pack("<I", 1),
+        struct.pack("<I", len(payload)),
+        payload,
+        struct.pack("<H", len(hdrs)),
+    ]
+    for key, val in hdrs.items():
+        key_bytes = key.encode("utf-8")
+        val_bytes = val.encode("utf-8")
+        parts.append(struct.pack("<H", len(key_bytes)))
+        parts.append(key_bytes)
+        parts.append(struct.pack("<H", len(val_bytes)))
+        parts.append(val_bytes)
+    return b"".join(parts)
+
+
 def serialize_group_value(group: str, consumer: str) -> bytes:
     """Serialize group and consumer names for consumer group operations.
 
