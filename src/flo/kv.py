@@ -3,11 +3,13 @@
 Key-value store operations for Flo client.
 """
 
+import json
 import struct
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .types import (
     DeleteOptions,
+    GetJsonResult,
     GetOptions,
     GetResult,
     HistoryOptions,
@@ -467,11 +469,13 @@ class KVOperations:
         key: str | bytes,
         path: str = "$",
         options: KVJsonOptions | None = None,
-    ) -> GetResult | None:
+    ) -> GetJsonResult[Any] | None:
         """Extract the value at ``path`` from the JSON document at ``key``.
 
-        Returns a :class:`GetResult` carrying the extracted JSON bytes and the
-        document's current version, or ``None`` if the key or path is missing.
+        Returns a :class:`GetJsonResult` whose ``value`` is the already-parsed
+        JSON (the ``KV_JSON_GET`` wire body is always a JSON document, so it is
+        decoded for you) together with the document's current version, or
+        ``None`` if the key or path is missing.
         """
         opts = options or KVJsonOptions()
         namespace = self._client.get_namespace(opts.namespace)
@@ -492,7 +496,8 @@ class KVOperations:
         if not response.data or len(response.data) < 8:
             return None
         version = int.from_bytes(response.data[:8], "little")
-        return GetResult(value=bytes(response.data[8:]), version=version)
+        value = json.loads(bytes(response.data[8:]).decode("utf-8"))
+        return GetJsonResult(value=value, version=version)
 
     async def json_set(
         self,

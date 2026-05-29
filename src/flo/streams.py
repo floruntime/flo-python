@@ -9,8 +9,10 @@ from typing import TYPE_CHECKING
 from .types import (
     OpCode,
     OptionTag,
+    PendingEntry,
     StreamAppendOptions,
     StreamAppendResult,
+    StreamClaimResult,
     StreamGroupAckOptions,
     StreamGroupJoinOptions,
     StreamGroupNackOptions,
@@ -25,12 +27,19 @@ from .types import (
 from .wire import (
     OptionsBuilder,
     build_stream_batch_value,
+    parse_pending_entries,
     parse_stream_append_response,
     parse_stream_info_response,
     parse_stream_read_response,
     serialize_group_ack_value,
+    serialize_group_claim_value,
+    serialize_group_pending_value,
     serialize_group_value,
 )
+
+# u64 max sentinel: group_claim returns StreamID.MAX when the PEL is fully
+# scanned (mirrors Go's math.MaxUint64 check).
+_U64_MAX = 0xFFFFFFFFFFFFFFFF
 
 if TYPE_CHECKING:
     from .client import FloClient
@@ -296,11 +305,18 @@ class StreamOperations:
         consumer: str,
         options: StreamGroupReadOptions | None = None,
     ) -> StreamReadResult:
-        """Read records from a consumer group.
+        """Read new records from a consumer group, advancing last_delivered_id.
 
-        Records are distributed among consumers in the group. Each record
-        is delivered to only one consumer. Unacknowledged records will be
-        redelivered.
+        Records are distributed among consumers in the group; each record is
+        delivered to only one consumer and added to that consumer's Pending
+        Entry List (PEL) until acked. Unacknowledged records are redelivered.
+
+        Crash recovery: ``group_read`` alone is NOT sufficient. It only returns
+        records past ``last_delivered_id``, so a record delivered-but-unacked at
+        crash time is never re-surfaced by a later ``group_read``. To re-process
+        in-flight work after a reconnect, drain the PEL with :meth:`group_claim`
+        (StreamWorker does this automatically — see
+        ``redeliver_pending_on_reconnect``).
 
         Args:
             stream: Stream name.
@@ -341,6 +357,99 @@ class StreamOperations:
         )
 
         return parse_stream_read_response(response.data)
+
+    async def group_pending(
+        self,
+        stream: str,
+        group: str,
+        consumer: str = "",
+        options: StreamGroupReadOptions | None = None,
+    ) -> list[PendingEntry]:
+        """List a consumer group's pending (delivered-but-unacked) entries.
+
+        If ``consumer`` is non-empty, only that consumer's entries are returned;
+        otherwise the whole group's PEL is returned. (FLO-102)
+
+        Returns:
+            A list of :class:`PendingEntry`.
+        """
+        opts = options or StreamGroupReadOptions()
+        namespace = self._client.get_namespace(opts.namespace)
+
+        value = serialize_group_pending_value(group, consumer)
+
+        response = await self._client._send_and_check(
+            OpCode.STREAM_GROUP_PENDING,
+            namespace,
+            stream.encode("utf-8"),
+            value,
+            allow_not_found=True,
+        )
+
+        return parse_pending_entries(response.data)
+
+    async def group_claim(
+        self,
+        stream: str,
+        group: str,
+        consumer: str,
+        min_idle_ms: int,
+        start_id: StreamID,
+        count: int,
+        options: StreamGroupReadOptions | None = None,
+    ) -> StreamClaimResult:
+        """Claim a page of a consumer group's pending entries for ``consumer``.
+
+        Scans the PEL in StreamID order from ``start_id`` and takes up to
+        ``count`` entries idle for at least ``min_idle_ms``. Returns the claimed
+        records (payload + headers) plus a cursor for the next page. (FLO-102)
+
+        * Drain own pending (reconnect): ``min_idle_ms=0``, ``start_id=StreamID()``.
+        * Steal from idle consumers (rebalance): ``min_idle_ms > 0``.
+
+        Loop until ``result.done`` to fully drain::
+
+            cursor = StreamID()
+            while True:
+                r = await client.stream.group_claim(
+                    stream, group, consumer, 0, cursor, 100)
+                for rec in r.records:
+                    process(rec)
+                if r.done or not r.records:
+                    break
+                cursor = r.next_cursor
+        """
+        opts = options or StreamGroupReadOptions()
+        namespace = self._client.get_namespace(opts.namespace)
+
+        value = serialize_group_claim_value(group, consumer, min_idle_ms, start_id, count)
+
+        response = await self._client._send_and_check(
+            OpCode.STREAM_GROUP_CLAIM,
+            namespace,
+            stream.encode("utf-8"),
+            value,
+            allow_not_found=True,
+        )
+
+        # Response = <records blob> + [next_ts:u64][next_seq:u64] trailer.
+        data = response.data or b""
+        if len(data) < 16:
+            return StreamClaimResult(records=[], next_cursor=StreamID(), done=True)
+
+        cursor_off = len(data) - 16
+        next_ts = int.from_bytes(data[cursor_off : cursor_off + 8], "little")
+        next_seq = int.from_bytes(data[cursor_off + 8 : cursor_off + 16], "little")
+
+        read = parse_stream_read_response(data[:cursor_off])
+
+        # StreamID.MAX (max, max) is the "fully scanned" sentinel.
+        done = next_ts == _U64_MAX and next_seq == _U64_MAX
+        return StreamClaimResult(
+            records=read.records,
+            next_cursor=StreamID(timestamp_ms=next_ts, sequence=next_seq),
+            done=done,
+        )
 
     async def group_ack(
         self,

@@ -12,6 +12,7 @@ from flo.types import (
     OptionTag,
     StatusCode,
 )
+from flo.types import StreamID
 from flo.wire import (
     OptionsBuilder,
     OptionsIterator,
@@ -19,8 +20,11 @@ from flo.wire import (
     compute_crc32,
     parse_dequeue_response,
     parse_enqueue_response,
+    parse_pending_entries,
     parse_response,
     parse_scan_response,
+    serialize_group_claim_value,
+    serialize_group_pending_value,
     serialize_request,
     serialize_seqs,
 )
@@ -402,3 +406,67 @@ class TestBuildStreamBatchValue:
         assert struct.unpack("<I", value[4:8])[0] == 5
         assert value[8:13] == b"hello"
         assert struct.unpack("<H", value[13:15])[0] == 1
+
+
+class TestGroupPendingClaimWire:
+    """Tests for the FLO-102 PEL pending/claim wire format."""
+
+    def test_serialize_group_pending_no_consumer(self) -> None:
+        value = serialize_group_pending_value("grp")
+        # [group_len:u16][group] only — no consumer trailer.
+        assert struct.unpack("<H", value[0:2])[0] == 3
+        assert value[2:5] == b"grp"
+        assert len(value) == 5
+
+    def test_serialize_group_pending_with_consumer(self) -> None:
+        value = serialize_group_pending_value("grp", "cons")
+        assert struct.unpack("<H", value[0:2])[0] == 3
+        assert value[2:5] == b"grp"
+        assert struct.unpack("<H", value[5:7])[0] == 4
+        assert value[7:11] == b"cons"
+
+    def test_serialize_group_claim_value(self) -> None:
+        sid = StreamID(timestamp_ms=111, sequence=5)
+        value = serialize_group_claim_value("grp", "cons", 2000, sid, 50)
+        pos = 0
+        assert struct.unpack("<H", value[pos : pos + 2])[0] == 3
+        pos += 2
+        assert value[pos : pos + 3] == b"grp"
+        pos += 3
+        assert struct.unpack("<H", value[pos : pos + 2])[0] == 4
+        pos += 2
+        assert value[pos : pos + 4] == b"cons"
+        pos += 4
+        assert struct.unpack("<I", value[pos : pos + 4])[0] == 2000
+        pos += 4
+        assert struct.unpack("<Q", value[pos : pos + 8])[0] == 111
+        pos += 8
+        assert struct.unpack("<Q", value[pos : pos + 8])[0] == 5
+        pos += 8
+        assert struct.unpack("<I", value[pos : pos + 4])[0] == 50
+
+    def test_parse_pending_entries(self) -> None:
+        blob = (
+            struct.pack("<I", 2)
+            + struct.pack("<Q", 111)
+            + struct.pack("<Q", 5)
+            + struct.pack("<I", 3)
+            + struct.pack("<H", 4)
+            + b"cons"
+            + struct.pack("<Q", 222)
+            + struct.pack("<Q", 9)
+            + struct.pack("<I", 1)
+            + struct.pack("<H", 0)
+        )
+        entries = parse_pending_entries(blob)
+        assert len(entries) == 2
+        assert entries[0].id == StreamID(timestamp_ms=111, sequence=5)
+        assert entries[0].consumer == "cons"
+        assert entries[0].delivery_count == 3
+        assert entries[1].id == StreamID(timestamp_ms=222, sequence=9)
+        assert entries[1].consumer == ""
+        assert entries[1].delivery_count == 1
+
+    def test_parse_pending_entries_empty(self) -> None:
+        assert parse_pending_entries(b"") == []
+        assert parse_pending_entries(struct.pack("<I", 0)) == []

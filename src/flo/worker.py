@@ -666,6 +666,15 @@ class StreamWorkerOptions:
     batch_size: int = 10
     block_ms: int = 30000
     message_timeout: float = 300.0  # 5 minutes
+    # Drain this consumer's pending (delivered-but-unacked) entries via
+    # group_claim after a reconnect, before resuming normal group_read.
+    # Required for at-least-once across reconnects: group_read alone only
+    # returns records past last_delivered_id. Set False for at-most-once.
+    redeliver_pending_on_reconnect: bool = True
+    # Minimum idle time (ms) an entry must have before the reconnect drain
+    # claims it. 0 = drain everything this consumer already owns; > 0 also
+    # steals entries abandoned by other (dead) consumers idle at least this long.
+    claim_min_idle_ms: int = 0
 
 
 @dataclass
@@ -749,6 +758,8 @@ class StreamWorker:
         batch_size: int = 10,
         block_ms: int = 30000,
         message_timeout: float = 300.0,
+        redeliver_pending_on_reconnect: bool = True,
+        claim_min_idle_ms: int = 0,
     ):
         self._parent_client = parent_client
         self._handler = handler
@@ -761,6 +772,8 @@ class StreamWorker:
             batch_size=batch_size,
             block_ms=block_ms,
             message_timeout=message_timeout,
+            redeliver_pending_on_reconnect=redeliver_pending_on_reconnect,
+            claim_min_idle_ms=claim_min_idle_ms,
         )
 
         self._client: FloClient | None = None
@@ -805,17 +818,18 @@ class StreamWorker:
         await self._client.connect()
 
         try:
-            # Join consumer group
-            await self._client.stream.group_join(
-                self.config.stream,
-                self.config.group,
-                self.config.consumer,
-            )
-            logger.info(f"Joined consumer group {self.config.group} on stream {self.config.stream}")
-
+            # Semaphore and running state must be set up before the join: a
+            # connection error during the join triggers _handle_reconnect ->
+            # _drain_pending, which acquires the semaphore.
             self._semaphore = asyncio.Semaphore(self.config.concurrency)
             self._running = True
             self._stop_event.clear()
+
+            # Join consumer group. A connection error here (a stalled or dropped
+            # connection at startup) is retried via reconnect rather than
+            # killing the worker — mirroring the poll loop and ack retry.
+            await self._join_group()
+            logger.info(f"Joined consumer group {self.config.group} on stream {self.config.stream}")
 
             await self._poll_loop()
 
@@ -900,8 +914,43 @@ class StreamWorker:
                     logger.error(f"Stream read error: {e}, retrying...")
                     await asyncio.sleep(1)
 
+    async def _join_group(self) -> None:
+        """Join the consumer group, retrying on connection errors.
+
+        A connection error (a stalled or dropped connection at startup) triggers
+        a reconnect-and-retry instead of failing the worker. Non-connection
+        errors (e.g. an invalid request) remain fatal and are raised.
+        """
+        assert self._client is not None
+        while True:
+            if self._stop_event.is_set():
+                return
+            try:
+                await self._client.stream.group_join(
+                    self.config.stream,
+                    self.config.group,
+                    self.config.consumer,
+                )
+                return
+            except Exception as e:
+                if not is_connection_error(e):
+                    raise
+                logger.warning(
+                    f"Connection lost during group join: {e}, reconnecting..."
+                )
+                with contextlib.suppress(Exception):
+                    await self._handle_reconnect()
+                await asyncio.sleep(1)
+
     async def _handle_reconnect(self) -> None:
-        """Reconnect and re-join the consumer group."""
+        """Reconnect, re-join the consumer group, and drain pending entries.
+
+        After re-joining, this consumer's pending (delivered-but-unacked)
+        entries are re-processed via a group_claim cursor loop before normal
+        reads resume — group_read only returns records past last_delivered_id,
+        so without this an in-flight record at crash time is never re-surfaced.
+        See ``redeliver_pending_on_reconnect``.
+        """
         assert self._client is not None
         await self._client.reconnect()
         await self._client.stream.group_join(
@@ -909,6 +958,55 @@ class StreamWorker:
             self.config.group,
             self.config.consumer,
         )
+        if self.config.redeliver_pending_on_reconnect:
+            await self._drain_pending()
+
+    async def _drain_pending(self) -> None:
+        """Re-process this consumer's pending entries via a group_claim loop.
+
+        Records flow through the same _process_record path (and concurrency
+        gate) as live reads, so a handler that succeeds acks and clears the PEL
+        entry. Bounded per stream by a max page count so a pathological backlog
+        can't wedge the reconnect indefinitely; leftovers are reclaimed on the
+        next reconnect or by group_read once acked.
+        """
+        if self._semaphore is None or self._client is None:
+            # start() has not initialized the concurrency gate yet.
+            return
+
+        max_pages = 1000  # safety cap: max_pages * batch_size entries
+        cursor = StreamID()  # MIN — scan from the start of the PEL
+        pages = 0
+        while True:
+            if self._stop_event.is_set():
+                return
+            try:
+                result = await self._client.stream.group_claim(
+                    self.config.stream,
+                    self.config.group,
+                    self.config.consumer,
+                    self.config.claim_min_idle_ms,
+                    cursor,
+                    self.config.batch_size,
+                )
+            except Exception as e:
+                # Don't fail the reconnect on a drain error; normal reads resume.
+                logger.warning(f"Pending drain claim failed: {e}")
+                return
+
+            for record in result.records:
+                await self._semaphore.acquire()  # same gate as live reads
+                if self._stop_event.is_set():
+                    self._semaphore.release()
+                    return
+                task = asyncio.create_task(self._process_record(record))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+
+            pages += 1
+            if result.done or not result.records or pages >= max_pages:
+                return
+            cursor = result.next_cursor
 
     async def _ack_with_retry(
         self, record_ids: list[StreamID], options: StreamGroupAckOptions

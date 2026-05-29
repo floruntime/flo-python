@@ -6,7 +6,7 @@ Core types, constants, and data classes for the Flo client SDK.
 import struct
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional
+from typing import Any, Generic, Optional, TypeVar
 
 # =============================================================================
 # Protocol Constants
@@ -441,6 +441,26 @@ class GetResult:
     version: int
 
 
+T = TypeVar("T")
+
+
+@dataclass
+class GetJsonResult(Generic[T]):
+    """Result of a :meth:`KV.json_get` that found the key and path.
+
+    Unlike :class:`GetResult`, ``value`` is the already-parsed JSON (the
+    ``KV_JSON_GET`` wire body is always a JSON document, so it is decoded for
+    you). ``version`` is the document's current version. ``kv.json_get``
+    returns ``None`` when the key or path is missing.
+
+    The value type defaults to ``Any``; the SDK does not validate the shape at
+    runtime.
+    """
+
+    value: Any
+    version: int
+
+
 @dataclass
 class MGetEntry:
     """One entry in a :meth:`KV.mget` response.
@@ -530,6 +550,35 @@ class StreamReadResult:
     """Result of reading from a stream."""
 
     records: list[StreamRecord]
+
+
+@dataclass
+class PendingEntry:
+    """One entry in a consumer group's Pending Entry List (PEL).
+
+    A delivered-but-unacked message. ``delivery_count`` is how many times the
+    entry has been delivered; ``consumer`` is the consumer that currently owns
+    it. (FLO-102)
+    """
+
+    id: StreamID = None  # type: ignore[assignment]
+    consumer: str = ""
+    delivery_count: int = 0
+
+
+@dataclass
+class StreamClaimResult:
+    """Result of a :meth:`StreamOperations.group_claim` cursor page (FLO-102).
+
+    ``records`` carry payload + headers (same shape as ``group_read``).
+    ``next_cursor`` is the ``start_id`` to pass on the next ``group_claim``
+    call; when ``done`` is ``True`` the PEL has been fully scanned and the loop
+    should stop.
+    """
+
+    records: list[StreamRecord]
+    next_cursor: StreamID = None  # type: ignore[assignment]
+    done: bool = False
 
 
 @dataclass

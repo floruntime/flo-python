@@ -83,7 +83,29 @@ class FloClient:
 
     @staticmethod
     def _parse_endpoint(endpoint: str) -> tuple[str, int]:
-        """Parse endpoint string into host and port."""
+        """Parse endpoint string into host and port.
+
+        Accepts an optional URI scheme: ``flo://`` (plaintext) is stripped and
+        bare ``host:port`` remains valid. ``flos://`` (TLS) is reserved but not
+        yet implemented, and any other scheme is rejected so it fails here
+        rather than as a confusing DNS error at connect time.
+        """
+        if "://" in endpoint:
+            scheme, _, rest = endpoint.partition("://")
+            scheme = scheme.lower()
+            if scheme == "flo":
+                # Drop scheme and any trailing path/query (reserved for future use).
+                endpoint = rest.split("/", 1)[0]
+            elif scheme == "flos":
+                raise InvalidEndpointError(
+                    f"flos:// (TLS) is not yet supported: {endpoint}"
+                )
+            else:
+                raise InvalidEndpointError(
+                    f"Unsupported scheme {scheme}:// (expected flo:// or bare "
+                    f"host:port): {endpoint}"
+                )
+
         parts = endpoint.rsplit(":", 1)
         if len(parts) != 2:
             raise InvalidEndpointError(f"Invalid endpoint format: {endpoint} (expected host:port)")
@@ -402,6 +424,8 @@ class FloClient:
         batch_size: int = 10,
         block_ms: int = 30000,
         message_timeout: float = 300.0,
+        redeliver_pending_on_reconnect: bool = True,
+        claim_min_idle_ms: int = 0,
     ) -> "StreamWorker":
         """Create a new StreamWorker from this client.
 
@@ -419,6 +443,14 @@ class FloClient:
             batch_size: Number of records to fetch per poll.
             block_ms: Timeout for blocking read in milliseconds.
             message_timeout: Timeout for record handlers in seconds.
+            redeliver_pending_on_reconnect: Drain this consumer's pending
+                (delivered-but-unacked) entries via group_claim after a
+                reconnect, before resuming normal reads. Defaults to True
+                (required for at-least-once across reconnects). Set False for
+                at-most-once.
+            claim_min_idle_ms: Minimum idle time (ms) before the reconnect drain
+                claims an entry. 0 drains everything this consumer owns; > 0
+                also steals entries abandoned by dead consumers.
 
         Returns:
             A new StreamWorker instance ready to start.
@@ -446,4 +478,6 @@ class FloClient:
             batch_size=batch_size,
             block_ms=block_ms,
             message_timeout=message_timeout,
+            redeliver_pending_on_reconnect=redeliver_pending_on_reconnect,
+            claim_min_idle_ms=claim_min_idle_ms,
         )
