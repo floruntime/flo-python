@@ -25,13 +25,13 @@ from .types import (
     PutResult,
     ScanOptions,
     ScanResult,
-    StatusCode,
     VersionEntry,
 )
 from .wire import OptionsBuilder, parse_history_response, parse_scan_response
 
 if TYPE_CHECKING:
     from .client import FloClient
+    from .kv_txn import Transaction
 
 
 class KVOperations:
@@ -211,9 +211,7 @@ class KVOperations:
         namespace = self._client.get_namespace(opts.namespace)
 
         # Pack request: [count:u16 LE]([key_len:u16 LE][key])*
-        encoded: list[bytes] = [
-            (k.encode("utf-8") if isinstance(k, str) else k) for k in keys
-        ]
+        encoded: list[bytes] = [(k.encode("utf-8") if isinstance(k, str) else k) for k in keys]
         for k in encoded:
             if len(k) > 0xFFFF:
                 raise ValueError("mget: key too long")
@@ -392,7 +390,7 @@ class KVOperations:
         # Wire body: [version:u64][counter:i64 LE]
         if not response.data or len(response.data) < 16:
             raise ValueError("incr: short response")
-        return struct.unpack("<q", response.data[8:16])[0]
+        return int(struct.unpack("<q", response.data[8:16])[0])
 
     async def touch(
         self,

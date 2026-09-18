@@ -935,9 +935,7 @@ class StreamWorker:
             except Exception as e:
                 if not is_connection_error(e):
                     raise
-                logger.warning(
-                    f"Connection lost during group join: {e}, reconnecting..."
-                )
+                logger.warning(f"Connection lost during group join: {e}, reconnecting...")
                 with contextlib.suppress(Exception):
                     await self._handle_reconnect()
                 await asyncio.sleep(1)

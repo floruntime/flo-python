@@ -97,9 +97,7 @@ class FloClient:
                 # Drop scheme and any trailing path/query (reserved for future use).
                 endpoint = rest.split("/", 1)[0]
             elif scheme == "flos":
-                raise InvalidEndpointError(
-                    f"flos:// (TLS) is not yet supported: {endpoint}"
-                )
+                raise InvalidEndpointError(f"flos:// (TLS) is not yet supported: {endpoint}")
             else:
                 raise InvalidEndpointError(
                     f"Unsupported scheme {scheme}:// (expected flo:// or bare "

@@ -30,6 +30,7 @@ from .types import (
     Message,
     OpCode,
     OptionTag,
+    PendingEntry,
     ScanResult,
     StatusCode,
     StorageTier,
@@ -38,7 +39,6 @@ from .types import (
     StreamInfo,
     StreamReadResult,
     StreamRecord,
-    PendingEntry,
     VersionEntry,
 )
 

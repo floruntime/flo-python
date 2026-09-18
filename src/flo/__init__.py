@@ -60,8 +60,8 @@ from .exceptions import (
     ValueTooLargeError,
     is_connection_error,
 )
-from .processing import ProcessingOperations
 from .kv_txn import Transaction, TxnFinishedError, TxnUnsupportedOpError
+from .processing import ProcessingOperations
 from .types import (
     AckOptions,
     ActionDeleteOptions,
@@ -80,7 +80,9 @@ from .types import (
     DlqListOptions,
     DlqRequeueOptions,
     EnqueueOptions,
+    GetJsonResult,
     GetOptions,
+    GetResult,
     HistoryOptions,
     KVBeginResult,
     KVCommitResult,
@@ -90,15 +92,13 @@ from .types import (
     KVJsonOptions,
     KVMGetOptions,
     KVTouchOptions,
-    GetResult,
-    GetJsonResult,
-    MGetEntry,
-    PutResult,
     Message,
+    MGetEntry,
     NackOptions,
     OpCode,
     OptionTag,
     PeekOptions,
+    PendingEntry,
     ProcessingCancelOptions,
     ProcessingListEntry,
     ProcessingListOptions,
@@ -112,6 +112,7 @@ from .types import (
     ProcessingSyncOptions,
     ProcessingSyncResult,
     PutOptions,
+    PutResult,
     ScanOptions,
     ScanResult,
     StatusCode,
@@ -130,7 +131,6 @@ from .types import (
     StreamReadResult,
     StreamRecord,
     StreamTrimOptions,
-    PendingEntry,
     TaskAssignment,
     TouchOptions,
     VersionEntry,
@@ -170,9 +170,23 @@ from .worker import (
 )
 from .workflows import WorkflowOperations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
+    "Transaction",
+    "TxnFinishedError",
+    "TxnUnsupportedOpError",
+    "KVBeginResult",
+    "KVCommitResult",
+    "KVExistsOptions",
+    "KVIncrOptions",
+    "KVJsonOptions",
+    "KVMGetOptions",
+    "KVTouchOptions",
+    "GetResult",
+    "GetJsonResult",
+    "MGetEntry",
+    "PutResult",
     # Client
     "FloClient",
     # High-level Worker API

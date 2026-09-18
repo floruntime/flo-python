@@ -5,7 +5,7 @@ Python SDK for the [Flo](https://github.com/floruntime) distributed systems plat
 ## Installation
 
 ```bash
-pip install flo
+pip install flo-python
 ```
 
 ## Quick Start
