@@ -30,6 +30,7 @@ from .types import (
     Message,
     OpCode,
     OptionTag,
+    PendingEntry,
     ScanResult,
     StatusCode,
     StorageTier,
@@ -687,6 +688,33 @@ def parse_stream_info_response(data: bytes) -> StreamInfo:
     )
 
 
+def build_stream_batch_value(
+    payload: bytes,
+    headers: dict[str, str] | None = None,
+) -> bytes:
+    """Frame a single record for stream_append (batch of one).
+
+    Wire format:
+    [record_count:u32=1][payload_len:u32][payload]
+    [header_count:u16]([key_len:u16][key][val_len:u16][val])*
+    """
+    hdrs = headers or {}
+    parts: list[bytes] = [
+        struct.pack("<I", 1),
+        struct.pack("<I", len(payload)),
+        payload,
+        struct.pack("<H", len(hdrs)),
+    ]
+    for key, val in hdrs.items():
+        key_bytes = key.encode("utf-8")
+        val_bytes = val.encode("utf-8")
+        parts.append(struct.pack("<H", len(key_bytes)))
+        parts.append(key_bytes)
+        parts.append(struct.pack("<H", len(val_bytes)))
+        parts.append(val_bytes)
+    return b"".join(parts)
+
+
 def serialize_group_value(group: str, consumer: str) -> bytes:
     """Serialize group and consumer names for consumer group operations.
 
@@ -721,6 +749,92 @@ def serialize_group_ack_value(group: str, ids: list[StreamID], consumer: str = "
         result.extend(struct.pack("<Q", sid.timestamp_ms))
         result.extend(struct.pack("<Q", sid.sequence))
     return bytes(result)
+
+
+def serialize_group_pending_value(group: str, consumer: str = "") -> bytes:
+    """Serialize group (and optional consumer filter) for STREAM_GROUP_PENDING.
+
+    Format: [group_len:u16][group]([consumer_len:u16][consumer])?
+
+    An empty ``consumer`` returns the whole group's PEL; a non-empty one filters
+    to that consumer's entries.
+    """
+    group_bytes = group.encode("utf-8")
+
+    result = bytearray()
+    result.extend(struct.pack("<H", len(group_bytes)))
+    result.extend(group_bytes)
+    if consumer:
+        consumer_bytes = consumer.encode("utf-8")
+        result.extend(struct.pack("<H", len(consumer_bytes)))
+        result.extend(consumer_bytes)
+    return bytes(result)
+
+
+def serialize_group_claim_value(
+    group: str,
+    consumer: str,
+    min_idle_ms: int,
+    start_id: StreamID,
+    count: int,
+) -> bytes:
+    """Serialize the request value for STREAM_GROUP_CLAIM (FLO-102).
+
+    Format: [group_len:u16][group][consumer_len:u16][consumer]
+            [min_idle_ms:u32][start_ts:u64][start_seq:u64][count:u32]
+    """
+    group_bytes = group.encode("utf-8")
+    consumer_bytes = consumer.encode("utf-8")
+
+    result = bytearray()
+    result.extend(struct.pack("<H", len(group_bytes)))
+    result.extend(group_bytes)
+    result.extend(struct.pack("<H", len(consumer_bytes)))
+    result.extend(consumer_bytes)
+    result.extend(struct.pack("<I", min_idle_ms))
+    result.extend(struct.pack("<Q", start_id.timestamp_ms))
+    result.extend(struct.pack("<Q", start_id.sequence))
+    result.extend(struct.pack("<I", count))
+    return bytes(result)
+
+
+def parse_pending_entries(data: bytes) -> list[PendingEntry]:
+    """Parse the STREAM_GROUP_PENDING response (FLO-102).
+
+    Format: [count:u32]([ts:u64][seq:u64][delivery_count:u32]
+            [consumer_len:u16][consumer])*
+    """
+    if len(data) < 4:
+        return []
+
+    pos = 0
+    count = struct.unpack("<I", data[pos : pos + 4])[0]
+    pos += 4
+
+    entries: list[PendingEntry] = []
+    for _ in range(count):
+        if pos + 8 + 8 + 4 + 2 > len(data):
+            raise IncompleteResponseError("Pending entry: truncated header")
+        ts = struct.unpack("<Q", data[pos : pos + 8])[0]
+        pos += 8
+        seq = struct.unpack("<Q", data[pos : pos + 8])[0]
+        pos += 8
+        delivery_count = struct.unpack("<I", data[pos : pos + 4])[0]
+        pos += 4
+        clen = struct.unpack("<H", data[pos : pos + 2])[0]
+        pos += 2
+        if pos + clen > len(data):
+            raise IncompleteResponseError("Pending entry: truncated consumer")
+        consumer = data[pos : pos + clen].decode("utf-8")
+        pos += clen
+        entries.append(
+            PendingEntry(
+                id=StreamID(timestamp_ms=ts, sequence=seq),
+                consumer=consumer,
+                delivery_count=delivery_count,
+            )
+        )
+    return entries
 
 
 # =============================================================================

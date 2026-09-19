@@ -16,13 +16,13 @@ The following operations are NOT supported inside a transaction and raise
 
 from __future__ import annotations
 
+import contextlib
 import struct
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .types import (
     DeleteOptions,
     GetResult,
-    KVBeginResult,
     KVCommitResult,
     OpCode,
     OptionTag,
@@ -59,7 +59,7 @@ class Transaction:
 
     def __init__(
         self,
-        client: "FloClient",
+        client: FloClient,
         namespace: str,
         routing_key: str,
         txn_id: int,
@@ -176,7 +176,7 @@ class Transaction:
         )
         if not response.data or len(response.data) < 8:
             return 0
-        return struct.unpack("<q", response.data[:8])[0]
+        return int(struct.unpack("<q", response.data[:8])[0])
 
     async def touch(self, key: str | bytes, ttl_seconds: int) -> None:
         """Update the TTL on an existing key inside the transaction."""
@@ -223,22 +223,22 @@ class Transaction:
 
     # ── Disallowed inside a transaction ───────────────────────────────
 
-    async def scan(self, *args, **kwargs) -> "None":  # pragma: no cover
+    async def scan(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
         raise TxnUnsupportedOpError("scan is not supported inside a KV transaction")
 
-    async def mget(self, *args, **kwargs) -> "None":  # pragma: no cover
+    async def mget(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
         raise TxnUnsupportedOpError("mget is not supported inside a KV transaction")
 
-    async def json_get(self, *args, **kwargs) -> "None":  # pragma: no cover
+    async def json_get(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
         raise TxnUnsupportedOpError("json_get is not supported inside a KV transaction")
 
-    async def json_set(self, *args, **kwargs) -> "None":  # pragma: no cover
+    async def json_set(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
         raise TxnUnsupportedOpError("json_set is not supported inside a KV transaction")
 
-    async def json_del(self, *args, **kwargs) -> "None":  # pragma: no cover
+    async def json_del(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
         raise TxnUnsupportedOpError("json_del is not supported inside a KV transaction")
 
-    async def history(self, *args, **kwargs) -> "None":  # pragma: no cover
+    async def history(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
         raise TxnUnsupportedOpError("history is not supported inside a KV transaction")
 
     # ── Lifecycle ──────────────────────────────────────────────────────
@@ -292,20 +292,18 @@ class Transaction:
             builder.build(),
         )
 
-    async def __aenter__(self) -> "Transaction":
+    async def __aenter__(self) -> Transaction:
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
         if not self._done:
-            try:
+            # Best-effort cleanup; surface the original exception.
+            with contextlib.suppress(Exception):
                 await self.rollback()
-            except Exception:
-                # Best-effort cleanup; surface the original exception.
-                pass
 
 
 async def begin(
-    client: "FloClient",
+    client: FloClient,
     namespace: str,
     routing_key: str,
 ) -> Transaction:
