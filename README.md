@@ -52,10 +52,8 @@ if value is not None:
     print(value.decode())
 
 # Blocking get - wait up to 5 seconds for value to appear
+# (block_ms is at most 300000; 0 means don't wait)
 value = await client.kv.get("key", GetOptions(block_ms=5000))
-
-# Blocking get - wait indefinitely (0 = infinite)
-value = await client.kv.get("key", GetOptions(block_ms=0))
 
 # Get with namespace override
 value = await client.kv.get("key", GetOptions(namespace="other"))
