@@ -43,6 +43,7 @@ from .types import (
     WorkerAwaitOptions,
     WorkerTouchOptions,
 )
+from .wire import validate_block_ms
 
 logger = logging.getLogger("flo.worker")
 
@@ -68,6 +69,19 @@ class ActionResult:
 ActionHandler = Callable[["ActionContext"], Awaitable[bytes | dict[str, Any] | ActionResult]]
 
 
+# Workers always long-poll: block_ms=0 ("don't wait") would turn the poll loop
+# into a busy spin against the server, so a worker treats 0 as this default.
+DEFAULT_WORKER_BLOCK_MS = 30000
+
+
+def _worker_block_ms(block_ms: int) -> int:
+    """Resolve a worker's block_ms: 0 means the default, over 300000 is refused."""
+    if block_ms == 0:
+        return DEFAULT_WORKER_BLOCK_MS
+    validate_block_ms(block_ms)
+    return block_ms
+
+
 @dataclass
 class ActionWorkerOptions:
     """Configuration for a Flo action worker.
@@ -78,7 +92,11 @@ class ActionWorkerOptions:
     worker_id: str = ""
     concurrency: int = 10
     action_timeout: float = 300.0  # 5 minutes
-    block_ms: int = 30000
+    # Long-poll wait per await, at most 300000 ms. 0 means the 30000 default.
+    block_ms: int = DEFAULT_WORKER_BLOCK_MS
+
+    def __post_init__(self) -> None:
+        self.block_ms = _worker_block_ms(self.block_ms)
 
 
 @dataclass
@@ -199,7 +217,8 @@ class ActionWorker:
             worker_id: Unique worker identifier (auto-generated if not provided).
             concurrency: Maximum number of concurrent actions.
             action_timeout: Timeout for action handlers in seconds.
-            block_ms: Timeout for blocking dequeue in milliseconds.
+            block_ms: Long-poll wait per await in milliseconds, at most 300000.
+                0 means the 30000 default.
         """
         self._parent_client = parent_client
         self.config = ActionWorkerOptions(
@@ -664,7 +683,8 @@ class StreamWorkerOptions:
     worker_id: str = ""
     concurrency: int = 10
     batch_size: int = 10
-    block_ms: int = 30000
+    # Long-poll wait per read, at most 300000 ms. 0 means the 30000 default.
+    block_ms: int = DEFAULT_WORKER_BLOCK_MS
     message_timeout: float = 300.0  # 5 minutes
     # Drain this consumer's pending (delivered-but-unacked) entries via
     # group_claim after a reconnect, before resuming normal group_read.
@@ -675,6 +695,9 @@ class StreamWorkerOptions:
     # claims it. 0 = drain everything this consumer already owns; > 0 also
     # steals entries abandoned by other (dead) consumers idle at least this long.
     claim_min_idle_ms: int = 0
+
+    def __post_init__(self) -> None:
+        self.block_ms = _worker_block_ms(self.block_ms)
 
 
 @dataclass

@@ -20,6 +20,9 @@ HEADER_SIZE: int = 32
 MAX_NAMESPACE_SIZE: int = 255
 MAX_KEY_SIZE: int = 64 * 1024  # 64 KB
 MAX_VALUE_SIZE: int = 16 * 1024 * 1024  # 16 MB practical limit
+# Longest blocking wait (block_ms / wait_ms) the server accepts: 5 minutes.
+# 0 means don't wait; the server refuses anything longer with bad_request.
+MAX_BLOCK_MS: int = 300_000
 
 
 # =============================================================================
@@ -305,8 +308,8 @@ class OptionTag(IntEnum):
     MAX_RETRIES = 0x14  # u8: Maximum retry attempts before DLQ
     COUNT = 0x15  # u32: Number of messages to dequeue
     SEND_TO_DLQ = 0x16  # u8: Whether to send failed messages to DLQ (0/1)
-    BLOCK_MS = 0x17  # u32: Block timeout - wait until exists (0=forever)
-    WAIT_MS = 0x18  # u32: Watch timeout - wait for NEXT version change (0=forever)
+    BLOCK_MS = 0x17  # u32: Block timeout - wait until exists (0=don't wait, max 300000)
+    WAIT_MS = 0x18  # u32: Watch timeout - wait for NEXT version change (0=don't wait, max 300000)
 
     # Stream Options (0x20 - 0x2F) - StreamID-native ONLY
     # All stream positioning uses StreamID (timestamp_ms + sequence)
@@ -602,7 +605,7 @@ class GetOptions:
     """Options for KV get operations."""
 
     namespace: str | None = None
-    block_ms: int | None = None  # Block until value available (0 = infinite)
+    block_ms: int | None = None  # Block until value available (0 = don't wait, max 300000)
 
 
 @dataclass
@@ -768,7 +771,7 @@ class StreamReadOptions:
     tail: bool = False  # Start from end of stream (mutually exclusive with start)
     partition: int | None = None  # Explicit partition index
     count: int | None = None  # Maximum number of records to return
-    block_ms: int | None = None  # Blocking timeout (0 = infinite)
+    block_ms: int | None = None  # Blocking timeout (0 = don't wait, max 300000)
 
 
 @dataclass
@@ -802,7 +805,7 @@ class StreamGroupReadOptions:
 
     namespace: str | None = None
     count: int | None = None  # Max records to read
-    block_ms: int | None = None  # Block waiting for records
+    block_ms: int | None = None  # Block waiting for records (0 = don't wait, max 300000)
 
 
 @dataclass
@@ -980,7 +983,7 @@ class WorkerAwaitOptions:
     """Options for awaiting a task."""
 
     namespace: str | None = None
-    block_ms: int | None = None  # Block waiting for task (0 = infinite)
+    block_ms: int | None = None  # Block waiting for task (0 = don't wait, max 300000)
     timeout_ms: int | None = None
 
 

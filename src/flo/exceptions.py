@@ -132,6 +132,12 @@ class ValueTooLargeError(ValidationError):
     pass
 
 
+class BlockTooLongError(ValidationError):
+    """A blocking wait (block_ms / wait_ms) exceeds 300000 ms (5 minutes)."""
+
+    pass
+
+
 # =============================================================================
 # Server Response Errors
 # =============================================================================

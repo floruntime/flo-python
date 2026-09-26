@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from . import types as types
 from .exceptions import (
+    BlockTooLongError,
     IncompleteResponseError,
     InvalidChecksumError,
     InvalidMagicError,
@@ -21,6 +22,7 @@ from .exceptions import (
 from .types import (
     HEADER_SIZE,
     MAGIC,
+    MAX_BLOCK_MS,
     MAX_KEY_SIZE,
     MAX_NAMESPACE_SIZE,
     MAX_VALUE_SIZE,
@@ -58,6 +60,21 @@ RESPONSE_HEADER_FORMAT = "<IIQIBBBB8s"
 # =============================================================================
 
 
+def validate_block_ms(block_ms: int) -> None:
+    """Refuse a blocking wait the server would refuse, before the round trip.
+
+    0 means don't wait. Anything over MAX_BLOCK_MS (5 minutes) is rejected.
+
+    Raises:
+        BlockTooLongError: If block_ms exceeds 300000.
+    """
+    if block_ms > MAX_BLOCK_MS:
+        raise BlockTooLongError(
+            f"a blocking wait (block_ms/wait_ms) is at most {MAX_BLOCK_MS} ms "
+            f"(5 minutes), got {block_ms}"
+        )
+
+
 class OptionsBuilder:
     """Helper for building TLV-encoded options."""
 
@@ -71,6 +88,8 @@ class OptionsBuilder:
 
     def add_u32(self, tag: OptionTag, value: int) -> "OptionsBuilder":
         """Add a u32 option."""
+        if tag in (OptionTag.BLOCK_MS, OptionTag.WAIT_MS):
+            validate_block_ms(value)
         self._buffer.extend(bytes([tag, 4]))
         self._buffer.extend(struct.pack("<I", value))
         return self

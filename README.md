@@ -54,7 +54,8 @@ if value is not None:
 # Blocking get - wait up to 5 seconds for value to appear
 value = await client.kv.get("key", GetOptions(block_ms=5000))
 
-# Blocking get - wait indefinitely (0 = infinite)
+# block_ms=0 means don't wait (same as omitting it); the longest wait is
+# 300000 ms (5 minutes), and a larger value raises BlockTooLongError
 value = await client.kv.get("key", GetOptions(block_ms=0))
 
 # Get with namespace override

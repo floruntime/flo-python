@@ -387,7 +387,8 @@ class FloClient:
             worker_id: Unique worker identifier (auto-generated if not provided).
             concurrency: Maximum number of concurrent actions.
             action_timeout: Timeout for action handlers in seconds.
-            block_ms: Timeout for blocking dequeue in milliseconds.
+            block_ms: Long-poll wait per await in milliseconds, at most 300000.
+                0 means the 30000 default.
 
         Returns:
             A new ActionWorker instance ready to register actions and start.
@@ -439,7 +440,8 @@ class FloClient:
             worker_id: Unique worker identifier (auto-generated if not provided).
             concurrency: Maximum number of concurrent record handlers.
             batch_size: Number of records to fetch per poll.
-            block_ms: Timeout for blocking read in milliseconds.
+            block_ms: Long-poll wait per read in milliseconds, at most 300000.
+                0 means the 30000 default.
             message_timeout: Timeout for record handlers in seconds.
             redeliver_pending_on_reconnect: Drain this consumer's pending
                 (delivered-but-unacked) entries via group_claim after a
