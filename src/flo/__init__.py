@@ -34,6 +34,7 @@ Example:
 from .client import FloClient
 from .exceptions import (
     BadRequestError,
+    BlockTooLongError,
     ConflictError,
     ConnectionFailedError,
     FloError,
@@ -217,6 +218,7 @@ __all__ = [
     "NamespaceTooLargeError",
     "KeyTooLargeError",
     "ValueTooLargeError",
+    "BlockTooLongError",
     "ServerError",
     "NotFoundError",
     "BadRequestError",

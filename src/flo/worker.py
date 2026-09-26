@@ -33,6 +33,7 @@ from typing import Any
 from .client import FloClient
 from .exceptions import NonRetryableError, is_connection_error
 from .types import (
+    _DEFAULT_WORKER_BLOCK_MS,
     ActionType,
     StreamGroupAckOptions,
     StreamGroupNackOptions,
@@ -43,6 +44,7 @@ from .types import (
     WorkerAwaitOptions,
     WorkerTouchOptions,
 )
+from .wire import _validate_block_ms
 
 logger = logging.getLogger("flo.worker")
 
@@ -68,6 +70,13 @@ class ActionResult:
 ActionHandler = Callable[["ActionContext"], Awaitable[bytes | dict[str, Any] | ActionResult]]
 
 
+def _worker_block_ms(block_ms: int | None) -> int:
+    if not block_ms:
+        return _DEFAULT_WORKER_BLOCK_MS
+    _validate_block_ms(block_ms)
+    return block_ms
+
+
 @dataclass
 class ActionWorkerOptions:
     """Configuration for a Flo action worker.
@@ -78,7 +87,10 @@ class ActionWorkerOptions:
     worker_id: str = ""
     concurrency: int = 10
     action_timeout: float = 300.0  # 5 minutes
-    block_ms: int = 30000
+    block_ms: int = _DEFAULT_WORKER_BLOCK_MS
+
+    def __post_init__(self) -> None:
+        self.block_ms = _worker_block_ms(self.block_ms)
 
 
 @dataclass
@@ -190,7 +202,7 @@ class ActionWorker:
         worker_id: str | None = None,
         concurrency: int = 10,
         action_timeout: float = 300.0,
-        block_ms: int = 30000,
+        block_ms: int = _DEFAULT_WORKER_BLOCK_MS,
     ):
         """Initialize a Flo worker from a connected client.
 
@@ -199,7 +211,8 @@ class ActionWorker:
             worker_id: Unique worker identifier (auto-generated if not provided).
             concurrency: Maximum number of concurrent actions.
             action_timeout: Timeout for action handlers in seconds.
-            block_ms: Timeout for blocking dequeue in milliseconds.
+            block_ms: Long-poll wait per await in milliseconds, at most 300000.
+                0 means the 30000 default.
         """
         self._parent_client = parent_client
         self.config = ActionWorkerOptions(
@@ -664,7 +677,7 @@ class StreamWorkerOptions:
     worker_id: str = ""
     concurrency: int = 10
     batch_size: int = 10
-    block_ms: int = 30000
+    block_ms: int = _DEFAULT_WORKER_BLOCK_MS
     message_timeout: float = 300.0  # 5 minutes
     # Drain this consumer's pending (delivered-but-unacked) entries via
     # group_claim after a reconnect, before resuming normal group_read.
@@ -675,6 +688,9 @@ class StreamWorkerOptions:
     # claims it. 0 = drain everything this consumer already owns; > 0 also
     # steals entries abandoned by other (dead) consumers idle at least this long.
     claim_min_idle_ms: int = 0
+
+    def __post_init__(self) -> None:
+        self.block_ms = _worker_block_ms(self.block_ms)
 
 
 @dataclass
@@ -756,7 +772,7 @@ class StreamWorker:
         worker_id: str | None = None,
         concurrency: int = 10,
         batch_size: int = 10,
-        block_ms: int = 30000,
+        block_ms: int = _DEFAULT_WORKER_BLOCK_MS,
         message_timeout: float = 300.0,
         redeliver_pending_on_reconnect: bool = True,
         claim_min_idle_ms: int = 0,

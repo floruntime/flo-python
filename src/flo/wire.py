@@ -10,17 +10,20 @@ from dataclasses import dataclass
 
 from . import types as types
 from .exceptions import (
+    BlockTooLongError,
     IncompleteResponseError,
     InvalidChecksumError,
     InvalidMagicError,
     KeyTooLargeError,
     NamespaceTooLargeError,
     UnsupportedVersionError,
+    ValidationError,
     ValueTooLargeError,
 )
 from .types import (
     HEADER_SIZE,
     MAGIC,
+    MAX_BLOCK_MS,
     MAX_KEY_SIZE,
     MAX_NAMESPACE_SIZE,
     MAX_VALUE_SIZE,
@@ -58,6 +61,16 @@ RESPONSE_HEADER_FORMAT = "<IIQIBBBB8s"
 # =============================================================================
 
 
+def _validate_block_ms(block_ms: int) -> None:
+    """Refuse a block_ms the server would refuse or u32 cannot encode, before the round trip."""
+    if block_ms < 0:
+        raise ValidationError(f"block_ms must not be negative, got {block_ms}")
+    if block_ms > MAX_BLOCK_MS:
+        raise BlockTooLongError(
+            f"a blocking wait (block_ms) is at most {MAX_BLOCK_MS} ms (5 minutes), got {block_ms}"
+        )
+
+
 class OptionsBuilder:
     """Helper for building TLV-encoded options."""
 
@@ -71,6 +84,8 @@ class OptionsBuilder:
 
     def add_u32(self, tag: OptionTag, value: int) -> "OptionsBuilder":
         """Add a u32 option."""
+        if tag in (OptionTag.BLOCK_MS, OptionTag.WAIT_MS):
+            _validate_block_ms(value)
         self._buffer.extend(bytes([tag, 4]))
         self._buffer.extend(struct.pack("<I", value))
         return self
