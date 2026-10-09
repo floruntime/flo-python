@@ -290,6 +290,10 @@ class FloClient:
             raise NotConnectedError("Not connected to server")
 
         async with self._lock:
+            # A call that held the lock before this one may have dropped the
+            # connection.
+            if self._writer is None or self._reader is None:
+                raise NotConnectedError("Not connected to server")
             request_id = self._next_request_id()
 
             # Serialize request
@@ -329,7 +333,7 @@ class FloClient:
                     try:
                         response_data = await asyncio.wait_for(
                             reader.readexactly(data_len),
-                            timeout=read_timeout,
+                            timeout=self._timeout,
                         )
                     except asyncio.IncompleteReadError as e:
                         raise UnexpectedEofError(

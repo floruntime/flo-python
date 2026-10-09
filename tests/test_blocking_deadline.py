@@ -4,12 +4,16 @@ handed to the next call. Runs against an in-process fake server."""
 import asyncio
 import struct
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 
 from flo import FloClient, GetOptions
+from flo import worker as worker_mod
+from flo.exceptions import NotConnectedError
 from flo.types import HEADER_SIZE, MAGIC, VERSION, StatusCode
 from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32
+from flo.worker import ActionWorker, StreamWorker
 
 
 def _response(request_id: int, data: bytes) -> bytes:
@@ -110,11 +114,9 @@ async def test_late_reply_is_not_read_by_the_next_call(
         await client.kv.get("first")
     await asyncio.sleep(0.4)  # the late reply has been sent by now
 
-    if client.is_connected:
-        result = await client.kv.get("second")
-    else:
-        await client.reconnect()
-        result = await client.kv.get("second")
+    assert not client.is_connected
+    await client.reconnect()
+    result = await client.kv.get("second")
     assert result is not None and result.value == b"second"
     await client.close()
 
@@ -127,11 +129,60 @@ async def test_cancelled_call_does_not_leak_its_reply(
         await asyncio.wait_for(client.kv.get("first"), timeout=0.05)
     await asyncio.sleep(0.3)
 
-    if not client.is_connected:
-        await client.reconnect()
+    assert not client.is_connected
+    await client.reconnect()
     result = await client.kv.get("second")
     assert result is not None and result.value == b"second"
     await client.close()
+
+
+async def test_call_queued_behind_a_timed_out_call_is_not_connected(
+    server_factory: list[FakeServer],
+) -> None:
+    client = await _client(server_factory, [0.3, 0.0], timeout_ms=100)
+    first = asyncio.create_task(client.kv.get("first"))
+    await asyncio.sleep(0.01)  # the first call holds the connection
+    second = asyncio.create_task(client.kv.get("second"))
+    results = await asyncio.gather(first, second, return_exceptions=True)
+    assert isinstance(results[0], asyncio.TimeoutError)
+    assert isinstance(results[1], NotConnectedError)
+
+
+class _RecordedError(Exception):
+    pass
+
+
+@pytest.mark.parametrize("kind", ["action", "stream"])
+async def test_worker_connections_use_the_client_timeout(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The client adds block_ms to a poll's deadline itself, so a worker that
+    # also added it would wait twice as long on a dead server.
+    timeouts: list[int] = []
+
+    class RecordingClient(FloClient):
+        def __init__(self, endpoint: str, *, timeout_ms: int = 5000, **kw: Any) -> None:
+            timeouts.append(timeout_ms)
+            super().__init__(endpoint, timeout_ms=timeout_ms, **kw)
+
+        async def connect(self) -> "FloClient":
+            raise _RecordedError
+
+    monkeypatch.setattr(worker_mod, "FloClient", RecordingClient)
+    parent = FloClient("127.0.0.1:1", timeout_ms=1234)
+    worker: ActionWorker | StreamWorker
+    if kind == "action":
+        worker = parent.new_action_worker(block_ms=30000)
+        worker.register_action("a", _noop)
+    else:
+        worker = parent.new_stream_worker(stream="s", group="g", handler=_noop, block_ms=30000)
+    with pytest.raises(_RecordedError):
+        await worker.start()
+    assert timeouts == [1234]
+
+
+async def _noop(ctx: Any) -> Any:
+    return b""
 
 
 @pytest.mark.parametrize(
