@@ -794,6 +794,10 @@ class StreamWorker:
 
         self._client: FloClient | None = None
         self._ack_client: FloClient | None = None
+        # Concurrent acks that fail on the same dead connection reconnect it
+        # once: the generation tells a waiter someone already did.
+        self._ack_reconnect_lock = asyncio.Lock()
+        self._ack_generation = 0
         self._running = False
         self._stop_event = asyncio.Event()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -986,6 +990,12 @@ class StreamWorker:
         """
         assert self._client is not None
         await self._client.reconnect()
+        # The ack connection went down with the poll connection (e.g. a server
+        # restart) but may not notice until an ack fails on it.
+        try:
+            await self._reconnect_ack_client()
+        except Exception as e:
+            logger.warning(f"Failed to reconnect ack client: {e}")
         await self._client.stream.group_join(
             self.config.stream,
             self.config.group,
@@ -1041,11 +1051,27 @@ class StreamWorker:
                 return
             cursor = result.next_cursor
 
-    async def _on_ack_connection(self, send: Callable[[FloClient], Awaitable[object]]) -> None:
+    async def _reconnect_ack_client(self, failed_generation: int | None = None) -> None:
+        """Reconnect the ack connection, unless it was reconnected since
+        `failed_generation` was observed."""
+        assert self._ack_client is not None
+        async with self._ack_reconnect_lock:
+            if failed_generation is not None and failed_generation != self._ack_generation:
+                return
+            await self._ack_client.reconnect()
+            self._ack_generation += 1
+
+    async def _on_ack_connection(
+        self,
+        op: str,
+        record_id: StreamID,
+        send: Callable[[FloClient], Awaitable[object]],
+    ) -> None:
         """Send an ack or nack, reconnecting the ack connection on a connection error."""
         assert self._ack_client is not None
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
+            generation = self._ack_generation
             try:
                 await send(self._ack_client)
                 return
@@ -1055,7 +1081,10 @@ class StreamWorker:
                 logger.warning(
                     f"Ack connection lost (attempt {attempt}/{max_attempts}), reconnecting..."
                 )
-                await self._ack_client.reconnect()
+                await self._reconnect_ack_client(generation)
+        message = f"Failed to {op} record {record_id} after {max_attempts} attempts"
+        logger.warning(message)
+        raise RuntimeError(message)
 
     async def _process_record(self, record: StreamRecord) -> None:
         """Process a single record: call handler, then ack or nack."""
@@ -1078,12 +1107,14 @@ class StreamWorker:
 
                 # Success — ack with retry
                 await self._on_ack_connection(
+                    "ack",
+                    record.id,
                     lambda c: c.stream.group_ack(
                         self.config.stream,
                         self.config.group,
                         [record.id],
                         StreamGroupAckOptions(consumer=self.config.consumer),
-                    )
+                    ),
                 )
 
             except Exception as e:
@@ -1092,12 +1123,14 @@ class StreamWorker:
                 )
                 try:
                     await self._on_ack_connection(
+                        "nack",
+                        record.id,
                         lambda c: c.stream.group_nack(
                             self.config.stream,
                             self.config.group,
                             [record.id],
                             StreamGroupNackOptions(consumer=self.config.consumer),
-                        )
+                        ),
                     )
                 except Exception as nack_err:
                     logger.error(f"Failed to nack record: {nack_err}")

@@ -187,13 +187,16 @@ class FloClient:
             timeout: Maximum total time to keep retrying (default 5 min).
         """
         async with self._lock:
-            # Close existing connection
-            if self._writer:
-                self._writer.close()
-                with contextlib.suppress(Exception):
-                    await self._writer.wait_closed()
+            # Close existing connection. It is detached before the await so a
+            # concurrent reconnect that installs its connection meanwhile
+            # keeps it.
+            old = self._writer
+            if old:
                 self._writer = None
                 self._reader = None
+                old.close()
+                with contextlib.suppress(Exception):
+                    await old.wait_closed()
 
         backoff = 1.0
         max_backoff = 30.0
@@ -203,10 +206,16 @@ class FloClient:
         while True:
             attempt += 1
             try:
-                self._reader, self._writer = await asyncio.wait_for(
+                reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(self._host, self._port),
                     timeout=self._timeout,
                 )
+                # A concurrent reconnect may have installed its connection
+                # first; close it rather than leak it.
+                replaced = self._writer
+                self._reader, self._writer = reader, writer
+                if replaced is not None:
+                    replaced.close()
                 if self._debug:
                     logger.debug(f"[flo] Reconnected to {self._endpoint} (attempt {attempt})")
                 return
