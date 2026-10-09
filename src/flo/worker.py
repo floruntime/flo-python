@@ -843,7 +843,11 @@ class StreamWorker:
             debug=self._parent_client._debug,
             timeout_ms=worker_timeout_ms,
         )
-        await self._ack_client.connect()
+        try:
+            await self._ack_client.connect()
+        except BaseException:
+            await self._client.close()
+            raise
 
         try:
             # Semaphore and running state must be set up before the join: a
