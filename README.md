@@ -135,8 +135,8 @@ seq = await client.queue.enqueue("tasks", payload, EnqueueOptions(priority=10))
 ### Dequeue
 
 Queues are currently at-most-once: a dequeue acknowledges each message as it
-hands it out. A message is never redelivered, even if your process crashes
-while handling it, so handle failures in your own code.
+hands it out. A message is not redelivered in normal operation, even if the
+consumer crashes while handling it, so handle failures in your own code.
 
 ```python
 from flo import DequeueOptions

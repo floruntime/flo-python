@@ -80,7 +80,8 @@ class QueueOperations:
         """Dequeue messages from a queue.
 
         Queues are currently at-most-once: the server acknowledges each
-        message as it hands it out, so it is never redelivered.
+        message as it hands it out, so it is not redelivered in normal
+        operation, even if the consumer crashes.
 
         Args:
             queue: Queue name.
