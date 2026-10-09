@@ -15,13 +15,15 @@ from .exceptions import (
     UnexpectedEofError,
     raise_for_status,
 )
-from .types import _DEFAULT_WORKER_BLOCK_MS, HEADER_SIZE, OpCode, StatusCode
-from .wire import RawResponse, parse_response_header, serialize_request
+from .types import _DEFAULT_WORKER_BLOCK_MS, HEADER_SIZE, OpCode, OptionTag, StatusCode
+from .wire import OptionsIterator, RawResponse, parse_response_header, serialize_request
 
 if TYPE_CHECKING:
     from .worker import ActionWorker, StreamRecordHandler, StreamWorker
 
 logger = logging.getLogger("flo")
+
+_SERVER_AWAIT_DEFAULT_MS = 30_000
 
 
 class FloClient:
@@ -46,7 +48,10 @@ class FloClient:
         Args:
             endpoint: Server endpoint in "host:port" format.
             namespace: Default namespace for operations.
-            timeout_ms: Connection and operation timeout in milliseconds.
+            timeout_ms: Connection and operation timeout in milliseconds. A
+                blocking call (block_ms or wait_ms) is allowed this long on
+                top of its wait. A call that times out drops the connection;
+                call reconnect() before reusing the client.
             debug: Enable debug logging.
         """
         self._endpoint = endpoint
@@ -244,6 +249,19 @@ class FloClient:
         self._request_id += 1
         return self._request_id
 
+    @staticmethod
+    def _server_wait_ms(op_code: OpCode, options: bytes) -> int:
+        """How long the server may hold this request before answering."""
+        waits = {
+            opt.tag: opt.as_u32() or 0
+            for opt in OptionsIterator(options)
+            if opt.tag in (OptionTag.BLOCK_MS, OptionTag.WAIT_MS)
+        }
+        if op_code == OpCode.ACTION_AWAIT:
+            # An await that names no block_ms waits the server's default.
+            waits.setdefault(OptionTag.BLOCK_MS, _SERVER_AWAIT_DEFAULT_MS)
+        return max(waits.values(), default=0)
+
     async def _send_request(
         self,
         op_code: OpCode,
@@ -287,33 +305,47 @@ class FloClient:
             if self._debug:
                 logger.debug(f"[flo] -> {op_code.name} ns={namespace} key={key!r}")
 
-            # Send request
-            self._writer.write(request)
-            await self._writer.drain()
-
-            # Read response header
+            # A blocking request is answered only after the server's wait, so
+            # it gets the operation timeout on top of that wait.
+            read_timeout = self._timeout + self._server_wait_ms(op_code, options) / 1000.0
+            writer, reader = self._writer, self._reader
             try:
-                header_data = await asyncio.wait_for(
-                    self._reader.readexactly(HEADER_SIZE),
-                    timeout=self._timeout,
-                )
-            except asyncio.IncompleteReadError as e:
-                raise UnexpectedEofError("Connection closed while reading response header") from e
+                writer.write(request)
+                await writer.drain()
 
-            # Parse header to get data length
-            status, data_len, resp_request_id, crc = parse_response_header(header_data)
-
-            # Read response data
-            if data_len > 0:
                 try:
-                    response_data = await asyncio.wait_for(
-                        self._reader.readexactly(data_len),
-                        timeout=self._timeout,
+                    header_data = await asyncio.wait_for(
+                        reader.readexactly(HEADER_SIZE),
+                        timeout=read_timeout,
                     )
                 except asyncio.IncompleteReadError as e:
-                    raise UnexpectedEofError("Connection closed while reading response data") from e
-            else:
-                response_data = b""
+                    raise UnexpectedEofError(
+                        "Connection closed while reading response header"
+                    ) from e
+
+                status, data_len, resp_request_id, crc = parse_response_header(header_data)
+
+                if data_len > 0:
+                    try:
+                        response_data = await asyncio.wait_for(
+                            reader.readexactly(data_len),
+                            timeout=read_timeout,
+                        )
+                    except asyncio.IncompleteReadError as e:
+                        raise UnexpectedEofError(
+                            "Connection closed while reading response data"
+                        ) from e
+                else:
+                    response_data = b""
+            except BaseException:
+                # The reply to an abandoned request (timed out, cancelled, cut
+                # off mid-frame) may still arrive and would be read as the
+                # answer to the next one, so the connection is dropped; the
+                # caller reconnects.
+                writer.close()
+                self._writer = None
+                self._reader = None
+                raise
 
             if self._debug:
                 logger.debug(f"[flo] <- {status.name} {len(response_data)} bytes")
