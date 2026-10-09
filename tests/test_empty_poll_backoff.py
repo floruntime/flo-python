@@ -1,6 +1,5 @@
-"""Workers pace polls that come back empty early. The server answers a blocking
-poll empty at once when it has no room to park it, and wakes every parked
-group read empty on an append. Runs against an in-process fake server."""
+"""Workers pace polls that come back empty early. Runs against an in-process
+fake server."""
 
 import asyncio
 import struct
@@ -48,6 +47,17 @@ def _one_record() -> bytes:
     )
 
 
+def _one_task() -> bytes:
+    return (
+        struct.pack("<H", 2)
+        + b"t1"  # task id
+        + struct.pack("<H", 1)
+        + b"a"  # task type
+        + struct.pack("<qI", 0, 1)  # created_at, attempt
+        + bytes([0])  # no caller
+    )
+
+
 class FakeServer:
     """Answers polls from `script`, then at once and empty (a full waiter
     pool); every other request OK and empty at once."""
@@ -75,7 +85,8 @@ class FakeServer:
                 self.polls += 1
                 self.poll_times.append(loop.time())
                 delay, record = self.script.pop(0) if self.script else (0.0, False)
-                data = _one_record() if record else b""
+                body = _one_task() if op_code == OpCode.ACTION_AWAIT else _one_record()
+                data = body if record else b""
 
                 def answer(rid: int = request_id, body: bytes = data) -> None:
                     self.answer_times.append(loop.time())
@@ -199,6 +210,30 @@ async def test_losers_of_a_reread_are_not_paused() -> None:
         for answered, nxt in zip(r.fake.answer_times[:4], r.fake.poll_times[1:5], strict=True)
     ]
     assert max(gaps) < 0.03
+
+
+async def test_action_worker_resets_the_pause_after_work() -> None:
+    # Four early empties build a streak, a task arrives, then an early empty:
+    # it is the first in a new streak, so the next poll goes out at once.
+    script: list[Answer] = [(0.0, False)] * 4 + [(0.0, True), (0.0, False), (5.0, False)]
+    r = await _start(_action_worker, script)
+    await asyncio.sleep(0.8)
+    await r.stop()
+    assert r.fake.polls >= 7
+    assert r.fake.poll_times[6] - r.fake.answer_times[5] < 0.03
+
+
+async def test_long_streak_pauses_the_cap() -> None:
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    backoff = _EmptyPollBackoff(block_ms=5000, stop=stop)
+    stop.set()  # pauses end at once while the streak builds
+    for _ in range(1100):
+        await backoff.empty(0.0)
+    stop.clear()
+    started = loop.time()
+    await backoff.empty(0.0)
+    assert 0.95 <= loop.time() - started < 1.1
 
 
 async def test_backoff_schedule() -> None:

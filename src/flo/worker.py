@@ -73,15 +73,12 @@ ActionHandler = Callable[["ActionContext"], Awaitable[bytes | dict[str, Any] | A
 class _EmptyPollBackoff:
     """Paces a poll loop whose blocking reads come back empty early.
 
-    Two server answers look the same on the wire: an empty answer at once
-    when the server has no room to park the read (re-polling straight away
-    would spin), and the empty answer every parked group read gets when a
-    record is appended, so the consumer re-reads (some other consumer may win
-    that re-read). They are told apart by timing: a full server answers within
-    a round trip, while appends wake a read whenever data arrives. So only an
-    empty answer under min(250 ms, block_ms / 2) counts as early, the first
-    early one in a row is re-polled at once, and the pause starts from the
-    second.
+    A blocking read can come back empty early for two reasons that look the
+    same on the wire. The server may have no room to park it (re-polling at
+    once would spin), or an append woke it so the consumer re-reads. A full
+    server answers within a round trip, so only answers under
+    min(250 ms, block_ms/2) count as early. Even then, one may be an append
+    wake, so the first in a row is re-polled at once.
     """
 
     _EARLY_S = 0.25
@@ -102,7 +99,9 @@ class _EmptyPollBackoff:
             return
         self._streak += 1
         if self._streak > 1:
-            pause = min(self._FIRST_S * 2 ** (self._streak - 2), self._MAX_S)
+            # The exponent is capped: the float power overflows on a long
+            # streak, and the pause reaches _MAX_S long before the cap.
+            pause = min(self._FIRST_S * 2 ** min(self._streak - 2, 16), self._MAX_S)
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=pause)
 
