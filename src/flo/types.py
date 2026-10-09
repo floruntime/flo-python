@@ -221,7 +221,7 @@ class OptionTag(IntEnum):
     TXN_ID = 0x09  # u64: Transaction ID for per-shard transactions
 
     # Queue Options (0x10 - 0x1F)
-    PRIORITY = 0x10  # u8: Message priority (0-255, higher = more urgent)
+    PRIORITY = 0x10  # u8: Message priority (0-255, lower is taken first)
     COUNT = 0x15  # u32: Number of messages to dequeue
     BLOCK_MS = 0x17  # u32: Block timeout - wait for data (0=don't wait, max 300000)
     WAIT_MS = 0x18  # u32: Watch timeout - wait for NEXT version change (0=don't wait, max 300000)
@@ -575,7 +575,7 @@ class EnqueueOptions:
     """Options for queue enqueue operations."""
 
     namespace: str | None = None
-    priority: int = 0
+    priority: int = 0  # 0-255, lower is taken first
 
 
 @dataclass

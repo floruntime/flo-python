@@ -32,7 +32,7 @@ asyncio.run(main())
 ## Features
 
 - **KV Store**: Versioned key-value storage with MVCC, TTL, and optimistic locking
-- **Queues**: Priority-based task queues with leases and dead letter queues
+- **Queues**: Priority task queues (currently at-most-once: dequeue hands each message out once)
 - **Streams**: Append-only logs with consumer groups for distributed processing
 - **Actions**: Registered tasks with configurable timeouts, retries, and idempotency
 - **Workers**: Distributed task execution with lease management and heartbeats
@@ -128,11 +128,15 @@ from flo import EnqueueOptions
 # Simple enqueue
 seq = await client.queue.enqueue("tasks", b'{"task": "process"}')
 
-# With priority (higher = more urgent, 0-255)
+# With priority (0-255, lower is taken first; default 0)
 seq = await client.queue.enqueue("tasks", payload, EnqueueOptions(priority=10))
 ```
 
 ### Dequeue
+
+Queues are currently at-most-once: a dequeue acknowledges each message as it
+hands it out. A message is never redelivered, even if your process crashes
+while handling it, so handle failures in your own code.
 
 ```python
 from flo import DequeueOptions
@@ -146,39 +150,17 @@ for msg in result.messages:
 result = await client.queue.dequeue("tasks", 10, DequeueOptions(block_ms=30000))
 ```
 
-### Ack/Nack
+### Ack/Nack and the Dead Letter Queue
 
-```python
-result = await client.queue.dequeue("tasks", 10)
-for msg in result.messages:
-    try:
-        process(msg.payload)
-        # Acknowledge successful processing
-        await client.queue.ack("tasks", [msg.seq])
-    except Exception:
-        # Retry the message
-        await client.queue.nack("tasks", [msg.seq])
-```
-
-### Dead Letter Queue
-
-```python
-from flo import DlqListOptions
-
-# List DLQ messages
-result = await client.queue.dlq_list("tasks", DlqListOptions(limit=100))
-for msg in result.messages:
-    print(f"Failed message {msg.seq}: {msg.payload}")
-
-# Requeue DLQ messages
-seqs = [msg.seq for msg in result.messages]
-await client.queue.dlq_requeue("tasks", seqs)
-```
+`queue.ack`, `queue.nack`, `queue.dlq_list` and `queue.dlq_requeue` exist, but
+while queues are at-most-once they do nothing useful: a dequeued message is
+already acknowledged, so ack and nack have no effect on it, nack does not
+retry it, and messages don't reach the DLQ in normal use.
 
 ### Peek
 
 ```python
-# Peek at messages without creating leases (no visibility timeout)
+# Peek at messages without removing them
 result = await client.queue.peek("tasks", 5)
 for msg in result.messages:
     print(f"Message {msg.seq}: {msg.payload}")

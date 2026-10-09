@@ -49,7 +49,7 @@ class QueueOperations:
             # Simple enqueue
             seq = await client.queue.enqueue("tasks", b'{"task": "process"}')
 
-            # With priority (higher = more urgent)
+            # With priority (0-255, lower is taken first; default 0)
             seq = await client.queue.enqueue("tasks", payload, EnqueueOptions(priority=10))
         """
         opts = options or EnqueueOptions()
@@ -79,6 +79,9 @@ class QueueOperations:
     ) -> DequeueResult:
         """Dequeue messages from a queue.
 
+        Queues are currently at-most-once: the server acknowledges each
+        message as it hands it out, so it is never redelivered.
+
         Args:
             queue: Queue name.
             count: Maximum number of messages to dequeue.
@@ -92,7 +95,6 @@ class QueueOperations:
             result = await client.queue.dequeue("tasks", 10)
             for msg in result.messages:
                 process(msg.payload)
-                await client.queue.ack("tasks", [msg.seq])
 
             # With long polling (wait up to 30s for messages)
             result = await client.queue.dequeue(
@@ -126,21 +128,15 @@ class QueueOperations:
         seqs: list[int],
         options: AckOptions | None = None,
     ) -> None:
-        """Acknowledge messages as successfully processed.
+        """Acknowledge messages.
+
+        Queues are currently at-most-once: dequeue already acknowledges each
+        message it hands out, so this has no effect on a dequeued message.
 
         Args:
             queue: Queue name.
             seqs: Sequence numbers of messages to acknowledge.
             options: Optional ack options.
-
-        Example:
-            result = await client.queue.dequeue("tasks", 10)
-            for msg in result.messages:
-                try:
-                    process(msg.payload)
-                    await client.queue.ack("tasks", [msg.seq])
-                except Exception:
-                    await client.queue.nack("tasks", [msg.seq])
         """
         if not seqs:
             return
@@ -163,15 +159,16 @@ class QueueOperations:
         seqs: list[int],
         options: NackOptions | None = None,
     ) -> None:
-        """Negative acknowledge messages so they are retried.
+        """Negatively acknowledge messages.
+
+        Queues are currently at-most-once: dequeue already acknowledges each
+        message it hands out, so this has no effect on a dequeued message and
+        does not retry it.
 
         Args:
             queue: Queue name.
             seqs: Sequence numbers of messages to nack.
             options: Optional nack options.
-
-        Example:
-            await client.queue.nack("tasks", [msg.seq])
         """
         if not seqs:
             return
@@ -194,6 +191,9 @@ class QueueOperations:
         options: DlqListOptions | None = None,
     ) -> DequeueResult:
         """List messages in the Dead Letter Queue.
+
+        Queues are currently at-most-once, so messages don't reach the DLQ in
+        normal use.
 
         Args:
             queue: Queue name.
@@ -231,6 +231,9 @@ class QueueOperations:
         options: DlqRequeueOptions | None = None,
     ) -> None:
         """Move messages from DLQ back to the main queue.
+
+        Queues are currently at-most-once, so messages don't reach the DLQ in
+        normal use.
 
         Args:
             queue: Queue name.

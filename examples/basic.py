@@ -4,7 +4,7 @@
 This example demonstrates:
 - Connecting to a Flo server
 - KV operations (get, put, delete, scan)
-- Queue operations (enqueue, dequeue, ack)
+- Queue operations (enqueue, dequeue)
 """
 
 import asyncio
@@ -81,7 +81,7 @@ async def queue_example(client: FloClient) -> None:
     seq2 = await client.queue.enqueue(
         queue_name,
         b'{"task": "task2"}',
-        EnqueueOptions(priority=10),  # Higher priority
+        EnqueueOptions(priority=10),  # Lower is taken first; default 0
     )
     print(f"  Enqueued task2 (priority=10) with seq={seq2}")
 
@@ -99,13 +99,7 @@ async def queue_example(client: FloClient) -> None:
     print(f"  Received {len(result.messages)} messages")
     for msg in result.messages:
         print(f"    seq={msg.seq}: {msg.payload.decode()}")
-
-    # Acknowledge messages
-    if result.messages:
-        seqs = [msg.seq for msg in result.messages]
-        print(f"\nAcknowledging messages: {seqs}")
-        await client.queue.ack(queue_name, seqs)
-        print("  Messages acknowledged")
+    # No ack needed: queues are at-most-once, so dequeue already acknowledged them.
 
 
 async def main() -> None:
