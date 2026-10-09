@@ -49,8 +49,10 @@ class FakeStreamServer:
         self.hold = hold
         self.delivered = False
         self.acked = asyncio.Event()
+        self.writers: set[asyncio.StreamWriter] = set()
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.writers.add(writer)
         loop = asyncio.get_running_loop()
         try:
             while True:
@@ -91,4 +93,8 @@ async def test_ack_is_not_queued_behind_the_long_poll() -> None:
         worker.stop()
         await asyncio.wait_for(run, timeout=10)
         server.close()
+        # Python 3.12+ wait_closed() also waits for open connections, and the
+        # client may still hold one.
+        for writer in fake.writers:
+            writer.close()
         await server.wait_closed()
