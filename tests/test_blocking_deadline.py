@@ -42,6 +42,7 @@ class FakeServer:
         self.served = 0
         self.port = 0
         self._server: asyncio.Server | None = None
+        self._writers: set[asyncio.StreamWriter] = set()
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
@@ -50,9 +51,14 @@ class FakeServer:
     async def stop(self) -> None:
         assert self._server is not None
         self._server.close()
+        # Python 3.12+ wait_closed() also waits for open connections, and the
+        # client may still hold one.
+        for writer in self._writers:
+            writer.close()
         await self._server.wait_closed()
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self._writers.add(writer)
         try:
             while True:
                 header = await reader.readexactly(HEADER_SIZE)
