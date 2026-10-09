@@ -63,6 +63,8 @@ RESPONSE_HEADER_FORMAT = "<IIQIBBBB8s"
 
 def _validate_block_ms(block_ms: int) -> None:
     """Refuse a block_ms the server would refuse or u32 cannot encode, before the round trip."""
+    if not isinstance(block_ms, int) or isinstance(block_ms, bool):
+        raise ValidationError(f"block_ms must be an int, got {block_ms!r}")
     if block_ms < 0:
         raise ValidationError(f"block_ms must not be negative, got {block_ms}")
     if block_ms > MAX_BLOCK_MS:

@@ -986,7 +986,7 @@ class WorkerAwaitOptions:
     """Options for awaiting a task."""
 
     namespace: str | None = None
-    block_ms: int | None = None  # Block waiting for task (0 = don't wait, max 300000)
+    block_ms: int | None = None  # Block waiting for task (None = 30000, 0 = don't wait, max 300000)
     timeout_ms: int | None = None
 
 

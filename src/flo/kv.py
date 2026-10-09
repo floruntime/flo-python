@@ -59,8 +59,8 @@ class KVOperations:
             if result is not None:
                 print(f"Found {result.value!r} at version {result.version}")
 
-            # Blocking get — wait up to 5 seconds
-            result = await client.kv.get("key", GetOptions(block_ms=5000))
+            # Blocking get — wait up to 2 seconds
+            result = await client.kv.get("key", GetOptions(block_ms=2000))
         """
         opts = options or GetOptions()
         namespace = self._client.get_namespace(opts.namespace)
