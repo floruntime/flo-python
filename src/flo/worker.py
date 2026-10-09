@@ -71,19 +71,26 @@ ActionHandler = Callable[["ActionContext"], Awaitable[bytes | dict[str, Any] | A
 
 
 class _EmptyPollBackoff:
-    """Paces a poll loop whose blocking reads come back empty long before block_ms.
+    """Paces a poll loop whose blocking reads come back empty early.
 
-    The server answers a blocking read empty at once when it has no room to
-    park it, and re-polling straight away would spin against it. A single
-    early empty answer is a normal wake-up (a group read is woken by an append
-    another consumer may win), so the pause starts from the second in a row.
+    Two server answers look the same on the wire: an empty answer at once
+    when the server has no room to park the read (re-polling straight away
+    would spin), and the empty answer every parked group read gets when a
+    record is appended, so the consumer re-reads (some other consumer may win
+    that re-read). They are told apart by timing: a full server answers within
+    a round trip, while appends wake a read whenever data arrives. So only an
+    empty answer under min(250 ms, block_ms / 2) counts as early, the first
+    early one in a row is re-polled at once, and the pause starts from the
+    second.
     """
 
+    _EARLY_S = 0.25
     _FIRST_S = 0.05
     _MAX_S = 1.0
 
-    def __init__(self, block_ms: int) -> None:
-        self._early_s = block_ms / 2000.0
+    def __init__(self, block_ms: int, stop: asyncio.Event) -> None:
+        self._early_s = min(self._EARLY_S, block_ms / 2000.0)
+        self._stop = stop
         self._streak = 0
 
     def reset(self) -> None:
@@ -95,7 +102,9 @@ class _EmptyPollBackoff:
             return
         self._streak += 1
         if self._streak > 1:
-            await asyncio.sleep(min(self._FIRST_S * 2 ** (self._streak - 2), self._MAX_S))
+            pause = min(self._FIRST_S * 2 ** (self._streak - 2), self._MAX_S)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), timeout=pause)
 
 
 def _worker_block_ms(block_ms: int | None) -> int:
@@ -423,7 +432,7 @@ class ActionWorker:
         assert self._client is not None
         assert self._semaphore is not None
         loop = asyncio.get_running_loop()
-        backoff = _EmptyPollBackoff(self.config.block_ms)
+        backoff = _EmptyPollBackoff(self.config.block_ms, self._stop_event)
         while self._running and not self._stop_event.is_set():
             try:
                 # Wait for semaphore slot
@@ -911,7 +920,7 @@ class StreamWorker:
         assert self._client is not None
         assert self._semaphore is not None
         loop = asyncio.get_running_loop()
-        backoff = _EmptyPollBackoff(self.config.block_ms)
+        backoff = _EmptyPollBackoff(self.config.block_ms, self._stop_event)
 
         while self._running and not self._stop_event.is_set():
             try:
