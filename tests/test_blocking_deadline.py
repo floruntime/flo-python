@@ -11,18 +11,19 @@ import pytest
 from flo import FloClient, GetOptions, RequestTimeoutError
 from flo import worker as worker_mod
 from flo.exceptions import (
+    BadRequestError,
     FloError,
     InvalidChecksumError,
     NotConnectedError,
     ProtocolError,
     is_connection_error,
 )
-from flo.types import HEADER_SIZE, MAGIC, VERSION, StatusCode
+from flo.types import HEADER_SIZE, MAGIC, VERSION, OpCode, StatusCode
 from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32
 from flo.worker import ActionWorker, StreamWorker
 
 
-def _response(request_id: int, data: bytes) -> bytes:
+def _response(request_id: int, data: bytes, status: StatusCode = StatusCode.OK) -> bytes:
     def header(crc: int) -> bytes:
         return struct.pack(
             RESPONSE_HEADER_FORMAT,
@@ -31,7 +32,7 @@ def _response(request_id: int, data: bytes) -> bytes:
             request_id,
             crc,
             VERSION,
-            StatusCode.OK,
+            status,
             0,
             0,
             b"\x00" * 8,
@@ -287,3 +288,85 @@ def test_action_await_wait(block_ms: int | None, expected: int) -> None:
         builder.add_u32(OptionTag.BLOCK_MS, block_ms)
     assert FloClient._server_wait_ms(OpCode.ACTION_AWAIT, builder.build()) == expected
     assert FloClient._server_wait_ms(OpCode.KV_GET, builder.build()) == (block_ms or 0)
+
+
+async def test_server_error_for_an_unparsable_request_surfaces() -> None:
+    # The server answers a request it cannot parse with request id 0, its
+    # error, and a close.
+    client, server = await _bad_frame_client(
+        lambda rid: _response(0, b"Invalid request", StatusCode.BAD_REQUEST)
+    )
+    with pytest.raises(BadRequestError, match="Invalid request"):
+        await client.kv.get("k")
+    assert not client.is_connected
+    server.close()
+
+
+async def test_action_worker_paces_reconnects_to_a_server_that_drops_them() -> None:
+    accepts = 0
+
+    async def accept_and_close(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal accepts
+        accepts += 1
+        writer.close()
+
+    server = await asyncio.start_server(accept_and_close, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    endpoint = f"127.0.0.1:{port}"
+    worker = FloClient(endpoint, timeout_ms=1000).new_action_worker(block_ms=1000)
+    worker.register_action("a", _noop)
+    # Drive the poll loop directly: start() would fail to register.
+    worker._client = await FloClient(endpoint, timeout_ms=1000).connect()
+    worker._semaphore = asyncio.Semaphore(1)
+    worker._running = True
+    loop = asyncio.get_running_loop()
+    run = asyncio.create_task(worker._poll_loop(["a"]))
+    await asyncio.sleep(1.5)
+    # The first reconnect is at once, the next after 1 s, then 2 s.
+    assert accepts <= 4
+    started = loop.time()
+    worker.stop()
+    await asyncio.wait_for(run, timeout=1)
+    assert loop.time() - started < 0.1  # stop ends the pause
+    server.close()
+    await server.wait_closed()
+
+
+async def test_action_worker_reconnects_at_once_after_a_poll_got_through() -> None:
+    # Each connection answers one poll and is then dropped: every drop is the
+    # first in a row, so none is paced.
+    accepts = 0
+
+    async def one_poll(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal accepts
+        accepts += 1
+        try:
+            while True:
+                header = await reader.readexactly(HEADER_SIZE)
+                _, payload_len, request_id, _, op_code, *_ = struct.unpack(
+                    REQUEST_HEADER_FORMAT, header
+                )
+                await reader.readexactly(payload_len)
+                writer.write(_response(request_id, b""))
+                if op_code == OpCode.ACTION_AWAIT:
+                    await writer.drain()
+                    break
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        writer.close()
+
+    server = await asyncio.start_server(one_poll, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    endpoint = f"127.0.0.1:{port}"
+    worker = FloClient(endpoint, timeout_ms=1000).new_action_worker(block_ms=1000)
+    worker.register_action("a", _noop)
+    worker._client = await FloClient(endpoint, timeout_ms=1000).connect()
+    worker._semaphore = asyncio.Semaphore(1)
+    worker._running = True
+    run = asyncio.create_task(worker._poll_loop(["a"]))
+    await asyncio.sleep(1.5)
+    worker.stop()
+    await asyncio.wait_for(run, timeout=1)
+    assert accepts >= 10
+    server.close()
+    await server.wait_closed()

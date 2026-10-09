@@ -362,6 +362,10 @@ class FloClient:
                     raise InvalidChecksumError(
                         f"CRC32 mismatch: 0x{computed_crc:08X} != 0x{crc:08X}"
                     )
+                if resp_request_id == 0:
+                    # The server answers a request it could not parse with
+                    # id 0 and then closes; surface its error.
+                    raise_for_status(status, response_data)
                 if resp_request_id != request_id:
                     raise ProtocolError(
                         f"Response is for request {resp_request_id}, expected {request_id}"
