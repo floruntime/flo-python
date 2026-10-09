@@ -293,7 +293,7 @@ class OptionTag(IntEnum):
     """
 
     # KV Options (0x01 - 0x0F)
-    TTL_SECONDS = 0x01  # u64: Time-to-live in seconds (0 = no expiration)
+    TTL_MS = 0x01  # u64: Time-to-live in milliseconds (0 = no expiration)
     CAS_VERSION = 0x02  # u64: Expected version for compare-and-swap
     IF_NOT_EXISTS = 0x03  # void: Only set if key doesn't exist (NX)
     IF_EXISTS = 0x04  # void: Only set if key exists (XX)
@@ -616,7 +616,7 @@ class PutOptions:
     """Options for KV put operations."""
 
     namespace: str | None = None
-    ttl_seconds: int | None = None
+    ttl_ms: int | None = None  # Time-to-live in milliseconds (0 = no expiration)
     cas_version: int | None = None
     if_not_exists: bool = False
     if_exists: bool = False

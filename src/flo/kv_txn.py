@@ -104,8 +104,8 @@ class Transaction:
         opts = options or PutOptions()
         key_bytes = key.encode("utf-8") if isinstance(key, str) else key
         builder = self._txn_options()
-        if opts.ttl_seconds is not None:
-            builder.add_u64(OptionTag.TTL_SECONDS, opts.ttl_seconds)
+        if opts.ttl_ms is not None:
+            builder.add_u64(OptionTag.TTL_MS, opts.ttl_ms)
         if opts.cas_version is not None:
             builder.add_u64(OptionTag.CAS_VERSION, opts.cas_version)
         if opts.if_not_exists:
@@ -178,8 +178,11 @@ class Transaction:
             return 0
         return int(struct.unpack("<q", response.data[:8])[0])
 
-    async def touch(self, key: str | bytes, ttl_seconds: int) -> None:
-        """Update the TTL on an existing key inside the transaction."""
+    async def touch(self, key: str | bytes, ttl_ms: int) -> None:
+        """Set the TTL on an existing key inside the transaction, in milliseconds.
+
+        ``ttl_ms=0`` clears the TTL.
+        """
         self._check_alive()
         key_bytes = key.encode("utf-8") if isinstance(key, str) else key
         builder = self._txn_options()
@@ -187,7 +190,7 @@ class Transaction:
             OpCode.KV_TOUCH,
             self._namespace,
             key_bytes,
-            struct.pack("<Q", ttl_seconds),
+            struct.pack("<Q", ttl_ms),
             builder.build(),
         )
 
