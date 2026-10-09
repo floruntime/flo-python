@@ -98,3 +98,62 @@ async def test_ack_is_not_queued_behind_the_long_poll() -> None:
         for writer in fake.writers:
             writer.close()
         await server.wait_closed()
+
+
+class NackDropServer:
+    """Hands out a record every 50 ms and closes the connection that sent
+    the first nack."""
+
+    def __init__(self) -> None:
+        self.nacks = 0
+        self.dropped = False
+        self.writers: set[asyncio.StreamWriter] = set()
+
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.writers.add(writer)
+        try:
+            while True:
+                header = await reader.readexactly(HEADER_SIZE)
+                _, payload_len, request_id, _, op_code, *_ = struct.unpack(
+                    REQUEST_HEADER_FORMAT, header
+                )
+                await reader.readexactly(payload_len)
+                if op_code == OpCode.STREAM_GROUP_READ:
+                    await asyncio.sleep(0.05)
+                    writer.write(_response(request_id, _one_record()))
+                    continue
+                if op_code == OpCode.STREAM_GROUP_NACK:
+                    self.nacks += 1
+                    if not self.dropped:
+                        self.dropped = True
+                        writer.write(_response(request_id, b""))
+                        await writer.drain()
+                        writer.close()
+                        return
+                writer.write(_response(request_id, b""))
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+
+
+async def test_nacks_reconnect_a_dropped_ack_connection() -> None:
+    fake = NackDropServer()
+    server = await asyncio.start_server(fake.handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    async def failing(ctx: StreamContext) -> None:
+        raise RuntimeError("handler failed")
+
+    client = FloClient(f"127.0.0.1:{port}")
+    worker = client.new_stream_worker(stream="s", group="g", handler=failing, block_ms=1000)
+    run = asyncio.create_task(worker.start())
+    try:
+        await asyncio.sleep(0.6)
+    finally:
+        worker.stop()
+        await asyncio.wait_for(run, timeout=10)
+        server.close()
+        for writer in fake.writers:
+            writer.close()
+        await server.wait_closed()
+    # About 10 records failed; every nack after the dropped one must arrive.
+    assert fake.nacks >= 5

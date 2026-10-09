@@ -1041,27 +1041,19 @@ class StreamWorker:
                 return
             cursor = result.next_cursor
 
-    async def _ack_with_retry(
-        self, record_ids: list[StreamID], options: StreamGroupAckOptions
-    ) -> None:
-        """Ack with retry on connection error."""
+    async def _on_ack_connection(self, send: Callable[[FloClient], Awaitable[object]]) -> None:
+        """Send an ack or nack, reconnecting the ack connection on a connection error."""
         assert self._ack_client is not None
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             try:
-                await self._ack_client.stream.group_ack(
-                    self.config.stream,
-                    self.config.group,
-                    record_ids,
-                    options,
-                )
+                await send(self._ack_client)
                 return
             except Exception as e:
                 if not is_connection_error(e) or not self._running:
                     raise
                 logger.warning(
-                    "Connection lost while acking "
-                    f"(attempt {attempt}/{max_attempts}), reconnecting..."
+                    f"Ack connection lost (attempt {attempt}/{max_attempts}), reconnecting..."
                 )
                 await self._ack_client.reconnect()
 
@@ -1085,9 +1077,13 @@ class StreamWorker:
                 )
 
                 # Success — ack with retry
-                await self._ack_with_retry(
-                    [record.id],
-                    StreamGroupAckOptions(consumer=self.config.consumer),
+                await self._on_ack_connection(
+                    lambda c: c.stream.group_ack(
+                        self.config.stream,
+                        self.config.group,
+                        [record.id],
+                        StreamGroupAckOptions(consumer=self.config.consumer),
+                    )
                 )
 
             except Exception as e:
@@ -1095,12 +1091,13 @@ class StreamWorker:
                     f"Record processing failed (stream={self.config.stream}, id={record.id}): {e}"
                 )
                 try:
-                    assert self._ack_client is not None
-                    await self._ack_client.stream.group_nack(
-                        self.config.stream,
-                        self.config.group,
-                        [record.id],
-                        StreamGroupNackOptions(consumer=self.config.consumer),
+                    await self._on_ack_connection(
+                        lambda c: c.stream.group_nack(
+                            self.config.stream,
+                            self.config.group,
+                            [record.id],
+                            StreamGroupNackOptions(consumer=self.config.consumer),
+                        )
                     )
                 except Exception as nack_err:
                     logger.error(f"Failed to nack record: {nack_err}")
