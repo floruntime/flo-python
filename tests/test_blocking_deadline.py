@@ -10,7 +10,7 @@ import pytest
 
 from flo import FloClient, GetOptions
 from flo import worker as worker_mod
-from flo.exceptions import NotConnectedError
+from flo.exceptions import NotConnectedError, is_connection_error
 from flo.types import HEADER_SIZE, MAGIC, VERSION, StatusCode
 from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32
 from flo.worker import ActionWorker, StreamWorker
@@ -107,8 +107,11 @@ async def test_blocking_call_still_times_out_after_its_wait(
     server_factory: list[FakeServer],
 ) -> None:
     client = await _client(server_factory, [1.0], timeout_ms=100)
-    with pytest.raises(asyncio.TimeoutError):
+    with pytest.raises(asyncio.TimeoutError) as raised:
         await client.kv.get("k", GetOptions(block_ms=200))
+    # The connection was dropped, so workers must take the reconnect path.
+    assert not client.is_connected
+    assert is_connection_error(raised.value)
 
 
 async def test_late_reply_is_not_read_by_the_next_call(

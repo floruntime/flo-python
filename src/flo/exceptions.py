@@ -3,6 +3,7 @@
 Exception classes for Flo client errors.
 """
 
+import asyncio
 import contextlib
 
 from .types import StatusCode
@@ -212,9 +213,11 @@ class GenericServerError(ServerError):
 def is_connection_error(exc: BaseException) -> bool:
     """Return True if the exception indicates a broken connection.
 
-    Connection errors may be resolved by reconnecting.
+    Connection errors may be resolved by reconnecting. A timed-out request
+    counts: the client drops its connection rather than risk reading the late
+    reply as the next answer.
     """
-    return isinstance(exc, (UnexpectedEofError, NotConnectedError))
+    return isinstance(exc, (UnexpectedEofError, NotConnectedError, asyncio.TimeoutError))
 
 
 def raise_for_status(status: StatusCode, data: bytes = b"") -> None:

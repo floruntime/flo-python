@@ -49,7 +49,7 @@ class FloClient:
             endpoint: Server endpoint in "host:port" format.
             namespace: Default namespace for operations.
             timeout_ms: Connection and operation timeout in milliseconds. A
-                blocking call (block_ms or wait_ms) is allowed this long on
+                blocking call (block_ms) is allowed this long on
                 top of its wait. A call that times out drops the connection;
                 call reconnect() before reusing the client.
             debug: Enable debug logging.
