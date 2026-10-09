@@ -57,8 +57,10 @@ class FakeServer:
         self.polls = 0
         self.poll_times: list[float] = []  # when each poll arrived
         self.answer_times: list[float] = []  # when each poll was answered
+        self.writers: set[asyncio.StreamWriter] = set()
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.writers.add(writer)
         loop = asyncio.get_running_loop()
         try:
             while True:
@@ -99,6 +101,10 @@ class Running:
         await asyncio.wait_for(self.run, timeout=5)
         took = loop.time() - started
         self.server.close()
+        # Python 3.12+ wait_closed() also waits for open connections, and the
+        # client may still hold one.
+        for writer in self.fake.writers:
+            writer.close()
         await self.server.wait_closed()
         return took
 
