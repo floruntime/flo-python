@@ -93,15 +93,20 @@ class _EmptyPollBackoff:
     def reset(self) -> None:
         self._streak = 0
 
-    async def empty(self, elapsed_s: float) -> None:
+    def _next_pause(self, elapsed_s: float) -> float:
         if elapsed_s >= self._early_s:
             self._streak = 0
-            return
+            return 0.0
         self._streak += 1
-        if self._streak > 1:
-            # The exponent is capped: the float power overflows on a long
-            # streak, and the pause reaches _MAX_S long before the cap.
-            pause = min(self._FIRST_S * 2 ** min(self._streak - 2, 16), self._MAX_S)
+        if self._streak == 1:
+            return 0.0
+        # The exponent is capped: the float power overflows on a long streak,
+        # and the pause reaches _MAX_S long before the cap.
+        return min(self._FIRST_S * 2.0 ** min(self._streak - 2, 16), self._MAX_S)
+
+    async def empty(self, elapsed_s: float) -> None:
+        pause = self._next_pause(elapsed_s)
+        if pause:
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=pause)
 
