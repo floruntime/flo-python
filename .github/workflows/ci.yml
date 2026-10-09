@@ -40,8 +40,31 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+      - name: Start the pinned flo release
+        run: |
+          . ./.github/flo-release.env
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o flo.tar.gz "https://github.com/floruntime/flo/releases/download/$FLO_TAG/flo-x86_64-linux.tar.gz"
+          echo "$FLO_SHA256  flo.tar.gz" | sha256sum -c -
+          tar xzf flo.tar.gz
+          curl -fsSL -o proto.zig "https://raw.githubusercontent.com/floruntime/flo/$FLO_TAG/src/protocol/proto.zig"
+          echo "FLO_PROTO_ZIG=$RUNNER_TEMP/proto.zig" >> "$GITHUB_ENV"
+          mkdir -p flo-data
+          ./flo server start --port 4453 --data-dir "$RUNNER_TEMP/flo-data" > flo-server.log 2>&1 &
+          for _ in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/4453) 2>/dev/null; then exit 0; fi
+            sleep 0.2
+          done
+          echo "flo server did not start"; cat flo-server.log; exit 1
       - name: Run tests
+        # CI=1 turns a missing server or proto.zig into a failure, not a skip.
+        env:
+          CI: "1"
+          FLO_ENDPOINT: localhost:4453
         run: pytest -v
+      - name: Server log
+        if: failure()
+        run: cat "$RUNNER_TEMP/flo-server.log"
 
   build:
     runs-on: ubuntu-latest
