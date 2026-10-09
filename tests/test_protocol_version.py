@@ -1,10 +1,12 @@
 """The SDK hard-codes the wire protocol version; it must match the server's.
 
-When the Flo runtime source is checked out beside this repo (the workspace
-layout, or CI with a sibling checkout) this test reads ``proto.zig`` and fails
-on drift. Elsewhere it is skipped rather than guessed.
+The test reads the server's ``proto.zig``: the file ``FLO_PROTO_ZIG`` names
+(CI fetches it at the pinned flo release), else the Flo runtime source
+checked out beside this repo (the workspace layout). With neither it is
+skipped rather than guessed, except in CI, where that fails.
 """
 
+import os
 import re
 from pathlib import Path
 
@@ -19,18 +21,21 @@ _CANDIDATES = [
 
 
 def _server_proto() -> Path | None:
+    named = os.environ.get("FLO_PROTO_ZIG")
+    if named:
+        return Path(named)
     for p in _CANDIDATES:
         if p.is_file():
             return p
     return None
 
 
-@pytest.mark.skipif(
-    _server_proto() is None, reason="flo runtime source not checked out beside the SDK"
-)
 def test_protocol_version_matches_server() -> None:
     src = _server_proto()
-    assert src is not None
+    if src is None:
+        if os.environ.get("CI"):
+            pytest.fail("no proto.zig to check against: set FLO_PROTO_ZIG")
+        pytest.skip("flo runtime source not checked out beside the SDK")
     text = src.read_text()
     m = re.search(r"pub const VERSION: u8 = (0x[0-9A-Fa-f]+|\d+);", text)
     assert m, "could not find VERSION in proto.zig"
