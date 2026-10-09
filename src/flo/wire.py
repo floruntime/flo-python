@@ -383,55 +383,29 @@ def parse_response(data: bytes) -> RawResponse:
 def parse_scan_response(data: bytes) -> ScanResult:
     """Parse scan response data.
 
-    Format: [has_more:u8][cursor_len:u32][cursor:bytes][count:u32][entries...]
+    Format: [count:u32][entries...][has_more:u8][cursor_len:u16][cursor]
     Entry format: [key_len:u16][key][value_len:u32][value]
     """
-    if len(data) < 9:
+    if len(data) < 4:
         raise IncompleteResponseError("Scan response too short")
 
-    offset = 0
+    count = struct.unpack("<I", data[0:4])[0]
+    offset = 4
 
-    # has_more
-    has_more = data[offset] != 0
-    offset += 1
-
-    # cursor
-    cursor_len = struct.unpack("<I", data[offset : offset + 4])[0]
-    offset += 4
-
-    if len(data) < offset + cursor_len:
-        raise IncompleteResponseError("Scan response cursor incomplete")
-
-    cursor = data[offset : offset + cursor_len] if cursor_len > 0 else None
-    offset += cursor_len
-
-    # count
-    if len(data) < offset + 4:
-        raise IncompleteResponseError("Scan response count incomplete")
-
-    count = struct.unpack("<I", data[offset : offset + 4])[0]
-    offset += 4
-
-    # entries
     entries: list[KVEntry] = []
     for _ in range(count):
-        # key
         if len(data) < offset + 2:
             raise IncompleteResponseError("Scan response key length incomplete")
-
         key_len = struct.unpack("<H", data[offset : offset + 2])[0]
         offset += 2
 
         if len(data) < offset + key_len:
             raise IncompleteResponseError("Scan response key incomplete")
-
         key = data[offset : offset + key_len]
         offset += key_len
 
-        # value
         if len(data) < offset + 4:
             raise IncompleteResponseError("Scan response value length incomplete")
-
         value_len = struct.unpack("<I", data[offset : offset + 4])[0]
         offset += 4
 
@@ -443,6 +417,15 @@ def parse_scan_response(data: bytes) -> ScanResult:
             offset += value_len
 
         entries.append(KVEntry(key=key, value=value))
+
+    if len(data) < offset + 3:
+        raise IncompleteResponseError("Scan response pagination trailer incomplete")
+    has_more = data[offset] != 0
+    cursor_len = struct.unpack("<H", data[offset + 1 : offset + 3])[0]
+    offset += 3
+    if len(data) < offset + cursor_len:
+        raise IncompleteResponseError("Scan response cursor incomplete")
+    cursor = data[offset : offset + cursor_len] if cursor_len > 0 else None
 
     return ScanResult(entries=entries, cursor=cursor, has_more=has_more)
 

@@ -93,7 +93,7 @@ async def queue_example(client: FloClient) -> None:
     result = await client.queue.dequeue(
         queue_name,
         10,
-        DequeueOptions(visibility_timeout_ms=30000),
+        DequeueOptions(block_ms=1000),
     )
 
     print(f"  Received {len(result.messages)} messages")
