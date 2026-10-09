@@ -789,7 +789,7 @@ class StreamTrimResult:
     """What a trim removed, or with dry_run would remove."""
 
     removed: int  # Records removed
-    first_seq: int  # Sequence of the first record left (0 if none)
+    first_seq: int  # Sequence of the first record left; meaningful only when records remain
 
 
 @dataclass
