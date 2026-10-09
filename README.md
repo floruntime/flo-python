@@ -52,8 +52,8 @@ if value is not None:
     print(value.decode())
 
 # Blocking get - wait up to 2 seconds for value to appear
-# (block_ms is at most 300000 and must be shorter than the client's
-# timeout_ms; 0 means don't wait)
+# (block_ms is at most 300000; the client waits timeout_ms on top of it;
+# 0 means don't wait)
 value = await client.kv.get("key", GetOptions(block_ms=2000))
 
 # Get with namespace override
@@ -478,6 +478,8 @@ client = FloClient(
 )
 ```
 
+A call that times out or is cancelled drops the connection; call `reconnect()` before reusing the client (workers do this themselves).
+
 ### Namespaces
 
 Each operation can override the default namespace:
@@ -514,6 +516,8 @@ except FloError as e:
     print(f"Flo error: {e}")
 ```
 
+A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or is cancelled drops the connection; call `reconnect()` before reusing the client (workers do this themselves).
+
 ### Error Types
 
 | Error | Description |
@@ -525,6 +529,7 @@ except FloError as e:
 | `OverloadedError` | Server is overloaded |
 | `InternalServerError` | Server internal error |
 | `ConnectionFailedError` | Failed to connect |
+| `RequestTimeoutError` | No response within the timeout |
 | `InvalidChecksumError` | Response CRC32 mismatch |
 
 ## Requirements

@@ -10,13 +10,22 @@ from typing import TYPE_CHECKING
 
 from .exceptions import (
     ConnectionFailedError,
+    InvalidChecksumError,
     InvalidEndpointError,
     NotConnectedError,
+    ProtocolError,
+    RequestTimeoutError,
     UnexpectedEofError,
     raise_for_status,
 )
 from .types import _DEFAULT_WORKER_BLOCK_MS, HEADER_SIZE, OpCode, OptionTag, StatusCode
-from .wire import OptionsIterator, RawResponse, parse_response_header, serialize_request
+from .wire import (
+    OptionsIterator,
+    RawResponse,
+    compute_crc32,
+    parse_response_header,
+    serialize_request,
+)
 
 if TYPE_CHECKING:
     from .worker import ActionWorker, StreamRecordHandler, StreamWorker
@@ -50,8 +59,8 @@ class FloClient:
             namespace: Default namespace for operations.
             timeout_ms: Connection and operation timeout in milliseconds. A
                 blocking call (block_ms) is allowed this long on
-                top of its wait. A call that times out drops the connection;
-                call reconnect() before reusing the client.
+                top of its wait. A call that times out or is cancelled drops
+                the connection; call reconnect() before reusing the client.
             debug: Enable debug logging.
         """
         self._endpoint = endpoint
@@ -309,8 +318,8 @@ class FloClient:
             if self._debug:
                 logger.debug(f"[flo] -> {op_code.name} ns={namespace} key={key!r}")
 
-            # A blocking request is answered only after the server's wait, so
-            # it gets the operation timeout on top of that wait.
+            # The server may hold a blocking request for its whole wait, so it
+            # gets the operation timeout on top of that wait.
             read_timeout = self._timeout + self._server_wait_ms(op_code, options) / 1000.0
             writer, reader = self._writer, self._reader
             try:
@@ -326,6 +335,8 @@ class FloClient:
                     raise UnexpectedEofError(
                         "Connection closed while reading response header"
                     ) from e
+                except asyncio.TimeoutError as e:
+                    raise RequestTimeoutError(f"No response to {op_code.name}") from e
 
                 status, data_len, resp_request_id, crc = parse_response_header(header_data)
 
@@ -339,29 +350,37 @@ class FloClient:
                         raise UnexpectedEofError(
                             "Connection closed while reading response data"
                         ) from e
+                    except asyncio.TimeoutError as e:
+                        raise RequestTimeoutError(
+                            f"Response to {op_code.name} stalled mid-frame"
+                        ) from e
                 else:
                     response_data = b""
+
+                computed_crc = compute_crc32(header_data, response_data)
+                if computed_crc != crc:
+                    raise InvalidChecksumError(
+                        f"CRC32 mismatch: 0x{computed_crc:08X} != 0x{crc:08X}"
+                    )
+                if resp_request_id != request_id:
+                    raise ProtocolError(
+                        f"Response is for request {resp_request_id}, expected {request_id}"
+                    )
             except BaseException:
                 # The reply to an abandoned request (timed out, cancelled, cut
                 # off mid-frame) may still arrive and would be read as the
-                # answer to the next one, so the connection is dropped; the
-                # caller reconnects.
+                # answer to the next one, and after a corrupt or mismatched
+                # frame the stream position is unknown, so the connection is
+                # dropped; the caller reconnects.
                 writer.close()
-                self._writer = None
-                self._reader = None
+                # reconnect() swaps the connection outside the lock.
+                if self._writer is writer:
+                    self._writer = None
+                    self._reader = None
                 raise
 
             if self._debug:
                 logger.debug(f"[flo] <- {status.name} {len(response_data)} bytes")
-
-            # Verify CRC32
-            from .wire import compute_crc32
-
-            computed_crc = compute_crc32(header_data, response_data)
-            if computed_crc != crc:
-                from .exceptions import InvalidChecksumError
-
-                raise InvalidChecksumError(f"CRC32 mismatch: 0x{computed_crc:08X} != 0x{crc:08X}")
 
             return RawResponse(status=status, data=response_data, request_id=resp_request_id)
 

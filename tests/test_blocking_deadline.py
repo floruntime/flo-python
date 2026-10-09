@@ -8,9 +8,15 @@ from typing import Any
 
 import pytest
 
-from flo import FloClient, GetOptions
+from flo import FloClient, GetOptions, RequestTimeoutError
 from flo import worker as worker_mod
-from flo.exceptions import NotConnectedError, is_connection_error
+from flo.exceptions import (
+    FloError,
+    InvalidChecksumError,
+    NotConnectedError,
+    ProtocolError,
+    is_connection_error,
+)
 from flo.types import HEADER_SIZE, MAGIC, VERSION, StatusCode
 from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32
 from flo.worker import ActionWorker, StreamWorker
@@ -107,11 +113,85 @@ async def test_blocking_call_still_times_out_after_its_wait(
     server_factory: list[FakeServer],
 ) -> None:
     client = await _client(server_factory, [1.0], timeout_ms=100)
-    with pytest.raises(asyncio.TimeoutError) as raised:
+    with pytest.raises(RequestTimeoutError) as raised:
         await client.kv.get("k", GetOptions(block_ms=200))
+    assert isinstance(raised.value, FloError)
+    assert isinstance(raised.value, asyncio.TimeoutError)
     # The connection was dropped, so workers must take the reconnect path.
     assert not client.is_connected
     assert is_connection_error(raised.value)
+
+
+async def test_stream_worker_join_survives_a_timed_out_join(
+    server_factory: list[FakeServer],
+) -> None:
+    # The first join is answered after the client gave up.
+    client = await _client(server_factory, [0.3, 0.0], timeout_ms=100)
+    worker = client.new_stream_worker(stream="s", group="g", handler=_noop)
+    worker._client = client
+    await asyncio.wait_for(worker._join_group(), timeout=5)
+    assert client.is_connected
+    await client.close()
+
+
+async def test_failed_call_keeps_a_connection_swapped_in_meanwhile(
+    server_factory: list[FakeServer],
+) -> None:
+    client = await _client(server_factory, [0.3], timeout_ms=100)
+    call = asyncio.create_task(client.kv.get("k"))
+    await asyncio.sleep(0.01)  # the call holds the old connection
+    # reconnect() assigns its new connection without the lock.
+    server = server_factory[0]
+    client._reader, client._writer = await asyncio.open_connection("127.0.0.1", server.port)
+    fresh = client._writer
+    with pytest.raises(RequestTimeoutError):
+        await call
+    assert client._writer is fresh and client.is_connected
+    await client.close()
+
+
+async def _bad_frame_client(reply: Any) -> tuple[FloClient, asyncio.Server]:
+    """A server that answers each request with reply(request_id)."""
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                header = await reader.readexactly(HEADER_SIZE)
+                _, payload_len, request_id, *_ = struct.unpack(REQUEST_HEADER_FORMAT, header)
+                await reader.readexactly(payload_len)
+                writer.write(reply(request_id))
+        except (asyncio.IncompleteReadError, ConnectionError):
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    return await FloClient(f"127.0.0.1:{port}", timeout_ms=100).connect(), server
+
+
+def _corrupt(request_id: int) -> bytes:
+    frame = bytearray(_response(request_id, struct.pack("<Q", 1) + b"k"))
+    frame[-1] ^= 0xFF
+    return bytes(frame)
+
+
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    [
+        (lambda rid: _response(rid + 1, struct.pack("<Q", 1) + b"k"), ProtocolError),
+        (_corrupt, InvalidChecksumError),
+        (
+            lambda rid: _response(rid, struct.pack("<Q", 1) + b"k")[:HEADER_SIZE],
+            RequestTimeoutError,
+        ),
+    ],
+    ids=["wrong-request-id", "bad-crc", "stalled-mid-frame"],
+)
+async def test_bad_frame_drops_the_connection(reply: Any, error: type[Exception]) -> None:
+    client, server = await _bad_frame_client(reply)
+    with pytest.raises(error):
+        await client.kv.get("k")
+    assert not client.is_connected
+    server.close()
 
 
 async def test_late_reply_is_not_read_by_the_next_call(

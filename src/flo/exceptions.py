@@ -57,6 +57,12 @@ class UnexpectedEofError(FloError):
     pass
 
 
+class RequestTimeoutError(FloError, asyncio.TimeoutError):
+    """The server did not answer a request in time; the connection was dropped."""
+
+    pass
+
+
 # =============================================================================
 # Protocol Errors
 # =============================================================================
@@ -217,7 +223,7 @@ def is_connection_error(exc: BaseException) -> bool:
     counts: the client drops its connection rather than risk reading the late
     reply as the next answer.
     """
-    return isinstance(exc, (UnexpectedEofError, NotConnectedError, asyncio.TimeoutError))
+    return isinstance(exc, (UnexpectedEofError, NotConnectedError, RequestTimeoutError))
 
 
 def raise_for_status(status: StatusCode, data: bytes = b"") -> None:
