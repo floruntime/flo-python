@@ -941,6 +941,10 @@ class StreamWorker:
                 break
             except Exception as e:
                 self._semaphore.release()
+                if self._stop_event.is_set():
+                    # stop() interrupted the read. Reconnecting would also
+                    # reconnect the ack connection under the draining handlers.
+                    break
                 if is_connection_error(e):
                     logger.warning("Stream worker lost connection, reconnecting...")
                     try:

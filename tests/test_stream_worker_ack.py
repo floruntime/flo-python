@@ -64,6 +64,7 @@ class FakeStreamServer:
         self.ack_delay = ack_delay
         self.delivered = False
         self.connections = 0
+        self.closed_by_client = 0
         self.acks = 0
         self.acked = asyncio.Event()
         self.nacked = asyncio.Event()
@@ -97,7 +98,7 @@ class FakeStreamServer:
                     self.nacked.set()
                 writer.write(_response(request_id, b""))
         except (asyncio.IncompleteReadError, ConnectionError):
-            pass
+            self.closed_by_client += 1
 
     @staticmethod
     def _answer_late(writer: asyncio.StreamWriter, request_id: int) -> None:
@@ -162,6 +163,51 @@ async def test_stop_lets_an_in_flight_ack_finish(caplog: pytest.LogCaptureFixtur
             await asyncio.wait_for(run, timeout=10)
         assert not caplog.records
     finally:
+        await _shut(server, fake)
+
+
+async def test_stop_does_not_reconnect_under_draining_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # stop() interrupts the poll read. Reconnecting then would also reopen
+    # the ack connection while the handlers below are about to ack.
+    open_connection = asyncio.open_connection
+
+    async def slow_open_connection(*args: Any, **kw: Any) -> Any:
+        await asyncio.sleep(0.05)
+        return await open_connection(*args, **kw)
+
+    monkeypatch.setattr(asyncio, "open_connection", slow_open_connection)
+    n = 3
+    fake = FakeStreamServer(hold=5.0, count=n)
+    server, port = await _serve(fake)
+    started = 0
+    all_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(ctx: StreamContext) -> None:
+        nonlocal started
+        started += 1
+        if started == n:
+            all_started.set()
+        await release.wait()
+
+    client = FloClient(f"127.0.0.1:{port}")
+    worker = client.new_stream_worker(stream="s", group="g", handler=handler, block_ms=5000)
+    run = asyncio.create_task(worker.start())
+    try:
+        await asyncio.wait_for(all_started.wait(), timeout=2.0)
+        worker.stop()
+        await asyncio.sleep(0.075)
+        release.set()
+        await asyncio.wait_for(run, timeout=10)
+        assert fake.acks == n
+        assert fake.connections == 2  # no reconnect after stop
+        # start() closed both connections on its way out.
+        await asyncio.sleep(0.05)
+        assert fake.closed_by_client == 2
+    finally:
+        release.set()
         await _shut(server, fake)
 
 
