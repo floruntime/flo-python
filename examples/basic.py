@@ -30,7 +30,7 @@ async def kv_example(client: FloClient) -> None:
 
     # Put with TTL
     print("Putting 'session:abc' with 60s TTL")
-    await client.kv.put("session:abc", b"session-data", PutOptions(ttl_seconds=60))
+    await client.kv.put("session:abc", b"session-data", PutOptions(ttl_ms=60_000))
 
     # Get a value
     value = await client.kv.get("user:1")
