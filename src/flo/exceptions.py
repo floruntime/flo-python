@@ -202,18 +202,32 @@ class RateLimitedError(ServerError):
         super().__init__(message, StatusCode.RATE_LIMITED)
 
 
+class UnavailableError(ServerError):
+    """No leader, or the shard isn't taking writes or is offline. Retryable.
+
+    The message says why; an offline shard stays unavailable until an
+    operator acts, so whether and when to retry is the caller's call.
+    """
+
+    def __init__(self, message: str = StatusCode.UNAVAILABLE.message()):
+        super().__init__(message, StatusCode.UNAVAILABLE)
+
+
 class InternalServerError(ServerError):
-    """Internal server error."""
+    """Internal server error. Not retryable: the server uses it for a write
+    that committed but wasn't applied, which must not be resent."""
 
     def __init__(self, message: str = "Internal server error"):
         super().__init__(message, StatusCode.INTERNAL_ERROR)
 
 
 class GenericServerError(ServerError):
-    """Generic server error."""
+    """Generic server error, or a status with no dedicated error type."""
 
-    def __init__(self, message: str = "Generic error"):
-        super().__init__(message, StatusCode.ERROR_GENERIC)
+    def __init__(
+        self, message: str = "Generic error", status_code: StatusCode = StatusCode.ERROR_GENERIC
+    ):
+        super().__init__(message, status_code)
 
 
 def is_connection_error(exc: BaseException) -> bool:
@@ -251,10 +265,15 @@ def raise_for_status(status: StatusCode, data: bytes = b"") -> None:
         StatusCode.CONFLICT: ConflictError,
         StatusCode.UNAUTHORIZED: UnauthorizedError,
         StatusCode.OVERLOADED: OverloadedError,
+        StatusCode.UNAVAILABLE: UnavailableError,
         StatusCode.RATE_LIMITED: RateLimitedError,
         StatusCode.INTERNAL_ERROR: InternalServerError,
         StatusCode.ERROR_GENERIC: GenericServerError,
     }
 
-    error_class = error_map.get(status, GenericServerError)
-    raise error_class(message)
+    error_class = error_map.get(status)
+    if error_class is not None:
+        raise error_class(message)
+    if status.name not in StatusCode.__members__:
+        message = f"Unknown status {int(status)}: {message}"
+    raise GenericServerError(message, status)

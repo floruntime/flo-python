@@ -184,6 +184,23 @@ class StatusCode(IntEnum):
     INTERNAL_ERROR = 9
     OVERLOADED = 10
     RATE_LIMITED = 11
+    UNAVAILABLE = 12
+
+    @classmethod
+    def _missing_(cls, value: object) -> "StatusCode | None":
+        # A status this SDK doesn't know still has a body on the wire; failing
+        # here would abandon it unread, so it becomes a pseudo-member instead.
+        if not isinstance(value, int) or not 0 <= value <= 255:
+            return None
+        member = int.__new__(cls, value)
+        member._name_ = f"UNKNOWN_{value}"
+        member._value_ = value
+        return member
+
+    def __reduce_ex__(self, proto: object) -> tuple[type["StatusCode"], tuple[int]]:
+        # Rebuilt from its value, not its name: a pseudo-member such as
+        # UNKNOWN_200 has no name to look up, so pickle and copy would fail.
+        return self.__class__, (int(self),)
 
     def message(self) -> str:
         """Get human-readable error message."""
@@ -200,8 +217,11 @@ class StatusCode(IntEnum):
             StatusCode.INTERNAL_ERROR: "Internal server error",
             StatusCode.OVERLOADED: "Server overloaded",
             StatusCode.RATE_LIMITED: "Request rate limit exceeded",
+            StatusCode.UNAVAILABLE: (
+                "Unavailable: no leader or the shard isn't taking writes; retry"
+            ),
         }
-        return messages.get(self, "Unknown error")
+        return messages.get(self, f"Unknown status {int(self)}")
 
 
 class OptionTag(IntEnum):
