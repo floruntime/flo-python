@@ -419,7 +419,7 @@ class TestBuildStreamBatchValue:
 
 
 class TestGroupPendingClaimWire:
-    """Tests for the FLO-102 PEL pending/claim wire format."""
+    """Tests for the consumer-group pending-list (PEL) pending/claim wire format."""
 
     def test_serialize_group_pending_no_consumer(self) -> None:
         value = serialize_group_pending_value("grp")
