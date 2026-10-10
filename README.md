@@ -102,9 +102,6 @@ result = await client.kv.scan("user:", ScanOptions(limit=100))
 while result.has_more:
     # Process entries...
     result = await client.kv.scan("user:", ScanOptions(cursor=result.cursor, limit=100))
-
-# Keys only (more efficient when you don't need values)
-result = await client.kv.scan("user:", ScanOptions(keys_only=True))
 ```
 
 ### History

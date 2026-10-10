@@ -216,7 +216,6 @@ class OptionTag(IntEnum):
     IF_NOT_EXISTS = 0x03  # void: Only set if key doesn't exist (NX)
     IF_EXISTS = 0x04  # void: Only set if key exists (XX)
     LIMIT = 0x05  # u32: Maximum number of results for scan/list operations
-    KEYS_ONLY = 0x06  # u8: Skip values in scan response (0/1)
     ROUTING_KEY = 0x08  # string: Explicit routing key for shard co-location
     TXN_ID = 0x09  # u64: Transaction ID for per-shard transactions
 
@@ -263,7 +262,7 @@ class KVEntry:
     """KV entry from scan results."""
 
     key: bytes
-    value: bytes | None  # None if keys_only=True
+    value: bytes | None
 
 
 @dataclass
@@ -522,7 +521,6 @@ class ScanOptions:
     namespace: str | None = None
     cursor: bytes | None = None
     limit: int | None = None
-    keys_only: bool = False
 
 
 @dataclass
