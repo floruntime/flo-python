@@ -328,6 +328,7 @@ async def test_action_worker_paces_reconnects_to_a_server_that_drops_them() -> N
     worker.stop()
     await asyncio.wait_for(run, timeout=1)
     assert loop.time() - started < 0.1  # stop ends the pause
+    await worker._client.close()
     server.close()
     await server.wait_closed()
 
@@ -336,10 +337,12 @@ async def test_action_worker_reconnects_at_once_after_a_poll_got_through() -> No
     # Each connection answers one poll and is then dropped: every drop is the
     # first in a row, so none is paced.
     accepts = 0
+    writers: list[asyncio.StreamWriter] = []
 
     async def one_poll(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         nonlocal accepts
         accepts += 1
+        writers.append(writer)
         try:
             while True:
                 header = await reader.readexactly(HEADER_SIZE)
@@ -368,5 +371,9 @@ async def test_action_worker_reconnects_at_once_after_a_poll_got_through() -> No
     worker.stop()
     await asyncio.wait_for(run, timeout=1)
     assert accepts >= 10
+    # Python 3.12+ wait_closed() also waits for open connections.
+    await worker._client.close()
     server.close()
+    for writer in writers:
+        writer.close()
     await server.wait_closed()
