@@ -335,12 +335,7 @@ class ActionWorker:
         )
 
         # Create a dedicated connection using the parent client's endpoint and namespace.
-        # Timeout must accommodate block_ms + action_timeout so blocking reads
-        # (ACTION_AWAIT with block_ms) don't get killed by socket-level timeout.
-        worker_timeout_ms = max(
-            self.config.block_ms + 5000,
-            int(self.config.action_timeout * 1000),
-        )
+        worker_timeout_ms = int(self._parent_client._timeout * 1000)
         self._client = FloClient(
             self._parent_client._endpoint,
             namespace=self._parent_client.namespace,
@@ -435,6 +430,10 @@ class ActionWorker:
         """Main polling loop for tasks."""
         assert self._client is not None
         assert self._semaphore is not None
+        # Pause before each reconnect after the first in a row: a server that
+        # accepts and then drops the connection would otherwise be hit in a
+        # tight loop. A poll that gets an answer resets it.
+        reconnect_pause = 0.0
         loop = asyncio.get_running_loop()
         backoff = _EmptyPollBackoff(self.config.block_ms, self._stop_event)
         while self._running and not self._stop_event.is_set():
@@ -454,6 +453,7 @@ class ActionWorker:
                     action_names,
                     WorkerAwaitOptions(block_ms=self.config.block_ms),
                 )
+                reconnect_pause = 0.0
 
                 if result.task is None:
                     # No task available, release semaphore and continue
@@ -472,6 +472,12 @@ class ActionWorker:
             except Exception as e:
                 self._semaphore.release()
                 if is_connection_error(e):
+                    if reconnect_pause:
+                        with contextlib.suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(self._stop_event.wait(), reconnect_pause)
+                        if self._stop_event.is_set():
+                            break
+                    reconnect_pause = min(max(reconnect_pause * 2, 1.0), 30.0)
                     logger.warning("Connection lost, reconnecting...")
                     try:
                         await self._client.reconnect()
@@ -498,7 +504,6 @@ class ActionWorker:
                         logger.info("Reconnected, resuming work")
                     except Exception as recon_err:
                         logger.error(f"Reconnect failed: {recon_err}, retrying...")
-                        await asyncio.sleep(1)
                 else:
                     logger.error(f"Await error: {e}, retrying...")
                     await asyncio.sleep(1)
@@ -870,12 +875,7 @@ class StreamWorker:
             f"concurrency={self.config.concurrency})"
         )
 
-        # Timeout must accommodate block_ms + message_timeout so blocking reads
-        # (group_read with block_ms) don't get killed by socket-level timeout.
-        worker_timeout_ms = max(
-            self.config.block_ms + 5000,
-            int(self.config.message_timeout * 1000),
-        )
+        worker_timeout_ms = int(self._parent_client._timeout * 1000)
         self._client = FloClient(
             self._parent_client._endpoint,
             namespace=self._parent_client.namespace,
