@@ -214,7 +214,7 @@ def is_connection_error(exc: BaseException) -> bool:
 
     Connection errors may be resolved by reconnecting.
     """
-    return isinstance(exc, (UnexpectedEofError, NotConnectedError))
+    return isinstance(exc, (UnexpectedEofError, NotConnectedError, OSError))
 
 
 def raise_for_status(status: StatusCode, data: bytes = b"") -> None:
