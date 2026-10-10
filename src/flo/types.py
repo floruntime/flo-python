@@ -323,11 +323,7 @@ class OptionTag(IntEnum):
     PARTITION = 0x24  # u32: Explicit partition index
     PARTITION_KEY = 0x25  # string: Key for partition routing
     MAX_AGE_SECONDS = 0x26  # u64: Maximum age in seconds for retention
-    MAX_BYTES = 0x27  # u64: Maximum size in bytes for retention
     DRY_RUN = 0x28  # void: Flag to preview what would be deleted
-    RETENTION_COUNT = 0x29  # u64: Retention policy - max event count
-    RETENTION_AGE = 0x2A  # u64: Retention policy - max age in seconds
-    RETENTION_BYTES = 0x2B  # u64: Retention policy - max bytes
 
     # Consumer Group Options (0x30 - 0x3F)
     ACK_TIMEOUT_MS = 0x30  # u32: Time before unacked message auto-redelivers
@@ -782,10 +778,18 @@ class StreamTrimOptions:
     """Options for stream trim operations."""
 
     namespace: str | None = None
-    max_len: int | None = None  # Retention policy - max event count
-    max_age_seconds: int | None = None  # Retention policy - max age in seconds
-    max_bytes: int | None = None  # Retention policy - max bytes
-    dry_run: bool = False  # Preview what would be deleted
+    before: Optional["StreamID"] = None  # Remove records up to and including this id
+    max_len: int | None = None  # Keep only the newest N records (> 0)
+    max_age_seconds: int | None = None  # Remove records older than this (> 0)
+    dry_run: bool = False  # Report what would be removed, removing nothing
+
+
+@dataclass
+class StreamTrimResult:
+    """What a trim removed, or with dry_run would remove."""
+
+    removed: int  # Records removed
+    first_seq: int  # Sequence of the first record left; meaningful only when records remain
 
 
 @dataclass
