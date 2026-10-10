@@ -70,6 +70,47 @@ class ActionResult:
 ActionHandler = Callable[["ActionContext"], Awaitable[bytes | dict[str, Any] | ActionResult]]
 
 
+class _EmptyPollBackoff:
+    """Paces a poll loop whose blocking reads come back empty early.
+
+    A blocking read can come back empty early for two reasons that look the
+    same on the wire. The server may have no room to park it (re-polling at
+    once would spin), or an append woke it so the consumer re-reads. A full
+    server answers within a round trip, so only answers under
+    min(250 ms, block_ms/2) count as early. Even then, one may be an append
+    wake, so the first in a row is re-polled at once.
+    """
+
+    _EARLY_S = 0.25
+    _FIRST_S = 0.05
+    _MAX_S = 1.0
+
+    def __init__(self, block_ms: int, stop: asyncio.Event) -> None:
+        self._early_s = min(self._EARLY_S, block_ms / 2000.0)
+        self._stop = stop
+        self._streak = 0
+
+    def reset(self) -> None:
+        self._streak = 0
+
+    def _next_pause(self, elapsed_s: float) -> float:
+        if elapsed_s >= self._early_s:
+            self._streak = 0
+            return 0.0
+        self._streak += 1
+        if self._streak == 1:
+            return 0.0
+        # The exponent is capped: the float power overflows on a long streak,
+        # and the pause reaches _MAX_S long before the cap.
+        return min(self._FIRST_S * 2.0 ** min(self._streak - 2, 16), self._MAX_S)
+
+    async def empty(self, elapsed_s: float) -> None:
+        pause = self._next_pause(elapsed_s)
+        if pause:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), timeout=pause)
+
+
 def _worker_block_ms(block_ms: int | None) -> int:
     if not block_ms:
         return _DEFAULT_WORKER_BLOCK_MS
@@ -394,6 +435,8 @@ class ActionWorker:
         """Main polling loop for tasks."""
         assert self._client is not None
         assert self._semaphore is not None
+        loop = asyncio.get_running_loop()
+        backoff = _EmptyPollBackoff(self.config.block_ms, self._stop_event)
         while self._running and not self._stop_event.is_set():
             try:
                 # Wait for semaphore slot
@@ -405,6 +448,7 @@ class ActionWorker:
                     break
 
                 # Await task from server
+                started = loop.time()
                 result = await self._client.worker.await_task(
                     self.config.worker_id,
                     action_names,
@@ -414,7 +458,9 @@ class ActionWorker:
                 if result.task is None:
                     # No task available, release semaphore and continue
                     self._semaphore.release()
+                    await backoff.empty(loop.time() - started)
                     continue
+                backoff.reset()
 
                 # Execute task in background
                 task = asyncio.create_task(self._execute_task(result.task))
@@ -900,6 +946,8 @@ class StreamWorker:
         """Main polling loop for stream records."""
         assert self._client is not None
         assert self._semaphore is not None
+        loop = asyncio.get_running_loop()
+        backoff = _EmptyPollBackoff(self.config.block_ms, self._stop_event)
 
         while self._running and not self._stop_event.is_set():
             try:
@@ -910,6 +958,7 @@ class StreamWorker:
                     self._semaphore.release()
                     break
 
+                started = loop.time()
                 result = await self._client.stream.group_read(
                     self.config.stream,
                     self.config.group,
@@ -922,7 +971,9 @@ class StreamWorker:
 
                 if not result.records:
                     self._semaphore.release()
+                    await backoff.empty(loop.time() - started)
                     continue
+                backoff.reset()
 
                 # Release semaphore before dispatching — each task will
                 # acquire its own slot via _process_record.
