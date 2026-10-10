@@ -273,12 +273,21 @@ await client.action.register(
 ### Invoke an Action
 
 ```python
+from flo import ActionInvokeOptions
+
 # Invoke an action
 result = await client.action.invoke(
     "process-image",
     b'{"image_url": "https://example.com/image.jpg"}',
 )
 print(f"Run ID: {result.run_id}")
+
+# Route the run only to workers registered with matching labels
+result = await client.action.invoke(
+    "process-image",
+    b'{"image_url": "https://example.com/image.jpg"}',
+    ActionInvokeOptions(labels={"gpu": True}),
+)
 ```
 
 ### Check Action Status

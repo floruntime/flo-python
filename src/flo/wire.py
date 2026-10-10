@@ -4,9 +4,11 @@ Binary serialization/deserialization for the Flo protocol.
 Header: 32 bytes, little-endian, CRC32 validated.
 """
 
+import json
 import struct
 from binascii import crc32
 from dataclasses import dataclass
+from typing import Any
 
 from . import types as types
 from .exceptions import (
@@ -908,42 +910,25 @@ def serialize_action_register_value(
 
 def serialize_action_invoke_value(
     input_data: bytes,
-    priority: int = 10,
-    idempotency_key: str | None = None,
+    labels: dict[str, Any] | None = None,
 ) -> bytes:
     """Serialize action invoke value.
 
-    Format: [priority:u8][delay_ms:i64][has_caller:u8]
-            [has_idempotency_key:u8][key_len:u16]?[key]?
-            [has_labels:u8][labels_len:u16]?[labels]?[input...]
+    Format: [has_labels:u8]([labels_len:u16][labels...])?[input...]
+
+    has_labels is 0 or 1. labels is a compact JSON object; only workers whose
+    registered labels contain every key/value receive the run.
+
+    Raises:
+        ValueError: If the encoded labels exceed 65535 bytes.
     """
-    result = bytearray()
+    if labels is None:
+        return b"\x00" + input_data
 
-    # priority
-    result.append(priority & 0xFF)
-
-    # delay_ms (default 0)
-    result.extend(struct.pack("<q", 0))
-
-    # caller_id (optional, none)
-    result.append(0)
-
-    # idempotency_key (optional)
-    if idempotency_key:
-        key_bytes = idempotency_key.encode("utf-8")
-        result.append(1)
-        result.extend(struct.pack("<H", len(key_bytes)))
-        result.extend(key_bytes)
-    else:
-        result.append(0)
-
-    # labels (none)
-    result.append(0)
-
-    # input
-    result.extend(input_data)
-
-    return bytes(result)
+    labels_bytes = json.dumps(labels, separators=(",", ":")).encode("utf-8")
+    if len(labels_bytes) > 0xFFFF:
+        raise ValueError(f"invoke labels are {len(labels_bytes)} bytes; the limit is 65535")
+    return b"\x01" + struct.pack("<H", len(labels_bytes)) + labels_bytes + input_data
 
 
 def serialize_action_list_value(limit: int = 100) -> bytes:

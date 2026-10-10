@@ -776,8 +776,9 @@ class ActionInvokeOptions:
     """Options for invoking an action."""
 
     namespace: str | None = None
-    priority: int = 10
-    idempotency_key: str | None = None
+    # Required worker labels: only workers registered with every key/value
+    # here receive the run.
+    labels: dict[str, Any] | None = None
 
 
 @dataclass
@@ -819,10 +820,6 @@ class TaskAssignment:
     attempt: int
     caller_run_id: str = ""
     caller_workflow_name: str = ""
-
-
-# Alias for backwards compatibility
-WorkerTask = TaskAssignment
 
 
 @dataclass

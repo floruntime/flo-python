@@ -24,6 +24,7 @@ from flo.wire import (
     parse_pending_entries,
     parse_response,
     parse_scan_response,
+    serialize_action_invoke_value,
     serialize_group_claim_value,
     serialize_group_pending_value,
     serialize_request,
@@ -488,3 +489,18 @@ class TestGroupPendingClaimWire:
     def test_parse_pending_entries_empty(self) -> None:
         assert parse_pending_entries(b"") == []
         assert parse_pending_entries(struct.pack("<I", 0)) == []
+
+
+class TestActionInvokeValue:
+    """Invoke value: [has_labels:u8]([labels_len:u16][labels])?[input]."""
+
+    def test_no_labels(self) -> None:
+        assert serialize_action_invoke_value(b"x") == b"\x00x"
+
+    def test_labels(self) -> None:
+        value = serialize_action_invoke_value(b"x", labels={"gpu": True})
+        assert value == b"\x01\x0c\x00" + b'{"gpu":true}' + b"x"
+
+    def test_oversized_labels_raise(self) -> None:
+        with pytest.raises(ValueError):
+            serialize_action_invoke_value(b"x", labels={"k": "v" * 0xFFFF})
