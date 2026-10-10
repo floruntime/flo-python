@@ -4,6 +4,7 @@ import struct
 
 import pytest
 
+from flo.exceptions import IncompleteResponseError
 from flo.types import (
     HEADER_SIZE,
     MAGIC,
@@ -11,8 +12,8 @@ from flo.types import (
     OpCode,
     OptionTag,
     StatusCode,
+    StreamID,
 )
-from flo.types import StreamID
 from flo.wire import (
     OptionsBuilder,
     OptionsIterator,
@@ -337,29 +338,36 @@ class TestParseDequeueResponse:
     """Tests for dequeue response parsing."""
 
     def test_parse_dequeue_response(self) -> None:
-        # Build dequeue response:
-        # [count:u32][messages...]
-        # Message: [seq:u64][payload_len:u32][payload]
+        # Build dequeue response as the server writes it:
+        # [count:u32] then per message
+        # [seq:u64][payload_len:u32][payload][enqueued_at_ms:i64][delivery_count:u32][priority:u8]
         data = bytearray()
-        data.extend(struct.pack("<I", 2))  # count
-
-        # Message 1
-        data.extend(struct.pack("<Q", 100))  # seq
-        data.extend(struct.pack("<I", 5))  # payload_len
-        data.extend(b"task1")
-
-        # Message 2
-        data.extend(struct.pack("<Q", 101))  # seq
-        data.extend(struct.pack("<I", 5))  # payload_len
-        data.extend(b"task2")
+        data.extend(struct.pack("<I", 3))
+        for seq, payload, at, deliveries, prio in (
+            (100, b"task1", 1_700_000_000_000, 1, 0),
+            (101, b"t2", 1_700_000_000_005, 2, 7),
+            (102, b"third", 1_700_000_000_009, 3, 255),
+        ):
+            data.extend(struct.pack("<QI", seq, len(payload)))
+            data.extend(payload)
+            data.extend(struct.pack("<qIB", at, deliveries, prio))
 
         result = parse_dequeue_response(bytes(data))
 
-        assert len(result.messages) == 2
-        assert result.messages[0].seq == 100
-        assert result.messages[0].payload == b"task1"
-        assert result.messages[1].seq == 101
-        assert result.messages[1].payload == b"task2"
+        got = [
+            (m.seq, m.payload, m.enqueued_at_ms, m.delivery_count, m.priority)
+            for m in result.messages
+        ]
+        assert got == [
+            (100, b"task1", 1_700_000_000_000, 1, 0),
+            (101, b"t2", 1_700_000_000_005, 2, 7),
+            (102, b"third", 1_700_000_000_009, 3, 255),
+        ]
+
+    def test_parse_dequeue_response_refuses_a_cut_trailer(self) -> None:
+        data = struct.pack("<IQI", 1, 1, 1) + b"x" + struct.pack("<q", 0)
+        with pytest.raises(IncompleteResponseError):
+            parse_dequeue_response(data)
 
 
 class TestParseEnqueueResponse:

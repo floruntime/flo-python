@@ -483,6 +483,9 @@ class Message:
 
     seq: int
     payload: bytes
+    enqueued_at_ms: int = 0
+    delivery_count: int = 0
+    priority: int = 0
 
 
 @dataclass

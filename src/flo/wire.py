@@ -491,6 +491,7 @@ def parse_dequeue_response(data: bytes) -> DequeueResult:
 
     Format: [count:u32][messages...]
     Message format: [seq:u64][payload_len:u32][payload]
+                    [enqueued_at_ms:i64][delivery_count:u32][priority:u8]
     """
     if len(data) < 4:
         raise IncompleteResponseError("Dequeue response too short")
@@ -517,7 +518,20 @@ def parse_dequeue_response(data: bytes) -> DequeueResult:
         payload = data[offset : offset + payload_len]
         offset += payload_len
 
-        messages.append(Message(seq=seq, payload=payload))
+        if len(data) < offset + 13:
+            raise IncompleteResponseError("Dequeue response message incomplete")
+        enqueued_at_ms, delivery_count, priority = struct.unpack("<qIB", data[offset : offset + 13])
+        offset += 13
+
+        messages.append(
+            Message(
+                seq=seq,
+                payload=payload,
+                enqueued_at_ms=enqueued_at_ms,
+                delivery_count=delivery_count,
+                priority=priority,
+            )
+        )
 
     return DequeueResult(messages=messages)
 
