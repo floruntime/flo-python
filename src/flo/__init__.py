@@ -144,7 +144,6 @@ from .types import (
     WorkerListOptions,
     WorkerListResult,
     WorkerRegisterOptions,
-    WorkerTask,
     WorkerTouchOptions,
     WorkflowCancelOptions,
     WorkflowCreateOptions,
@@ -287,7 +286,6 @@ __all__ = [
     "ActionDeleteOptions",
     # Worker types
     "TaskAssignment",
-    "WorkerTask",
     "WorkerAwaitResult",
     "WorkerInfo",
     "WorkerListResult",
