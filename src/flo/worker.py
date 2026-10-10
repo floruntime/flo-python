@@ -839,6 +839,11 @@ class StreamWorker:
         )
 
         self._client: FloClient | None = None
+        self._ack_client: FloClient | None = None
+        # Concurrent acks that fail on the same dead connection reconnect it
+        # once: the generation tells a waiter someone already did.
+        self._ack_reconnect_lock = asyncio.Lock()
+        self._ack_generation = 0
         self._running = False
         self._stop_event = asyncio.Event()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -879,6 +884,21 @@ class StreamWorker:
         )
         await self._client.connect()
 
+        # Acks and nacks get their own connection: the polling one is held by
+        # a group_read for up to block_ms, and an ack queued behind it can
+        # arrive after the group's ack timeout and see the record redelivered.
+        self._ack_client = FloClient(
+            self._parent_client._endpoint,
+            namespace=self._parent_client.namespace,
+            debug=self._parent_client._debug,
+            timeout_ms=worker_timeout_ms,
+        )
+        try:
+            await self._ack_client.connect()
+        except BaseException:
+            await self._client.close()
+            raise
+
         try:
             # Semaphore and running state must be set up before the join: a
             # connection error during the join triggers _handle_reconnect ->
@@ -915,6 +935,9 @@ class StreamWorker:
 
                 await self._client.close()
                 self._client = None
+            if self._ack_client:
+                await self._ack_client.close()
+                self._ack_client = None
 
             self._running = False
             logger.info("Stream worker stopped")
@@ -969,6 +992,10 @@ class StreamWorker:
                 break
             except Exception as e:
                 self._semaphore.release()
+                if self._stop_event.is_set():
+                    # stop() interrupted the read. Reconnecting would also
+                    # reconnect the ack connection under the draining handlers.
+                    break
                 if is_connection_error(e):
                     logger.warning("Stream worker lost connection, reconnecting...")
                     try:
@@ -1018,6 +1045,12 @@ class StreamWorker:
         """
         assert self._client is not None
         await self._client.reconnect()
+        # The ack connection went down with the poll connection (e.g. a server
+        # restart) but may not notice until an ack fails on it.
+        try:
+            await self._reconnect_ack_client()
+        except Exception as e:
+            logger.warning(f"Failed to reconnect ack client: {e}")
         await self._client.stream.group_join(
             self.config.stream,
             self.config.group,
@@ -1073,29 +1106,40 @@ class StreamWorker:
                 return
             cursor = result.next_cursor
 
-    async def _ack_with_retry(
-        self, record_ids: list[StreamID], options: StreamGroupAckOptions
+    async def _reconnect_ack_client(self, failed_generation: int | None = None) -> None:
+        """Reconnect the ack connection, unless it was reconnected since
+        `failed_generation` was observed."""
+        assert self._ack_client is not None
+        async with self._ack_reconnect_lock:
+            if failed_generation is not None and failed_generation != self._ack_generation:
+                return
+            await self._ack_client.reconnect()
+            self._ack_generation += 1
+
+    async def _on_ack_connection(
+        self,
+        op: str,
+        record_id: StreamID,
+        send: Callable[[FloClient], Awaitable[object]],
     ) -> None:
-        """Ack with retry on connection error."""
+        """Send an ack or nack, reconnecting the ack connection on a connection error."""
+        assert self._ack_client is not None
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
+            generation = self._ack_generation
             try:
-                assert self._client is not None
-                await self._client.stream.group_ack(
-                    self.config.stream,
-                    self.config.group,
-                    record_ids,
-                    options,
-                )
+                await send(self._ack_client)
                 return
             except Exception as e:
                 if not is_connection_error(e) or not self._running:
                     raise
                 logger.warning(
-                    "Connection lost while acking "
-                    f"(attempt {attempt}/{max_attempts}), reconnecting..."
+                    f"Ack connection lost (attempt {attempt}/{max_attempts}), reconnecting..."
                 )
-                await self._handle_reconnect()
+                await self._reconnect_ack_client(generation)
+        message = f"Failed to {op} record {record_id} after {max_attempts} attempts"
+        logger.warning(message)
+        raise RuntimeError(message)
 
     async def _process_record(self, record: StreamRecord) -> None:
         """Process a single record: call handler, then ack or nack."""
@@ -1117,9 +1161,15 @@ class StreamWorker:
                 )
 
                 # Success — ack with retry
-                await self._ack_with_retry(
-                    [record.id],
-                    StreamGroupAckOptions(consumer=self.config.consumer),
+                await self._on_ack_connection(
+                    "ack",
+                    record.id,
+                    lambda c: c.stream.group_ack(
+                        self.config.stream,
+                        self.config.group,
+                        [record.id],
+                        StreamGroupAckOptions(consumer=self.config.consumer),
+                    ),
                 )
 
             except Exception as e:
@@ -1127,11 +1177,15 @@ class StreamWorker:
                     f"Record processing failed (stream={self.config.stream}, id={record.id}): {e}"
                 )
                 try:
-                    await self._client.stream.group_nack(
-                        self.config.stream,
-                        self.config.group,
-                        [record.id],
-                        StreamGroupNackOptions(consumer=self.config.consumer),
+                    await self._on_ack_connection(
+                        "nack",
+                        record.id,
+                        lambda c: c.stream.group_nack(
+                            self.config.stream,
+                            self.config.group,
+                            [record.id],
+                            StreamGroupNackOptions(consumer=self.config.consumer),
+                        ),
                     )
                 except Exception as nack_err:
                     logger.error(f"Failed to nack record: {nack_err}")
@@ -1155,6 +1209,8 @@ class StreamWorker:
         self.stop()
         if self._client:
             await self._client.close()
+        if self._ack_client:
+            await self._ack_client.close()
 
     async def __aenter__(self) -> "StreamWorker":
         """Async context manager entry."""

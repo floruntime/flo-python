@@ -69,7 +69,7 @@ from flo import PutOptions
 await client.kv.put("key", b"value")
 
 # Put with TTL (expires in 1 hour)
-await client.kv.put("session:abc", b"data", PutOptions(ttl_seconds=3600))
+await client.kv.put("session:abc", b"data", PutOptions(ttl_ms=3_600_000))
 
 # Put with CAS (optimistic locking)
 await client.kv.put("counter", b"2", PutOptions(cas_version=1))
