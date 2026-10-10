@@ -778,7 +778,7 @@ def serialize_group_claim_value(
     start_id: StreamID,
     count: int,
 ) -> bytes:
-    """Serialize the request value for STREAM_GROUP_CLAIM (FLO-102).
+    """Serialize the request value for STREAM_GROUP_CLAIM.
 
     Format: [group_len:u16][group][consumer_len:u16][consumer]
             [min_idle_ms:u32][start_ts:u64][start_seq:u64][count:u32]
@@ -799,7 +799,7 @@ def serialize_group_claim_value(
 
 
 def parse_pending_entries(data: bytes) -> list[PendingEntry]:
-    """Parse the STREAM_GROUP_PENDING response (FLO-102).
+    """Parse the STREAM_GROUP_PENDING response.
 
     Format: [count:u32]([ts:u64][seq:u64][delivery_count:u32]
             [consumer_len:u16][consumer])*

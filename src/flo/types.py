@@ -448,7 +448,7 @@ class PendingEntry:
 
     A delivered-but-unacked message. ``delivery_count`` is how many times the
     entry has been delivered; ``consumer`` is the consumer that currently owns
-    it. (FLO-102)
+    it.
     """
 
     id: StreamID = None  # type: ignore[assignment]
@@ -458,7 +458,7 @@ class PendingEntry:
 
 @dataclass
 class StreamClaimResult:
-    """Result of a :meth:`StreamOperations.group_claim` cursor page (FLO-102).
+    """Result of a :meth:`StreamOperations.group_claim` cursor page.
 
     ``records`` carry payload + headers (same shape as ``group_read``).
     ``next_cursor`` is the ``start_id`` to pass on the next ``group_claim``
@@ -603,7 +603,6 @@ class DlqListOptions:
     """Options for DLQ list operations."""
 
     namespace: str | None = None
-    limit: int = 100
 
 
 @dataclass

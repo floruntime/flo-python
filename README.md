@@ -34,7 +34,7 @@ asyncio.run(main())
 - **KV Store**: Versioned key-value storage with MVCC, TTL, and optimistic locking
 - **Queues**: Priority task queues (currently at-most-once: dequeue hands each message out once)
 - **Streams**: Append-only logs with consumer groups for distributed processing
-- **Actions**: Registered tasks with configurable timeouts, retries, and idempotency
+- **Actions**: Registered tasks with configurable timeouts and retries
 - **Workers**: Distributed task execution with lease management and heartbeats
 - **Async/await**: Native asyncio support for high-performance applications
 - **Type hints**: Full type annotations for IDE support
@@ -273,22 +273,12 @@ await client.action.register(
 ### Invoke an Action
 
 ```python
-from flo import ActionInvokeOptions
-
 # Invoke an action
 result = await client.action.invoke(
     "process-image",
     b'{"image_url": "https://example.com/image.jpg"}',
-    ActionInvokeOptions(priority=10)
 )
 print(f"Run ID: {result.run_id}")
-
-# Invoke with idempotency key (prevents duplicate runs)
-result = await client.action.invoke(
-    "process-image",
-    payload,
-    ActionInvokeOptions(idempotency_key="order-123-image")
-)
 ```
 
 ### Check Action Status

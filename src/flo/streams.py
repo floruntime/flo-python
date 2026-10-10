@@ -371,7 +371,7 @@ class StreamOperations:
         """List a consumer group's pending (delivered-but-unacked) entries.
 
         If ``consumer`` is non-empty, only that consumer's entries are returned;
-        otherwise the whole group's PEL is returned. (FLO-102)
+        otherwise the whole group's PEL is returned.
 
         Returns:
             A list of :class:`PendingEntry`.
@@ -405,7 +405,7 @@ class StreamOperations:
 
         Scans the PEL in StreamID order from ``start_id`` and takes up to
         ``count`` entries idle for at least ``min_idle_ms``. Returns the claimed
-        records (payload + headers) plus a cursor for the next page. (FLO-102)
+        records (payload + headers) plus a cursor for the next page.
 
         * Drain own pending (reconnect): ``min_idle_ms=0``, ``start_id=StreamID()``.
         * Steal from idle consumers (rebalance): ``min_idle_ms > 0``.

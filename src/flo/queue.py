@@ -198,29 +198,24 @@ class QueueOperations:
 
         Args:
             queue: Queue name.
-            options: Optional DLQ list options (limit).
+            options: Optional DLQ list options (namespace).
 
         Returns:
             DequeueResult containing list of DLQ messages.
 
         Example:
-            result = await client.queue.dlq_list("tasks", DlqListOptions(limit=100))
+            result = await client.queue.dlq_list("tasks")
             for msg in result.messages:
                 print(f"Failed message {msg.seq}: {msg.payload}")
         """
         opts = options or DlqListOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        # Build TLV options
-        builder = OptionsBuilder()
-        builder.add_u32(OptionTag.LIMIT, opts.limit)
-
         response = await self._client._send_and_check(
             OpCode.QUEUE_DLQ_LIST,
             namespace,
             queue.encode("utf-8"),
             b"",
-            builder.build(),
         )
 
         return parse_dequeue_response(response.data)
