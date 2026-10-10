@@ -118,8 +118,8 @@ class KVOperations:
         key_bytes = key.encode("utf-8") if isinstance(key, str) else key
 
         builder = OptionsBuilder()
-        if opts.ttl_seconds is not None:
-            builder.add_u64(OptionTag.TTL_SECONDS, opts.ttl_seconds)
+        if opts.ttl_ms is not None:
+            builder.add_u64(OptionTag.TTL_MS, opts.ttl_ms)
         if opts.cas_version is not None:
             builder.add_u64(OptionTag.CAS_VERSION, opts.cas_version)
         if opts.if_not_exists:
@@ -395,10 +395,10 @@ class KVOperations:
     async def touch(
         self,
         key: str | bytes,
-        ttl_seconds: int,
+        ttl_ms: int,
         options: KVTouchOptions | None = None,
     ) -> None:
-        """Update the TTL on an existing key. ``ttl_seconds=0`` clears the TTL.
+        """Set the TTL on an existing key, in milliseconds. ``ttl_ms=0`` clears the TTL.
 
         When ``options.if_match`` is set, the touch only succeeds if the
         current key version equals it — enabling race-free lease renewal.
@@ -413,7 +413,7 @@ class KVOperations:
             OpCode.KV_TOUCH,
             namespace,
             key_bytes,
-            struct.pack("<Q", ttl_seconds),
+            struct.pack("<Q", ttl_ms),
             builder.build(),
         )
 

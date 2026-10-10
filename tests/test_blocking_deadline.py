@@ -333,9 +333,16 @@ async def test_action_worker_paces_reconnects_to_a_server_that_drops_them() -> N
     await server.wait_closed()
 
 
-async def test_action_worker_reconnects_at_once_after_a_poll_got_through() -> None:
+async def test_action_worker_reconnects_at_once_after_a_poll_got_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Each connection answers one poll and is then dropped: every drop is the
-    # first in a row, so none is paced.
+    # first in a row, so none is paced. The empty answers would also pace the
+    # loop through the empty-poll backoff, which is not under test here.
+    async def no_pause(self: object, elapsed_s: float) -> None:
+        return None
+
+    monkeypatch.setattr(worker_mod._EmptyPollBackoff, "empty", no_pause)
     accepts = 0
     writers: list[asyncio.StreamWriter] = []
 

@@ -4,6 +4,7 @@ Stream (append-only log) operations for Flo client.
 Uses StreamID-native positioning (timestamp_ms + sequence).
 """
 
+import struct
 from typing import TYPE_CHECKING
 
 from .types import (
@@ -23,6 +24,7 @@ from .types import (
     StreamReadOptions,
     StreamReadResult,
     StreamTrimOptions,
+    StreamTrimResult,
 )
 from .wire import (
     OptionsBuilder,
@@ -193,21 +195,19 @@ class StreamOperations:
         self,
         stream: str,
         options: StreamTrimOptions | None = None,
-    ) -> None:
-        """Trim a stream based on retention policy.
+    ) -> StreamTrimResult:
+        """Remove a stream's oldest records by exactly one bound.
 
-        Args:
-            stream: Stream name.
-            options: Trim options (max_len, max_age_seconds, max_bytes, dry_run).
+        Set one of ``before``, ``max_len`` or ``max_age_seconds``; the server
+        refuses none or several. Trim cuts whole append batches, so ``max_len``
+        may keep a few more records than asked. With ``dry_run`` nothing is
+        removed and the result says what would be.
 
         Example:
-            # Keep only last 1000 records
+            # Keep only the newest 1000 records
             await client.stream.trim("events", StreamTrimOptions(max_len=1000))
 
-            # Delete records older than 1 day
-            await client.stream.trim("events", StreamTrimOptions(max_age_seconds=86400))
-
-            # Preview what would be deleted
+            # Count what that would remove, removing nothing
             await client.stream.trim("events", StreamTrimOptions(max_len=1000, dry_run=True))
         """
         opts = options or StreamTrimOptions()
@@ -215,26 +215,29 @@ class StreamOperations:
 
         builder = OptionsBuilder()
 
+        if opts.before is not None:
+            builder.add_bytes(OptionTag.STREAM_START, opts.before.to_bytes())
+
         if opts.max_len is not None:
-            builder.add_u64(OptionTag.RETENTION_COUNT, opts.max_len)
+            builder.add_u64(OptionTag.LIMIT, opts.max_len)
 
         if opts.max_age_seconds is not None:
-            builder.add_u64(OptionTag.RETENTION_AGE, opts.max_age_seconds)
-
-        if opts.max_bytes is not None:
-            builder.add_u64(OptionTag.RETENTION_BYTES, opts.max_bytes)
+            builder.add_u64(OptionTag.MAX_AGE_SECONDS, opts.max_age_seconds)
 
         if opts.dry_run:
             builder.add_flag(OptionTag.DRY_RUN)
 
-        await self._client._send_and_check(
+        response = await self._client._send_and_check(
             OpCode.STREAM_TRIM,
             namespace,
             stream.encode("utf-8"),
             b"",
             builder.build(),
-            allow_not_found=True,
         )
+        if len(response.data) != 16:
+            raise ValueError(f"stream trim: response is {len(response.data)} bytes, want 16")
+        removed, first_seq = struct.unpack("<QQ", response.data)
+        return StreamTrimResult(removed=removed, first_seq=first_seq)
 
     async def group_join(
         self,

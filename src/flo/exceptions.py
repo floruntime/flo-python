@@ -223,7 +223,7 @@ def is_connection_error(exc: BaseException) -> bool:
     counts: the client drops its connection rather than risk reading the late
     reply as the next answer.
     """
-    return isinstance(exc, (UnexpectedEofError, NotConnectedError, RequestTimeoutError))
+    return isinstance(exc, (UnexpectedEofError, NotConnectedError, RequestTimeoutError, OSError))
 
 
 def raise_for_status(status: StatusCode, data: bytes = b"") -> None:

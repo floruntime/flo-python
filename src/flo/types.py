@@ -293,7 +293,7 @@ class OptionTag(IntEnum):
     """
 
     # KV Options (0x01 - 0x0F)
-    TTL_SECONDS = 0x01  # u64: Time-to-live in seconds (0 = no expiration)
+    TTL_MS = 0x01  # u64: Time-to-live in milliseconds (0 = no expiration)
     CAS_VERSION = 0x02  # u64: Expected version for compare-and-swap
     IF_NOT_EXISTS = 0x03  # void: Only set if key doesn't exist (NX)
     IF_EXISTS = 0x04  # void: Only set if key exists (XX)
@@ -323,11 +323,7 @@ class OptionTag(IntEnum):
     PARTITION = 0x24  # u32: Explicit partition index
     PARTITION_KEY = 0x25  # string: Key for partition routing
     MAX_AGE_SECONDS = 0x26  # u64: Maximum age in seconds for retention
-    MAX_BYTES = 0x27  # u64: Maximum size in bytes for retention
     DRY_RUN = 0x28  # void: Flag to preview what would be deleted
-    RETENTION_COUNT = 0x29  # u64: Retention policy - max event count
-    RETENTION_AGE = 0x2A  # u64: Retention policy - max age in seconds
-    RETENTION_BYTES = 0x2B  # u64: Retention policy - max bytes
 
     # Consumer Group Options (0x30 - 0x3F)
     ACK_TIMEOUT_MS = 0x30  # u32: Time before unacked message auto-redelivers
@@ -616,7 +612,7 @@ class PutOptions:
     """Options for KV put operations."""
 
     namespace: str | None = None
-    ttl_seconds: int | None = None
+    ttl_ms: int | None = None  # Time-to-live in milliseconds (0 = no expiration)
     cas_version: int | None = None
     if_not_exists: bool = False
     if_exists: bool = False
@@ -782,10 +778,18 @@ class StreamTrimOptions:
     """Options for stream trim operations."""
 
     namespace: str | None = None
-    max_len: int | None = None  # Retention policy - max event count
-    max_age_seconds: int | None = None  # Retention policy - max age in seconds
-    max_bytes: int | None = None  # Retention policy - max bytes
-    dry_run: bool = False  # Preview what would be deleted
+    before: Optional["StreamID"] = None  # Remove records up to and including this id
+    max_len: int | None = None  # Keep only the newest N records (> 0)
+    max_age_seconds: int | None = None  # Remove records older than this (> 0)
+    dry_run: bool = False  # Report what would be removed, removing nothing
+
+
+@dataclass
+class StreamTrimResult:
+    """What a trim removed, or with dry_run would remove."""
+
+    removed: int  # Records removed
+    first_seq: int  # Sequence of the first record left; meaningful only when records remain
 
 
 @dataclass
