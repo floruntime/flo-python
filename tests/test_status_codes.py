@@ -102,3 +102,21 @@ async def test_error_reply_body_is_not_read_by_the_next_call(
     assert result.version == 7
     await client.close()
     server.close()
+
+
+def test_an_unknown_status_and_its_error_survive_pickle_and_copy() -> None:
+    import copy
+    import pickle
+
+    status = StatusCode(200)
+    assert pickle.loads(pickle.dumps(status)) == 200
+    assert copy.deepcopy(status) == 200
+    err = GenericServerError("Unknown status 200: boom", status)
+    assert pickle.loads(pickle.dumps(err)).status_code == 200
+
+
+def test_statuses_without_their_own_error_keep_their_code() -> None:
+    for code in (4, 5, 6):
+        with pytest.raises(ServerError) as caught:
+            raise_for_status(StatusCode(code), b"why")
+        assert caught.value.status_code == code

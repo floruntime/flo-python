@@ -197,6 +197,11 @@ class StatusCode(IntEnum):
         member._value_ = value
         return member
 
+    def __reduce_ex__(self, proto: object) -> tuple[type["StatusCode"], tuple[int]]:
+        # Rebuilt from its value, not its name: a pseudo-member such as
+        # UNKNOWN_200 has no name to look up, so pickle and copy would fail.
+        return self.__class__, (int(self),)
+
     def message(self) -> str:
         """Get human-readable error message."""
         messages = {
