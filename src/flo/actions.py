@@ -109,8 +109,7 @@ class ActionOperations:
 
         value = serialize_action_invoke_value(
             input_data=input_data,
-            priority=opts.priority,
-            idempotency_key=opts.idempotency_key,
+            labels=opts.labels,
         )
 
         response = await self._client._send_and_check(
