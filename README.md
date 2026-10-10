@@ -467,8 +467,10 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 | `BadRequestError` | Invalid request parameters |
 | `ConflictError` | CAS version mismatch |
 | `UnauthorizedError` | Authentication failed |
-| `OverloadedError` | Server is overloaded |
-| `InternalServerError` | Server internal error |
+| `OverloadedError` | Server is overloaded; retryable |
+| `UnavailableError` | No leader, or the shard isn't taking writes or is offline; retryable (the message says why) |
+| `InternalServerError` | Server internal error; not retryable (may mean committed but not applied) |
+| `GenericServerError` | Any other error status, including one this SDK doesn't know (`status_code` carries it) |
 | `ConnectionFailedError` | Failed to connect |
 | `RequestTimeoutError` | No response within the timeout |
 | `InvalidChecksumError` | Response CRC32 mismatch |
