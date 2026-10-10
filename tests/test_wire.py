@@ -51,12 +51,12 @@ class TestOptionsBuilder:
 
     def test_add_u64(self) -> None:
         builder = OptionsBuilder()
-        builder.add_u64(OptionTag.TTL_SECONDS, 3600)
+        builder.add_u64(OptionTag.TTL_MS, 3_600_000)
         result = builder.build()
 
-        assert result[0] == 0x01  # TTL_SECONDS tag
+        assert result[0] == 0x01  # TTL_MS tag
         assert result[1] == 8  # length
-        assert struct.unpack("<Q", result[2:])[0] == 3600
+        assert struct.unpack("<Q", result[2:])[0] == 3_600_000
 
     def test_add_bytes(self) -> None:
         builder = OptionsBuilder()
@@ -76,7 +76,7 @@ class TestOptionsBuilder:
 
     def test_multiple_options(self) -> None:
         builder = OptionsBuilder()
-        builder.add_u64(OptionTag.TTL_SECONDS, 3600)
+        builder.add_u64(OptionTag.TTL_MS, 3_600_000)
         builder.add_u8(OptionTag.PRIORITY, 5)
         builder.add_bytes(OptionTag.DEDUP_KEY, b"abc")
         result = builder.build()
@@ -95,7 +95,7 @@ class TestOptionsIterator:
     def test_iterate_options(self) -> None:
         # Build options
         builder = OptionsBuilder()
-        builder.add_u64(OptionTag.TTL_SECONDS, 3600)
+        builder.add_u64(OptionTag.TTL_MS, 3_600_000)
         builder.add_u8(OptionTag.PRIORITY, 5)
         data = builder.build()
 
@@ -103,15 +103,15 @@ class TestOptionsIterator:
         options = list(OptionsIterator(data))
         assert len(options) == 2
 
-        assert options[0].tag == OptionTag.TTL_SECONDS
-        assert options[0].as_u64() == 3600
+        assert options[0].tag == OptionTag.TTL_MS
+        assert options[0].as_u64() == 3_600_000
 
         assert options[1].tag == OptionTag.PRIORITY
         assert options[1].as_u8() == 5
 
     def test_find_option(self) -> None:
         builder = OptionsBuilder()
-        builder.add_u64(OptionTag.TTL_SECONDS, 7200)
+        builder.add_u64(OptionTag.TTL_MS, 7_200_000)
         builder.add_u8(OptionTag.PRIORITY, 10)
         data = builder.build()
 
@@ -123,9 +123,9 @@ class TestOptionsIterator:
         assert priority.as_u8() == 10
 
         # Find TTL
-        ttl = iter.find(OptionTag.TTL_SECONDS)
+        ttl = iter.find(OptionTag.TTL_MS)
         assert ttl is not None
-        assert ttl.as_u64() == 7200
+        assert ttl.as_u64() == 7_200_000
 
         # Find non-existent
         cas = iter.find(OptionTag.CAS_VERSION)
@@ -199,7 +199,7 @@ class TestSerializeRequest:
 
     def test_request_with_options(self) -> None:
         builder = OptionsBuilder()
-        builder.add_u64(OptionTag.TTL_SECONDS, 3600)
+        builder.add_u64(OptionTag.TTL_MS, 3_600_000)
         options = builder.build()
 
         request = serialize_request(
