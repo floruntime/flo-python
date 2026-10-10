@@ -6,7 +6,7 @@ Exception classes for Flo client errors.
 import asyncio
 import contextlib
 
-from .types import StatusCode
+from .types import TABLE_HASH, VERSION, StatusCode
 
 
 class FloError(Exception):
@@ -80,20 +80,27 @@ class InvalidMagicError(ProtocolError):
     pass
 
 
-class UnsupportedVersionError(ProtocolError):
-    """Unsupported protocol version."""
+class TableMismatchError(ProtocolError):
+    """The server was built from another protocol version or op table, so
+    neither can read the other. Upgrade the SDK and the server together."""
 
-    pass
+    def __init__(self, server_version: int, server_table: int) -> None:
+        self.server_version = server_version
+        self.server_table = server_table
+        if server_version != VERSION:
+            message = (
+                f"server protocol {server_version}, client protocol {VERSION}: upgrade the client"
+            )
+        else:
+            message = (
+                f"server table 0x{server_table:016x}, client table 0x{TABLE_HASH:016x}: "
+                "upgrade the client"
+            )
+        super().__init__(message)
 
 
 class InvalidChecksumError(ProtocolError):
     """CRC32 checksum validation failed."""
-
-    pass
-
-
-class InvalidReservedFieldError(ProtocolError):
-    """Reserved field contains non-zero value."""
 
     pass
 
