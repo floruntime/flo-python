@@ -32,9 +32,9 @@ asyncio.run(main())
 ## Features
 
 - **KV Store**: Versioned key-value storage with MVCC, TTL, and optimistic locking
-- **Queues**: Priority-based task queues with visibility timeout and dead letter queues
+- **Queues**: Priority task queues (currently at-most-once: dequeue hands each message out once)
 - **Streams**: Append-only logs with consumer groups for distributed processing
-- **Actions**: Registered tasks with configurable timeouts, retries, and idempotency
+- **Actions**: Registered tasks with configurable timeouts and retries
 - **Workers**: Distributed task execution with lease management and heartbeats
 - **Async/await**: Native asyncio support for high-performance applications
 - **Type hints**: Full type annotations for IDE support
@@ -102,9 +102,6 @@ result = await client.kv.scan("user:", ScanOptions(limit=100))
 while result.has_more:
     # Process entries...
     result = await client.kv.scan("user:", ScanOptions(cursor=result.cursor, limit=100))
-
-# Keys only (more efficient when you don't need values)
-result = await client.kv.scan("user:", ScanOptions(keys_only=True))
 ```
 
 ### History
@@ -128,17 +125,15 @@ from flo import EnqueueOptions
 # Simple enqueue
 seq = await client.queue.enqueue("tasks", b'{"task": "process"}')
 
-# With priority (higher = more urgent, 0-255)
+# With priority (0-255, lower is taken first; default 0)
 seq = await client.queue.enqueue("tasks", payload, EnqueueOptions(priority=10))
-
-# With delay (message invisible for 60 seconds)
-seq = await client.queue.enqueue("tasks", payload, EnqueueOptions(delay_ms=60000))
-
-# With deduplication key
-seq = await client.queue.enqueue("tasks", payload, EnqueueOptions(dedup_key="task-123"))
 ```
 
 ### Dequeue
+
+Queues are currently at-most-once: a dequeue acknowledges each message as it
+hands it out. A message is not redelivered in normal operation, even if the
+consumer crashes while handling it, so handle failures in your own code.
 
 ```python
 from flo import DequeueOptions
@@ -150,67 +145,23 @@ for msg in result.messages:
 
 # Long polling (wait up to 30s for messages)
 result = await client.queue.dequeue("tasks", 10, DequeueOptions(block_ms=30000))
-
-# Custom visibility timeout (message invisible for 60s)
-result = await client.queue.dequeue("tasks", 10, DequeueOptions(visibility_timeout_ms=60000))
 ```
 
-### Ack/Nack
+### Ack/Nack and the Dead Letter Queue
 
-```python
-from flo import NackOptions
-
-result = await client.queue.dequeue("tasks", 10)
-for msg in result.messages:
-    try:
-        process(msg.payload)
-        # Acknowledge successful processing
-        await client.queue.ack("tasks", [msg.seq])
-    except Exception:
-        # Retry the message
-        await client.queue.nack("tasks", [msg.seq])
-        # Or send to DLQ
-        await client.queue.nack("tasks", [msg.seq], NackOptions(to_dlq=True))
-```
-
-### Dead Letter Queue
-
-```python
-from flo import DlqListOptions
-
-# List DLQ messages
-result = await client.queue.dlq_list("tasks", DlqListOptions(limit=100))
-for msg in result.messages:
-    print(f"Failed message {msg.seq}: {msg.payload}")
-
-# Requeue DLQ messages
-seqs = [msg.seq for msg in result.messages]
-await client.queue.dlq_requeue("tasks", seqs)
-```
+`queue.ack`, `queue.nack`, `queue.dlq_list` and `queue.dlq_requeue` exist, but
+while queues are at-most-once they do nothing useful: a dequeued message is
+already acknowledged, so ack and nack have no effect on it, nack does not
+retry it, and messages don't reach the DLQ in normal use.
 
 ### Peek
 
 ```python
-# Peek at messages without creating leases (no visibility timeout)
+# Peek at messages without removing them
 result = await client.queue.peek("tasks", 5)
 for msg in result.messages:
     print(f"Message {msg.seq}: {msg.payload}")
 # Messages remain visible to other consumers
-```
-
-### Touch (Lease Renewal)
-
-```python
-# Renew lease on messages during long-running processing
-result = await client.queue.dequeue("tasks", 1)
-msg = result.messages[0]
-
-# Long running task - periodically touch to prevent visibility timeout
-for chunk in process_in_chunks(msg.payload):
-    await process_chunk(chunk)
-    await client.queue.touch("tasks", [msg.seq])  # Renew lease
-
-await client.queue.ack("tasks", [msg.seq])
 ```
 
 ## Stream Operations
@@ -322,22 +273,12 @@ await client.action.register(
 ### Invoke an Action
 
 ```python
-from flo import ActionInvokeOptions
-
 # Invoke an action
 result = await client.action.invoke(
     "process-image",
     b'{"image_url": "https://example.com/image.jpg"}',
-    ActionInvokeOptions(priority=10)
 )
 print(f"Run ID: {result.run_id}")
-
-# Invoke with idempotency key (prevents duplicate runs)
-result = await client.action.invoke(
-    "process-image",
-    payload,
-    ActionInvokeOptions(idempotency_key="order-123-image")
-)
 ```
 
 ### Check Action Status

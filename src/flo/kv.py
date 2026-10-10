@@ -272,7 +272,7 @@ class KVOperations:
 
         Args:
             prefix: Key prefix to scan.
-            options: Optional scan options (cursor, limit, keys_only).
+            options: Optional scan options (cursor, limit).
 
         Returns:
             ScanResult with entries, cursor, and has_more flag.
@@ -287,20 +287,11 @@ class KVOperations:
             result = await client.kv.scan("user:", ScanOptions(limit=100))
             while result.has_more:
                 result = await client.kv.scan("user:", ScanOptions(cursor=result.cursor))
-
-            # Keys only (more efficient)
-            result = await client.kv.scan("user:", ScanOptions(keys_only=True))
         """
         opts = options or ScanOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
         prefix_bytes = prefix.encode("utf-8") if isinstance(prefix, str) else prefix
-
-        # Build TLV options (keys_only only — limit is in value now)
-        builder = OptionsBuilder()
-
-        if opts.keys_only:
-            builder.add_u8(OptionTag.KEYS_ONLY, 1)
 
         # Value: [limit:u32][cursor...]
         limit = opts.limit if opts.limit is not None else 0  # 0 = server default
@@ -312,7 +303,7 @@ class KVOperations:
             namespace,
             prefix_bytes,
             value,
-            builder.build(),
+            b"",
         )
 
         return parse_scan_response(response.data)

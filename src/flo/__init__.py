@@ -135,7 +135,6 @@ from .types import (
     StreamTrimOptions,
     StreamTrimResult,
     TaskAssignment,
-    TouchOptions,
     VersionEntry,
     WorkerAwaitOptions,
     WorkerAwaitResult,
@@ -255,7 +254,6 @@ __all__ = [
     "DlqListOptions",
     "DlqRequeueOptions",
     "PeekOptions",
-    "TouchOptions",
     # Stream types
     "StreamID",
     "StorageTier",

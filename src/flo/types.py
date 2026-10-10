@@ -41,11 +41,6 @@ class OpCode(IntEnum):
 
     # ── System (0x000 – 0x00F) ──
     PING = 0x000
-    PONG = 0x001
-    ERROR_RESPONSE = 0x002
-    AUTH = 0x003
-    SET_DURABILITY = 0x004
-    OK = 0x005
 
     # ── Namespace (0x010 – 0x02F) ──
     NAMESPACE_CREATE = 0x010
@@ -54,12 +49,6 @@ class OpCode(IntEnum):
     NAMESPACE_INFO = 0x013
     NAMESPACE_CONFIG_SET = 0x014
     NAMESPACE_CONFIG_GET = 0x015
-    NAMESPACE_CREATE_RESPONSE = 0x020
-    NAMESPACE_DELETE_RESPONSE = 0x021
-    NAMESPACE_LIST_RESPONSE = 0x022
-    NAMESPACE_INFO_RESPONSE = 0x023
-    NAMESPACE_CONFIG_SET_RESPONSE = 0x024
-    NAMESPACE_CONFIG_GET_RESPONSE = 0x025
 
     # ── Cluster (0x030 – 0x04F) ──
     CLUSTER_STATUS = 0x030
@@ -69,9 +58,6 @@ class OpCode(IntEnum):
     CLUSTER_TRANSFER_LEADER = 0x034
     CLUSTER_ADD_NODE = 0x035
     CLUSTER_REMOVE_NODE = 0x036
-    CLUSTER_STATUS_RESPONSE = 0x040
-    CLUSTER_MEMBERS_RESPONSE = 0x041
-    CLUSTER_JOIN_RESPONSE = 0x042
 
     # ── KV (0x100 – 0x12F) ──
     KV_PUT = 0x100
@@ -80,11 +66,6 @@ class OpCode(IntEnum):
     KV_DELETE = 0x103
     KV_SCAN = 0x104
     KV_HISTORY = 0x105
-    KV_GET_RESPONSE = 0x106
-    KV_MGET_RESPONSE = 0x107
-    KV_PUT_RESPONSE = 0x108
-    KV_SCAN_RESPONSE = 0x109
-    KV_HISTORY_RESPONSE = 0x10A
     # KV Extended (atomic counters, JSON ops)
     KV_INCR = 0x10B
     KV_JSON_GET = 0x10C
@@ -98,27 +79,14 @@ class OpCode(IntEnum):
     KV_TOUCH = 0x113
     KV_PERSIST = 0x114
     KV_EXISTS = 0x115
-    KV_INCR_RESPONSE = 0x116
-    KV_JSON_RESPONSE = 0x117
-    KV_EXISTS_RESPONSE = 0x118
-    KV_TXN_RESPONSE = 0x119
 
     # ── Streams (0x130 – 0x14F) ──
     STREAM_APPEND = 0x130
     STREAM_READ = 0x131
     STREAM_TRIM = 0x132
     STREAM_INFO = 0x133
-    STREAM_APPEND_RESPONSE = 0x134
-    STREAM_READ_RESPONSE = 0x135
-    STREAM_EVENT = 0x136
-    STREAM_SUBSCRIBE = 0x137
-    STREAM_UNSUBSCRIBE = 0x138
-    STREAM_SUBSCRIBED = 0x139
-    STREAM_UNSUBSCRIBED = 0x13A
     STREAM_LIST = 0x13B
-    STREAM_LIST_RESPONSE = 0x13C
     STREAM_CREATE = 0x13D
-    STREAM_CREATE_RESPONSE = 0x13E
     STREAM_ALTER = 0x13F
 
     # ── Stream Consumer Groups (0x150 – 0x16F) ──
@@ -130,7 +98,6 @@ class OpCode(IntEnum):
     STREAM_GROUP_CLAIM = 0x155
     STREAM_GROUP_PENDING = 0x156
     STREAM_GROUP_CONFIGURE_SWEEPER = 0x157
-    STREAM_GROUP_READ_RESPONSE = 0x158
     STREAM_GROUP_NACK = 0x159
     STREAM_GROUP_TOUCH = 0x15A
     STREAM_GROUP_INFO = 0x15B
@@ -140,29 +107,14 @@ class OpCode(IntEnum):
     QUEUE_ENQUEUE = 0x170
     QUEUE_DEQUEUE = 0x171
     QUEUE_COMPLETE = 0x172
-    QUEUE_EXTEND_LEASE = 0x173
     QUEUE_FAIL = 0x174
-    QUEUE_FAIL_AUTO = 0x175
     QUEUE_DLQ_LIST = 0x176
     QUEUE_DLQ_DELETE = 0x177
     QUEUE_DLQ_REQUEUE = 0x178
-    QUEUE_DLQ_STATS = 0x179
-    QUEUE_PROMOTE_DUE = 0x17A
     QUEUE_STATS = 0x17B
     QUEUE_PEEK = 0x17C
-    QUEUE_TOUCH = 0x17D
-    QUEUE_BATCH_ENQUEUE = 0x17E
     QUEUE_PURGE = 0x17F
-    QUEUE_ENQUEUE_RESPONSE = 0x190
-    QUEUE_DEQUEUE_RESPONSE = 0x191
-    QUEUE_DLQ_LIST_RESPONSE = 0x192
-    QUEUE_STATS_RESPONSE = 0x193
-    QUEUE_PEEK_RESPONSE = 0x194
-    QUEUE_TOUCH_RESPONSE = 0x195
-    QUEUE_BATCH_ENQUEUE_RESPONSE = 0x196
-    QUEUE_PURGE_RESPONSE = 0x197
     QUEUE_LIST = 0x198
-    QUEUE_LIST_RESPONSE = 0x199
 
     # ── Time-Series (0x1A0 – 0x1BF) ──
     TS_WRITE = 0x1A0
@@ -172,13 +124,6 @@ class OpCode(IntEnum):
     TS_LIST = 0x1A4
     TS_DELETE = 0x1A5
     TS_RETENTION = 0x1A6
-    TS_WRITE_RESPONSE = 0x1A7
-    TS_READ_RESPONSE = 0x1A8
-    TS_QUERY_RESPONSE = 0x1A9
-    TS_FLOQL_RESPONSE = 0x1AA
-    TS_LIST_RESPONSE = 0x1AB
-    TS_DELETE_RESPONSE = 0x1AC
-    TS_RETENTION_RESPONSE = 0x1AD
 
     # ── Actions (0x300 – 0x31F) ──
     ACTION_REGISTER = 0x300
@@ -191,12 +136,6 @@ class OpCode(IntEnum):
     ACTION_COMPLETE = 0x307
     ACTION_FAIL = 0x308
     ACTION_TOUCH = 0x309
-    ACTION_REGISTER_RESPONSE = 0x310
-    ACTION_INVOKE_RESPONSE = 0x311
-    ACTION_STATUS_RESPONSE = 0x312
-    ACTION_LIST_RESPONSE = 0x313
-    ACTION_LIST_RUNS_RESPONSE = 0x314
-    ACTION_TASK_ASSIGNMENT = 0x315
 
     # ── Workers (0x320 – 0x33F) ──
     WORKER_REGISTER = 0x320
@@ -205,10 +144,6 @@ class OpCode(IntEnum):
     WORKER_LIST = 0x323
     WORKER_INFO = 0x324
     WORKER_DRAIN = 0x325
-    WORKER_REGISTER_RESPONSE = 0x330
-    WORKER_LIST_RESPONSE = 0x331
-    WORKER_INFO_RESPONSE = 0x332
-    WORKER_DRAIN_RESPONSE = 0x333
 
     # ── Workflows (0x340 – 0x35F) ──
     WORKFLOW_CREATE = 0x340
@@ -222,15 +157,6 @@ class OpCode(IntEnum):
     WORKFLOW_DISABLE = 0x348
     WORKFLOW_ENABLE = 0x349
     WORKFLOW_LIST_DEFINITIONS = 0x34A
-    WORKFLOW_CREATE_RESPONSE = 0x350
-    WORKFLOW_START_RESPONSE = 0x351
-    WORKFLOW_STATUS_RESPONSE = 0x352
-    WORKFLOW_HISTORY_RESPONSE = 0x353
-    WORKFLOW_LIST_RUNS_RESPONSE = 0x354
-    WORKFLOW_GET_DEFINITION_RESPONSE = 0x355
-    WORKFLOW_DISABLE_RESPONSE = 0x356
-    WORKFLOW_ENABLE_RESPONSE = 0x357
-    WORKFLOW_LIST_DEFINITIONS_RESPONSE = 0x358
 
     # ── Processing (0x360 – 0x37F) ──
     PROCESSING_SUBMIT = 0x360
@@ -241,14 +167,6 @@ class OpCode(IntEnum):
     PROCESSING_SAVEPOINT = 0x365
     PROCESSING_RESTORE = 0x366
     PROCESSING_RESCALE = 0x367
-    PROCESSING_SUBMIT_RESPONSE = 0x370
-    PROCESSING_STOP_RESPONSE = 0x371
-    PROCESSING_CANCEL_RESPONSE = 0x372
-    PROCESSING_STATUS_RESPONSE = 0x373
-    PROCESSING_LIST_RESPONSE = 0x374
-    PROCESSING_SAVEPOINT_RESPONSE = 0x375
-    PROCESSING_RESTORE_RESPONSE = 0x376
-    PROCESSING_RESCALE_RESPONSE = 0x377
 
 
 class StatusCode(IntEnum):
@@ -298,19 +216,12 @@ class OptionTag(IntEnum):
     IF_NOT_EXISTS = 0x03  # void: Only set if key doesn't exist (NX)
     IF_EXISTS = 0x04  # void: Only set if key exists (XX)
     LIMIT = 0x05  # u32: Maximum number of results for scan/list operations
-    KEYS_ONLY = 0x06  # u8: Skip values in scan response (0/1)
-    CURSOR = 0x07  # bytes: Pagination cursor (ShardWalker format)
     ROUTING_KEY = 0x08  # string: Explicit routing key for shard co-location
     TXN_ID = 0x09  # u64: Transaction ID for per-shard transactions
 
     # Queue Options (0x10 - 0x1F)
-    PRIORITY = 0x10  # u8: Message priority (0-255, higher = more urgent)
-    DELAY_MS = 0x11  # u64: Delay before message becomes visible
-    VISIBILITY_TIMEOUT_MS = 0x12  # u32: How long message is invisible after dequeue
-    DEDUP_KEY = 0x13  # string: Deduplication key
-    MAX_RETRIES = 0x14  # u8: Maximum retry attempts before DLQ
+    PRIORITY = 0x10  # u8: Message priority (0-255, lower is taken first)
     COUNT = 0x15  # u32: Number of messages to dequeue
-    SEND_TO_DLQ = 0x16  # u8: Whether to send failed messages to DLQ (0/1)
     BLOCK_MS = 0x17  # u32: Block timeout - wait for data (0=don't wait, max 300000)
     WAIT_MS = 0x18  # u32: Watch timeout - wait for NEXT version change (0=don't wait, max 300000)
 
@@ -328,27 +239,6 @@ class OptionTag(IntEnum):
     # Consumer Group Options (0x30 - 0x3F)
     ACK_TIMEOUT_MS = 0x30  # u32: Time before unacked message auto-redelivers
     MAX_DELIVER = 0x31  # u8: Max delivery attempts before DLQ (default: 10)
-    SUBSCRIPTION_MODE = 0x32  # u8: 0=shared, 1=exclusive, 2=key_shared
-    REDELIVERY_DELAY_MS = 0x33  # u32: Delay before NACK'd message becomes visible
-    CONSUMER_TIMEOUT_MS = 0x34  # u32: Remove consumer from group if no activity
-    NO_ACK = 0x35  # void: Auto-ack on delivery (at-most-once)
-    IDLE_TIMEOUT_MS = 0x36  # u64: Min idle time for claiming stuck messages
-    MAX_ACK_PENDING = 0x37  # u32: Max unacked messages per consumer
-    EXTEND_ACK_MS = 0x38  # u32: Amount of time to extend ack deadline
-    MAX_STANDBYS = 0x39  # u16: Max standby consumers in exclusive mode
-    NUM_SLOTS = 0x3A  # u16: Number of hash slots for key_shared mode
-
-    # Worker/Action Options (0x40 - 0x4F)
-    WORKER_ID = 0x40  # string: Worker identifier
-    EXTEND_MS = 0x41  # u32: Lease extension time in milliseconds
-    MAX_TASKS = 0x42  # u32: Maximum tasks to return in batch
-    RETRY = 0x43  # u8: Whether to retry on failure (0/1)
-
-    # Workflow Options (0x50 - 0x5F)
-    TIMEOUT_MS = 0x50  # u64: Workflow/activity timeout
-    RETRY_POLICY = 0x51  # bytes: Serialized retry policy
-    CORRELATION_ID = 0x52  # string: Correlation ID for tracing
-    SUBSCRIPTION_ID = 0x53  # u64: Subscription ID for stream subscriptions
 
     # Time-Series Options (0x60 - 0x6F)
     TS_FROM_MS = 0x60  # i64: Start of time range (inclusive, unix ms)
@@ -357,11 +247,9 @@ class OptionTag(IntEnum):
     TS_AGGREGATION = 0x63  # string: Aggregation function name (avg, sum, count, min, max)
     TS_FIELD = 0x64  # string: Field name filter (empty = "value")
     TS_TAGS = 0x65  # string: Comma-separated tag filters "key=val,key2=val2"
-    TS_PRECISION = 0x66  # u8: Timestamp precision (0=ns, 1=us, 2=ms, 3=s)
     TS_TIMESTAMP = 0x67  # i64: Explicit timestamp for write (0 = server-assigned)
     TS_RAW_TTL = 0x68  # string: Raw data TTL (e.g., "7d")
     TS_DOWNSAMPLE = 0x69  # string: Downsample rule (e.g., "1m:avg:30d")
-    TS_BATCH = 0x6A  # void: Flag indicating batch/line-protocol mode
 
 
 # =============================================================================
@@ -374,7 +262,7 @@ class KVEntry:
     """KV entry from scan results."""
 
     key: bytes
-    value: bytes | None  # None if keys_only=True
+    value: bytes | None
 
 
 @dataclass
@@ -563,7 +451,7 @@ class PendingEntry:
 
     A delivered-but-unacked message. ``delivery_count`` is how many times the
     entry has been delivered; ``consumer`` is the consumer that currently owns
-    it. (FLO-102)
+    it.
     """
 
     id: StreamID = None  # type: ignore[assignment]
@@ -573,7 +461,7 @@ class PendingEntry:
 
 @dataclass
 class StreamClaimResult:
-    """Result of a :meth:`StreamOperations.group_claim` cursor page (FLO-102).
+    """Result of a :meth:`StreamOperations.group_claim` cursor page.
 
     ``records`` carry payload + headers (same shape as ``group_read``).
     ``next_cursor`` is the ``start_id`` to pass on the next ``group_claim``
@@ -636,7 +524,6 @@ class ScanOptions:
     namespace: str | None = None
     cursor: bytes | None = None
     limit: int | None = None
-    keys_only: bool = False
 
 
 @dataclass
@@ -689,9 +576,7 @@ class EnqueueOptions:
     """Options for queue enqueue operations."""
 
     namespace: str | None = None
-    priority: int = 0
-    delay_ms: int | None = None
-    dedup_key: str | None = None
+    priority: int = 0  # 0-255, lower is taken first
 
 
 @dataclass
@@ -699,7 +584,6 @@ class DequeueOptions:
     """Options for queue dequeue operations."""
 
     namespace: str | None = None
-    visibility_timeout_ms: int | None = None
     block_ms: int | None = None  # Wait for messages (0 = don't wait, max 300000)
 
 
@@ -715,7 +599,6 @@ class NackOptions:
     """Options for queue nack operations."""
 
     namespace: str | None = None
-    to_dlq: bool = False
 
 
 @dataclass
@@ -723,7 +606,6 @@ class DlqListOptions:
     """Options for DLQ list operations."""
 
     namespace: str | None = None
-    limit: int = 100
 
 
 @dataclass
@@ -736,13 +618,6 @@ class DlqRequeueOptions:
 @dataclass
 class PeekOptions:
     """Options for queue peek operations."""
-
-    namespace: str | None = None
-
-
-@dataclass
-class TouchOptions:
-    """Options for queue touch (lease renewal) operations."""
 
     namespace: str | None = None
 
@@ -832,7 +707,6 @@ class StreamGroupNackOptions:
 
     namespace: str | None = None
     consumer: str = ""  # Consumer ID (required for correct nack matching)
-    redelivery_delay_ms: int | None = None  # Delay before message becomes visible again
 
 
 # =============================================================================
@@ -994,7 +868,6 @@ class WorkerAwaitOptions:
 
     namespace: str | None = None
     block_ms: int | None = None  # Block waiting for task (None = 30000, 0 = don't wait, max 300000)
-    timeout_ms: int | None = None
 
 
 @dataclass

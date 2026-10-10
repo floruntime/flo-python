@@ -61,10 +61,10 @@ class TestOptionsBuilder:
 
     def test_add_bytes(self) -> None:
         builder = OptionsBuilder()
-        builder.add_bytes(OptionTag.DEDUP_KEY, b"abc123")
+        builder.add_bytes(OptionTag.ROUTING_KEY, b"abc123")
         result = builder.build()
 
-        assert result[0] == 0x13  # DEDUP_KEY tag
+        assert result[0] == 0x08  # ROUTING_KEY tag
         assert result[1] == 6  # length
         assert result[2:] == b"abc123"
 
@@ -79,7 +79,7 @@ class TestOptionsBuilder:
         builder = OptionsBuilder()
         builder.add_u64(OptionTag.TTL_MS, 3_600_000)
         builder.add_u8(OptionTag.PRIORITY, 5)
-        builder.add_bytes(OptionTag.DEDUP_KEY, b"abc")
+        builder.add_bytes(OptionTag.ROUTING_KEY, b"abc")
         result = builder.build()
 
         assert len(result) == 10 + 3 + 5  # u64(10) + u8(3) + bytes(2+3)
@@ -87,7 +87,7 @@ class TestOptionsBuilder:
     def test_bytes_too_large(self) -> None:
         builder = OptionsBuilder()
         with pytest.raises(ValueError, match="too large"):
-            builder.add_bytes(OptionTag.DEDUP_KEY, b"x" * 256)
+            builder.add_bytes(OptionTag.ROUTING_KEY, b"x" * 256)
 
 
 class TestOptionsIterator:
@@ -305,11 +305,8 @@ class TestParseScanResponse:
 
     def test_parse_scan_response(self) -> None:
         # Build scan response:
-        # [has_more:u8][cursor_len:u32][cursor][count:u32][entries...]
+        # [count:u32][entries...][has_more:u8][cursor_len:u16][cursor]
         data = bytearray()
-        data.append(1)  # has_more = true
-        data.extend(struct.pack("<I", 4))  # cursor_len
-        data.extend(b"curs")  # cursor
         data.extend(struct.pack("<I", 2))  # count
 
         # Entry 1: key="key1", value="val1"
@@ -323,6 +320,10 @@ class TestParseScanResponse:
         data.extend(b"key2")
         data.extend(struct.pack("<I", 0))
 
+        data.append(1)  # has_more = true
+        data.extend(struct.pack("<H", 4))  # cursor_len
+        data.extend(b"curs")  # cursor
+
         result = parse_scan_response(bytes(data))
 
         assert result.has_more is True
@@ -332,6 +333,15 @@ class TestParseScanResponse:
         assert result.entries[0].value == b"val1"
         assert result.entries[1].key == b"key2"
         assert result.entries[1].value is None
+
+    def test_parse_scan_last_page(self) -> None:
+        data = struct.pack("<I", 0) + b"\x00" + struct.pack("<H", 0)
+
+        result = parse_scan_response(data)
+
+        assert result.entries == []
+        assert result.has_more is False
+        assert result.cursor is None
 
 
 class TestParseDequeueResponse:
@@ -417,7 +427,7 @@ class TestBuildStreamBatchValue:
 
 
 class TestGroupPendingClaimWire:
-    """Tests for the FLO-102 PEL pending/claim wire format."""
+    """Tests for the consumer-group pending-list (PEL) pending/claim wire format."""
 
     def test_serialize_group_pending_no_consumer(self) -> None:
         value = serialize_group_pending_value("grp")

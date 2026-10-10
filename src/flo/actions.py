@@ -280,7 +280,7 @@ class WorkerOperations:
         Args:
             worker_id: Worker identifier.
             task_types: Task types to listen for.
-            options: Optional await options (block_ms, timeout_ms).
+            options: Optional await options (block_ms).
 
         Returns:
             WorkerAwaitResult with task if available.
@@ -290,12 +290,9 @@ class WorkerOperations:
 
         value = serialize_worker_await_value(task_types)
 
-        # Build options for block_ms and timeout_ms
         options_builder = OptionsBuilder()
         if opts.block_ms is not None:
             options_builder.add_u32(OptionTag.BLOCK_MS, opts.block_ms)
-        if opts.timeout_ms is not None:
-            options_builder.add_u32(OptionTag.TIMEOUT_MS, opts.timeout_ms)
 
         response = await self._client._send_and_check(
             OpCode.ACTION_AWAIT,

@@ -16,7 +16,6 @@ from .types import (
     OpCode,
     OptionTag,
     PeekOptions,
-    TouchOptions,
 )
 from .wire import OptionsBuilder, parse_dequeue_response, parse_enqueue_response, serialize_seqs
 
@@ -41,7 +40,7 @@ class QueueOperations:
         Args:
             queue: Queue name.
             payload: Message payload.
-            options: Optional enqueue options (priority, delay, dedup_key).
+            options: Optional enqueue options (priority).
 
         Returns:
             Sequence number of the enqueued message.
@@ -50,14 +49,8 @@ class QueueOperations:
             # Simple enqueue
             seq = await client.queue.enqueue("tasks", b'{"task": "process"}')
 
-            # With priority (higher = more urgent)
+            # With priority (0-255, lower is taken first; default 0)
             seq = await client.queue.enqueue("tasks", payload, EnqueueOptions(priority=10))
-
-            # With delay
-            seq = await client.queue.enqueue("tasks", payload, EnqueueOptions(delay_ms=60000))
-
-            # With deduplication
-            seq = await client.queue.enqueue("tasks", payload, EnqueueOptions(dedup_key="task-123"))
         """
         opts = options or EnqueueOptions()
         namespace = self._client.get_namespace(opts.namespace)
@@ -67,12 +60,6 @@ class QueueOperations:
 
         if opts.priority != 0:
             builder.add_u8(OptionTag.PRIORITY, opts.priority)
-
-        if opts.delay_ms is not None:
-            builder.add_u64(OptionTag.DELAY_MS, opts.delay_ms)
-
-        if opts.dedup_key is not None:
-            builder.add_bytes(OptionTag.DEDUP_KEY, opts.dedup_key.encode("utf-8"))
 
         response = await self._client._send_and_check(
             OpCode.QUEUE_ENQUEUE,
@@ -92,10 +79,14 @@ class QueueOperations:
     ) -> DequeueResult:
         """Dequeue messages from a queue.
 
+        Queues are currently at-most-once: the server acknowledges each
+        message as it hands it out, so it is not redelivered in normal
+        operation, even if the consumer crashes.
+
         Args:
             queue: Queue name.
             count: Maximum number of messages to dequeue.
-            options: Optional dequeue options (visibility_timeout, block_ms).
+            options: Optional dequeue options (block_ms).
 
         Returns:
             DequeueResult containing list of messages.
@@ -105,18 +96,11 @@ class QueueOperations:
             result = await client.queue.dequeue("tasks", 10)
             for msg in result.messages:
                 process(msg.payload)
-                await client.queue.ack("tasks", [msg.seq])
 
             # With long polling (wait up to 30s for messages)
             result = await client.queue.dequeue(
                 "tasks", 10,
                 DequeueOptions(block_ms=30000)
-            )
-
-            # With custom visibility timeout
-            result = await client.queue.dequeue(
-                "tasks", 10,
-                DequeueOptions(visibility_timeout_ms=60000)
             )
         """
         opts = options or DequeueOptions()
@@ -125,9 +109,6 @@ class QueueOperations:
         # Build TLV options
         builder = OptionsBuilder()
         builder.add_u32(OptionTag.COUNT, count)
-
-        if opts.visibility_timeout_ms is not None:
-            builder.add_u32(OptionTag.VISIBILITY_TIMEOUT_MS, opts.visibility_timeout_ms)
 
         if opts.block_ms is not None:
             builder.add_u32(OptionTag.BLOCK_MS, opts.block_ms)
@@ -148,21 +129,15 @@ class QueueOperations:
         seqs: list[int],
         options: AckOptions | None = None,
     ) -> None:
-        """Acknowledge messages as successfully processed.
+        """Acknowledge messages.
+
+        Queues are currently at-most-once: dequeue already acknowledges each
+        message it hands out, so this has no effect on a dequeued message.
 
         Args:
             queue: Queue name.
             seqs: Sequence numbers of messages to acknowledge.
             options: Optional ack options.
-
-        Example:
-            result = await client.queue.dequeue("tasks", 10)
-            for msg in result.messages:
-                try:
-                    process(msg.payload)
-                    await client.queue.ack("tasks", [msg.seq])
-                except Exception:
-                    await client.queue.nack("tasks", [msg.seq])
         """
         if not seqs:
             return
@@ -185,31 +160,22 @@ class QueueOperations:
         seqs: list[int],
         options: NackOptions | None = None,
     ) -> None:
-        """Negative acknowledge messages (retry or send to DLQ).
+        """Negatively acknowledge messages.
+
+        Queues are currently at-most-once: dequeue already acknowledges each
+        message it hands out, so this has no effect on a dequeued message and
+        does not retry it.
 
         Args:
             queue: Queue name.
             seqs: Sequence numbers of messages to nack.
-            options: Optional nack options (to_dlq).
-
-        Example:
-            # Retry the message
-            await client.queue.nack("tasks", [msg.seq])
-
-            # Send to DLQ (don't retry)
-            await client.queue.nack("tasks", [msg.seq], NackOptions(to_dlq=True))
+            options: Optional nack options.
         """
         if not seqs:
             return
 
         opts = options or NackOptions()
         namespace = self._client.get_namespace(opts.namespace)
-
-        # Build TLV options
-        builder = OptionsBuilder()
-
-        if opts.to_dlq:
-            builder.add_u8(OptionTag.SEND_TO_DLQ, 1)
 
         value = serialize_seqs(seqs)
 
@@ -218,7 +184,6 @@ class QueueOperations:
             namespace,
             queue.encode("utf-8"),
             value,
-            builder.build(),
         )
 
     async def dlq_list(
@@ -228,31 +193,29 @@ class QueueOperations:
     ) -> DequeueResult:
         """List messages in the Dead Letter Queue.
 
+        Queues are currently at-most-once, so messages don't reach the DLQ in
+        normal use.
+
         Args:
             queue: Queue name.
-            options: Optional DLQ list options (limit).
+            options: Optional DLQ list options (namespace).
 
         Returns:
             DequeueResult containing list of DLQ messages.
 
         Example:
-            result = await client.queue.dlq_list("tasks", DlqListOptions(limit=100))
+            result = await client.queue.dlq_list("tasks")
             for msg in result.messages:
                 print(f"Failed message {msg.seq}: {msg.payload}")
         """
         opts = options or DlqListOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        # Build TLV options
-        builder = OptionsBuilder()
-        builder.add_u32(OptionTag.LIMIT, opts.limit)
-
         response = await self._client._send_and_check(
             OpCode.QUEUE_DLQ_LIST,
             namespace,
             queue.encode("utf-8"),
             b"",
-            builder.build(),
         )
 
         return parse_dequeue_response(response.data)
@@ -264,6 +227,9 @@ class QueueOperations:
         options: DlqRequeueOptions | None = None,
     ) -> None:
         """Move messages from DLQ back to the main queue.
+
+        Queues are currently at-most-once, so messages don't reach the DLQ in
+        normal use.
 
         Args:
             queue: Queue name.
@@ -332,45 +298,3 @@ class QueueOperations:
         )
 
         return parse_dequeue_response(response.data)
-
-    async def touch(
-        self,
-        queue: str,
-        seqs: list[int],
-        options: TouchOptions | None = None,
-    ) -> None:
-        """Renew lease on messages to prevent visibility timeout.
-
-        Call this periodically during long-running processing to prevent
-        the message from becoming visible again before you're done.
-
-        Args:
-            queue: Queue name.
-            seqs: Sequence numbers of messages to touch.
-            options: Optional touch options.
-
-        Example:
-            result = await client.queue.dequeue("tasks", 1)
-            msg = result.messages[0]
-
-            # Long running task - renew lease periodically
-            for chunk in process_in_chunks(msg.payload):
-                await process_chunk(chunk)
-                await client.queue.touch("tasks", [msg.seq])
-
-            await client.queue.ack("tasks", [msg.seq])
-        """
-        if not seqs:
-            return
-
-        opts = options or TouchOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = serialize_seqs(seqs)
-
-        await self._client._send_and_check(
-            OpCode.QUEUE_TOUCH,
-            namespace,
-            queue.encode("utf-8"),
-            value,
-        )
