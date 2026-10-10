@@ -17,7 +17,39 @@ VERSION: int = 0x02
 # The hash of the op table this SDK was built for, written into every request
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses.
-TABLE_HASH: int = 0x4E9243EEAB771A02
+TABLE_HASH: int = 0x2827F6F0631754FE
+
+
+class Reason(IntEnum):
+    """Why the server refused a request. Mirrors the server's list; the table
+    hash covers it, so a server can't send one this SDK doesn't know."""
+
+    UNKNOWN_OP = 1
+    MALFORMED = 2
+    FIELD_TOO_LONG = 3
+    OUT_OF_RANGE = 4
+    LEADER_UNKNOWN = 5
+    SHARD_BUSY = 6
+    TABLE_MISMATCH = 7
+    UNKNOWN_FLAG = 8
+    INTERNAL = 9
+    COMMITTED_NOT_APPLIED = 10
+    ANSWER_LOST = 11
+    # A refusal from an op family the server hasn't classified yet.
+    UNCLASSIFIED = 12
+
+
+class Ran(IntEnum):
+    """Whether a refused request took effect: retry logic reads this, not the
+    message."""
+
+    NO = 0
+    # It took effect; don't resend it.
+    YES = 1
+    # It may still take effect; check before resending.
+    UNKNOWN = 2
+
+
 HEADER_SIZE: int = 32
 
 # Size limits (for client-side validation)

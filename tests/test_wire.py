@@ -170,7 +170,7 @@ class TestSerializeRequest:
         assert request_id == 42
         assert op_code == OpCode.KV_GET
         assert flags == 0
-        assert table_hash == 0x4E9243EEAB771A02
+        assert table_hash == 0x2827F6F0631754FE
 
     def test_request_with_value(self) -> None:
         request = serialize_request(

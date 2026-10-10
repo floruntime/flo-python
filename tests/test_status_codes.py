@@ -9,18 +9,24 @@ import pytest
 from flo import FloClient
 from flo.exceptions import (
     GenericServerError,
+    IncompleteResponseError,
     ServerError,
     TableMismatchError,
     UnavailableError,
     raise_for_status,
 )
-from flo.types import HEADER_SIZE, MAGIC, TABLE_HASH, VERSION, StatusCode
+from flo.types import HEADER_SIZE, MAGIC, TABLE_HASH, VERSION, Ran, Reason, StatusCode
 from flo.wire import (
     REQUEST_HEADER_FORMAT,
     RESPONSE_HEADER_FORMAT,
     compute_crc32,
     parse_response,
 )
+
+
+def _refusal(message: bytes, reason: Reason = Reason.UNCLASSIFIED, ran: Ran = Ran.NO) -> bytes:
+    """A refusal's body as the server writes it: [reason:u16][ran:u8][message]."""
+    return int(reason).to_bytes(2, "little") + bytes([int(ran)]) + message
 
 
 def _frame(request_id: int, status: int, data: bytes) -> bytes:
@@ -42,7 +48,7 @@ def _frame(request_id: int, status: int, data: bytes) -> bytes:
 
 
 def test_unavailable_maps_to_unavailable_error_with_the_server_message() -> None:
-    resp = parse_response(_frame(1, 12, b"shard 3 is offline"))
+    resp = parse_response(_frame(1, 12, _refusal(b"shard 3 is offline")))
     assert resp.status == StatusCode.UNAVAILABLE
     with pytest.raises(UnavailableError) as raised:
         raise_for_status(resp.status, resp.data)
@@ -51,9 +57,8 @@ def test_unavailable_maps_to_unavailable_error_with_the_server_message() -> None
 
 
 def test_unknown_status_maps_to_generic_error_naming_it() -> None:
-    resp = parse_response(_frame(1, 200, b"something new"))
+    resp = parse_response(_frame(1, 200, _refusal(b"something new", ran=Ran.UNKNOWN)))
     assert int(resp.status) == 200
-    assert resp.data == b"something new"
     with pytest.raises(GenericServerError) as raised:
         raise_for_status(resp.status, resp.data)
     assert str(raised.value) == "Unknown status 200: something new"
@@ -72,7 +77,7 @@ async def _client_answering(first_status: int) -> tuple[FloClient, asyncio.Serve
                 _, payload_len, request_id, *_ = struct.unpack(REQUEST_HEADER_FORMAT, header)
                 await reader.readexactly(payload_len)
                 if served == 0:
-                    reply = _frame(request_id, first_status, b"first reply's message")
+                    reply = _frame(request_id, first_status, _refusal(b"first reply's message"))
                 else:
                     reply = _frame(request_id, 0, struct.pack("<Q", 7) + b"second")
                 served += 1
@@ -119,7 +124,7 @@ def test_an_unknown_status_and_its_error_survive_pickle_and_copy() -> None:
 def test_statuses_without_their_own_error_keep_their_code() -> None:
     for code in (4, 5, 6):
         with pytest.raises(ServerError) as caught:
-            raise_for_status(StatusCode(code), b"why")
+            raise_for_status(StatusCode(code), _refusal(b"why"))
         assert caught.value.status_code == code
 
 
@@ -157,3 +162,18 @@ async def test_an_answer_from_another_table_is_refused_unread_and_drops_the_conn
     assert not client.is_connected
     await client.close()
     server.close()
+
+
+def test_a_refusal_carries_its_reason_and_ran() -> None:
+    body = _refusal(b"do not resend", Reason.COMMITTED_NOT_APPLIED, Ran.YES)
+    with pytest.raises(ServerError) as raised:
+        raise_for_status(StatusCode.INTERNAL_ERROR, body)
+    assert raised.value.reason == Reason.COMMITTED_NOT_APPLIED
+    assert raised.value.ran == Ran.YES
+    assert str(raised.value) == "do not resend"
+
+
+@pytest.mark.parametrize("body", [b"\x01\x00", b"\xff\xff\x00", b"\x01\x00\x09"])
+def test_a_body_that_is_not_a_refusal_is_refused(body: bytes) -> None:
+    with pytest.raises(IncompleteResponseError):
+        raise_for_status(StatusCode.BAD_REQUEST, body)
