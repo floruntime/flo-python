@@ -4,10 +4,11 @@ import struct
 
 import pytest
 
-from flo.exceptions import IncompleteResponseError
+from flo.exceptions import IncompleteResponseError, TableMismatchError
 from flo.types import (
     HEADER_SIZE,
     MAGIC,
+    TABLE_HASH,
     VERSION,
     OpCode,
     OptionTag,
@@ -160,8 +161,8 @@ class TestSerializeRequest:
         assert len(request) > HEADER_SIZE
 
         # Check header
-        magic, payload_len, request_id, crc, op_code, version, flags, reserved = struct.unpack(
-            "<IIQIHBB8s", request[:HEADER_SIZE]
+        magic, payload_len, request_id, crc, op_code, version, flags, table_hash = struct.unpack(
+            "<IIQIHBBQ", request[:HEADER_SIZE]
         )
 
         assert magic == MAGIC
@@ -169,7 +170,7 @@ class TestSerializeRequest:
         assert request_id == 42
         assert op_code == OpCode.KV_GET
         assert flags == 0
-        assert reserved == b"\x00" * 8
+        assert table_hash == 0x4E9243EEAB771A02
 
     def test_request_with_value(self) -> None:
         request = serialize_request(
@@ -250,7 +251,7 @@ class TestParseResponse:
     ) -> bytes:
         """Helper to create a valid response."""
         header_without_crc = struct.pack(
-            "<IIQIBBBB8s",
+            "<IIQIBBBBQ",
             MAGIC,
             len(data),
             request_id,
@@ -259,13 +260,13 @@ class TestParseResponse:
             status,
             0,  # flags
             0,  # _pad
-            b"\x00" * 8,  # reserved
+            TABLE_HASH,
         )
 
         crc = compute_crc32(header_without_crc, data)
 
         header = struct.pack(
-            "<IIQIBBBB8s",
+            "<IIQIBBBBQ",
             MAGIC,
             len(data),
             request_id,
@@ -274,10 +275,26 @@ class TestParseResponse:
             status,
             0,
             0,
-            b"\x00" * 8,
+            TABLE_HASH,
         )
 
         return header + data
+
+    def test_an_answer_from_another_protocol_or_table_is_refused(self) -> None:
+        cases = [
+            (1, 0, "server protocol 1, client protocol 2: upgrade the client"),
+            (
+                VERSION,
+                TABLE_HASH + 1,
+                f"server table 0x{TABLE_HASH + 1:016x}, client table 0x{TABLE_HASH:016x}: "
+                "upgrade the client",
+            ),
+        ]
+        for version, table, message in cases:
+            header = struct.pack("<IIQIBBBBQ", MAGIC, 0, 1, 0, version, 0, 0, 0, table)
+            with pytest.raises(TableMismatchError, match=message) as e:
+                parse_response(header)
+            assert e.value.server_table == table
 
     def test_parse_ok_response(self) -> None:
         response_data = self._make_response(StatusCode.OK, b"value")

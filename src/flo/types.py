@@ -13,7 +13,11 @@ from typing import Any, Generic, Optional, TypeVar
 # =============================================================================
 
 MAGIC: int = 0x004F4C46  # "FLO\0" in little-endian
-VERSION: int = 0x01
+VERSION: int = 0x02
+# The hash of the op table this SDK was built for, written into every request
+# header. A server built from another table refuses the request, and its
+# answers carry its own hash, which this SDK refuses.
+TABLE_HASH: int = 0x4E9243EEAB771A02
 HEADER_SIZE: int = 32
 
 # Size limits (for client-side validation)

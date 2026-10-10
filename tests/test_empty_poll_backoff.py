@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import pytest
 
 from flo import ActionContext, FloClient
-from flo.types import HEADER_SIZE, MAGIC, VERSION, OpCode, StatusCode
+from flo.types import HEADER_SIZE, MAGIC, TABLE_HASH, VERSION, OpCode, StatusCode
 from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32
 from flo.worker import ActionWorker, StreamContext, StreamWorker, _EmptyPollBackoff
 
@@ -31,7 +31,7 @@ def _response(request_id: int, data: bytes) -> bytes:
             StatusCode.OK,
             0,
             0,
-            b"\x00" * 8,
+            TABLE_HASH,
         )
 
     return header(compute_crc32(header(0), data)) + data

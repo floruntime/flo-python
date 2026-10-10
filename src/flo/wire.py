@@ -18,7 +18,7 @@ from .exceptions import (
     InvalidMagicError,
     KeyTooLargeError,
     NamespaceTooLargeError,
-    UnsupportedVersionError,
+    TableMismatchError,
     ValidationError,
     ValueTooLargeError,
 )
@@ -29,6 +29,7 @@ from .types import (
     MAX_KEY_SIZE,
     MAX_NAMESPACE_SIZE,
     MAX_VALUE_SIZE,
+    TABLE_HASH,
     VERSION,
     DequeueResult,
     KVEntry,
@@ -49,13 +50,13 @@ from .types import (
 
 # Request header (32 bytes):
 #   magic(u32) + payload_len(u32) + request_id(u64)
-#   + crc32(u32) + op_code(u16) + version(u8) + flags(u8) + reserved(8s)
-REQUEST_HEADER_FORMAT = "<IIQIHBB8s"
+#   + crc32(u32) + op_code(u16) + version(u8) + flags(u8) + table_hash(u64)
+REQUEST_HEADER_FORMAT = "<IIQIHBBQ"
 
 # Response header (32 bytes):
 #   magic(u32) + data_len(u32) + request_id(u64)
-#   + crc32(u32) + version(u8) + status(u8) + flags(u8) + _pad(u8) + reserved(8s)
-RESPONSE_HEADER_FORMAT = "<IIQIBBBB8s"
+#   + crc32(u32) + version(u8) + status(u8) + flags(u8) + _pad(u8) + table_hash(u64)
+RESPONSE_HEADER_FORMAT = "<IIQIBBBBQ"
 
 
 # =============================================================================
@@ -198,7 +199,7 @@ def compute_crc32(header_bytes: bytes, payload: bytes) -> int:
 
     The CRC32 is computed over:
     - Header bytes 0-15 (magic, payload_length, request_id)
-    - Header bytes 20-31 (op_code/version/flags/reserved or version/status/flags/pad/reserved)
+    - Header bytes 20-31 (op_code/version/flags/table_hash or version/status/flags/pad/table_hash)
     - Payload bytes
     """
     # Hash bytes 0-15 and 20-31 of header (skip crc32 field at 16-19)
@@ -273,7 +274,7 @@ def serialize_request(
         op_code,
         VERSION,
         0,  # flags
-        b"\x00" * 8,  # reserved
+        TABLE_HASH,
     )
 
     # Compute CRC32
@@ -289,7 +290,7 @@ def serialize_request(
         op_code,
         VERSION,
         0,  # flags
-        b"\x00" * 8,  # reserved
+        TABLE_HASH,
     )
 
     return header + payload_bytes
@@ -329,21 +330,21 @@ def parse_response_header(data: bytes) -> tuple[StatusCode, int, int, int]:
     Raises:
         IncompleteResponseError: If data is too short.
         InvalidMagicError: If magic number is invalid.
-        UnsupportedVersionError: If protocol version is unsupported.
-        InvalidChecksumError: If CRC32 validation fails.
+        TableMismatchError: If the server was built from another protocol
+            version or op table; its body can't be read.
     """
     if len(data) < HEADER_SIZE:
         raise IncompleteResponseError(f"Response too short: {len(data)} < {HEADER_SIZE}")
 
-    magic, data_len, request_id, crc, version, status, flags, _pad, reserved = struct.unpack(
+    magic, data_len, request_id, crc, version, status, flags, _pad, table_hash = struct.unpack(
         RESPONSE_HEADER_FORMAT, data[:HEADER_SIZE]
     )
 
     if magic != MAGIC:
         raise InvalidMagicError(f"Invalid magic: 0x{magic:08X} != 0x{MAGIC:08X}")
 
-    if version != VERSION:
-        raise UnsupportedVersionError(f"Unsupported version: {version} != {VERSION}")
+    if version != VERSION or table_hash != TABLE_HASH:
+        raise TableMismatchError(version, table_hash)
 
     return StatusCode(status), data_len, request_id, crc
 

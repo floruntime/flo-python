@@ -10,10 +10,11 @@ from flo import FloClient
 from flo.exceptions import (
     GenericServerError,
     ServerError,
+    TableMismatchError,
     UnavailableError,
     raise_for_status,
 )
-from flo.types import HEADER_SIZE, MAGIC, VERSION, StatusCode
+from flo.types import HEADER_SIZE, MAGIC, TABLE_HASH, VERSION, StatusCode
 from flo.wire import (
     REQUEST_HEADER_FORMAT,
     RESPONSE_HEADER_FORMAT,
@@ -34,7 +35,7 @@ def _frame(request_id: int, status: int, data: bytes) -> bytes:
             status,
             0,
             0,
-            b"\x00" * 8,
+            TABLE_HASH,
         )
 
     return header(compute_crc32(header(0), data)) + data
@@ -120,3 +121,39 @@ def test_statuses_without_their_own_error_keep_their_code() -> None:
         with pytest.raises(ServerError) as caught:
             raise_for_status(StatusCode(code), b"why")
         assert caught.value.status_code == code
+
+
+async def test_an_answer_from_another_table_is_refused_unread_and_drops_the_connection() -> None:
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        header = await reader.readexactly(HEADER_SIZE)
+        _, payload_len, request_id, *_ = struct.unpack(REQUEST_HEADER_FORMAT, header)
+        await reader.readexactly(payload_len)
+        data = b"from elsewhere"
+
+        def head(crc: int) -> bytes:
+            return struct.pack(
+                RESPONSE_HEADER_FORMAT,
+                MAGIC,
+                len(data),
+                request_id,
+                crc,
+                VERSION,
+                0,
+                0,
+                0,
+                TABLE_HASH + 1,
+            )
+
+        writer.write(head(compute_crc32(head(0), data)) + data)
+        await writer.drain()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    client = await FloClient(f"127.0.0.1:{port}", timeout_ms=1000).connect()
+    with pytest.raises(TableMismatchError) as raised:
+        await client.kv.get("k")
+    assert raised.value.server_table == TABLE_HASH + 1
+    assert str(raised.value).endswith("upgrade the client")
+    assert not client.is_connected
+    await client.close()
+    server.close()
