@@ -7,6 +7,8 @@ import json
 import struct
 from typing import TYPE_CHECKING, Any
 
+from .exceptions import ServerError, raise_for_status
+from .kv_body import decode_get_answer, decode_set_answer, encode_get_body, encode_set_body
 from .types import (
     DeleteOptions,
     GetJsonResult,
@@ -23,6 +25,7 @@ from .types import (
     OptionTag,
     PutOptions,
     PutResult,
+    Reason,
     ScanOptions,
     ScanResult,
     VersionEntry,
@@ -32,6 +35,41 @@ from .wire import OptionsBuilder, parse_history_response, parse_scan_response
 if TYPE_CHECKING:
     from .client import FloClient
     from .kv_txn import Transaction
+
+
+async def kv_get(
+    client: "FloClient", namespace: str, key: str | bytes, opts: GetOptions, txn: int | None = None
+) -> GetResult | None:
+    """kv.get, inside transaction ``txn`` when given."""
+    key_bytes = key.encode("utf-8") if isinstance(key, str) else key
+    response = await client._send_and_check(
+        OpCode.KV_GET, namespace, key_bytes, encode_get_body(opts, txn), b"", allow_not_found=True
+    )
+    if response.is_not_found():
+        # Absent; any other not-found (no such transaction) is an error.
+        try:
+            raise_for_status(response.status, response.data)
+        except ServerError as e:
+            if e.reason == Reason.NOT_FOUND:
+                return None
+            raise
+    return decode_get_answer(response.data)
+
+
+async def kv_set(
+    client: "FloClient",
+    namespace: str,
+    key: str | bytes,
+    value: bytes,
+    opts: PutOptions,
+    txn: int | None = None,
+) -> PutResult:
+    """kv.set, inside transaction ``txn`` when given."""
+    key_bytes = key.encode("utf-8") if isinstance(key, str) else key
+    response = await client._send_and_check(
+        OpCode.KV_PUT, namespace, key_bytes, encode_set_body(value, opts, txn), b""
+    )
+    return decode_set_answer(response.data)
 
 
 class KVOperations:
@@ -47,47 +85,17 @@ class KVOperations:
     ) -> GetResult | None:
         """Get value and version for a key.
 
-        Args:
-            key: The key to retrieve.
-            options: Optional operation options (block_ms for blocking get).
-
-        Returns:
-            ``GetResult(value, version)`` if found, ``None`` if not found.
+        Returns ``GetResult(value, version)``, or ``None`` if the key is not
+        found, also when a wait (``wait_ms``) ends without it.
 
         Example:
             result = await client.kv.get("user:123")
-            if result is not None:
-                print(f"Found {result.value!r} at version {result.version}")
 
-            # Blocking get — wait up to 2 seconds
-            result = await client.kv.get("key", GetOptions(block_ms=2000))
+            # Wait up to 2 seconds for the key to exist
+            result = await client.kv.get("key", GetOptions(wait_ms=2000))
         """
         opts = options or GetOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-
-        builder = OptionsBuilder()
-        if opts.block_ms is not None:
-            builder.add_u32(OptionTag.BLOCK_MS, opts.block_ms)
-
-        response = await self._client._send_and_check(
-            OpCode.KV_GET,
-            namespace,
-            key_bytes,
-            b"",
-            builder.build(),
-            allow_not_found=True,
-        )
-
-        if response.is_not_found():
-            return None
-
-        # Wire body: [version:u64 LE][value bytes]
-        if not response.data or len(response.data) < 8:
-            return GetResult(value=b"", version=0)
-        version = struct.unpack("<Q", response.data[:8])[0]
-        return GetResult(value=bytes(response.data[8:]), version=version)
+        return await kv_get(self._client, self._client.get_namespace(opts.namespace), key, opts)
 
     async def put(
         self,
@@ -97,48 +105,17 @@ class KVOperations:
     ) -> PutResult:
         """Set a key-value pair and return the new version.
 
-        Args:
-            key: The key to set.
-            value: The value bytes.
-            options: Optional operation options (TTL, CAS, etc.).
-
-        Returns:
-            ``PutResult(version)`` — the version assigned by the server,
-            usable for CAS on the next write.
+        A ``cas_version`` that isn't the key's, or a ``condition`` that doesn't
+        hold, raises a conflict with reason CAS_MISMATCH or CONDITION_FAILED.
 
         Example:
             res = await client.kv.put("user:123", b"John Doe")
-            # CAS the next write against this version:
-            await client.kv.put("user:123", b"Jane",
-                                PutOptions(cas_version=res.version))
+            await client.kv.put("user:123", b"Jane", PutOptions(cas_version=res.version))
         """
         opts = options or PutOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-
-        builder = OptionsBuilder()
-        if opts.ttl_ms is not None:
-            builder.add_u64(OptionTag.TTL_MS, opts.ttl_ms)
-        if opts.cas_version is not None:
-            builder.add_u64(OptionTag.CAS_VERSION, opts.cas_version)
-        if opts.if_not_exists:
-            builder.add_flag(OptionTag.IF_NOT_EXISTS)
-        if opts.if_exists:
-            builder.add_flag(OptionTag.IF_EXISTS)
-
-        response = await self._client._send_and_check(
-            OpCode.KV_PUT,
-            namespace,
-            key_bytes,
-            value,
-            builder.build(),
+        return await kv_set(
+            self._client, self._client.get_namespace(opts.namespace), key, value, opts
         )
-
-        # Wire body: [version:u64 LE]
-        if not response.data or len(response.data) < 8:
-            return PutResult(version=0)
-        return PutResult(version=struct.unpack("<Q", response.data[:8])[0])
 
     async def delete(
         self,

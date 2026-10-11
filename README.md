@@ -44,17 +44,20 @@ asyncio.run(main())
 ### Get
 
 ```python
-from flo import GetOptions
+from flo import GetOptions, WaitFor
 
 # Simple get
 value = await client.kv.get("key")
 if value is not None:
     print(value.decode())
 
-# Blocking get - wait up to 2 seconds for value to appear
-# (block_ms is at most 300000; the client waits timeout_ms on top of it;
+# Wait up to 2 seconds for the key to exist (answers at once if it does)
+# (wait_ms is at most 300000; the client waits timeout_ms on top of it;
 # 0 means don't wait)
-value = await client.kv.get("key", GetOptions(block_ms=2000))
+value = await client.kv.get("key", GetOptions(wait_ms=2000))
+
+# Wait up to 2 seconds for the key's next version
+value = await client.kv.get("key", GetOptions(wait_ms=2000, wait_for=WaitFor.CHANGE))
 
 # Get with namespace override
 value = await client.kv.get("key", GetOptions(namespace="other"))
@@ -63,7 +66,7 @@ value = await client.kv.get("key", GetOptions(namespace="other"))
 ### Put
 
 ```python
-from flo import PutOptions
+from flo import Condition, PutOptions
 
 # Simple put
 await client.kv.put("key", b"value")
@@ -75,10 +78,10 @@ await client.kv.put("session:abc", b"data", PutOptions(ttl_ms=3_600_000))
 await client.kv.put("counter", b"2", PutOptions(cas_version=1))
 
 # Put only if key doesn't exist
-await client.kv.put("key", b"value", PutOptions(if_not_exists=True))
+await client.kv.put("key", b"value", PutOptions(condition=Condition.IF_ABSENT))
 
 # Put only if key exists
-await client.kv.put("key", b"value", PutOptions(if_exists=True))
+await client.kv.put("key", b"value", PutOptions(condition=Condition.IF_PRESENT))
 ```
 
 ### Delete

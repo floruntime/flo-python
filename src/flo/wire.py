@@ -22,6 +22,7 @@ from .exceptions import (
     ValidationError,
     ValueTooLargeError,
 )
+from .kv_body import is_table_op
 from .types import (
     HEADER_SIZE,
     MAGIC,
@@ -89,7 +90,7 @@ class OptionsBuilder:
 
     def add_u32(self, tag: OptionTag, value: int) -> "OptionsBuilder":
         """Add a u32 option."""
-        if tag in (OptionTag.BLOCK_MS, OptionTag.WAIT_MS):
+        if tag == OptionTag.BLOCK_MS:
             _validate_block_ms(value)
         self._buffer.extend(bytes([tag, 4]))
         self._buffer.extend(struct.pack("<I", value))
@@ -254,13 +255,19 @@ def serialize_request(
     payload.extend(struct.pack("<H", len(key)))
     payload.extend(key)
 
-    # Value: [len:u32][data]
-    payload.extend(struct.pack("<I", len(value)))
-    payload.extend(value)
+    if is_table_op(op_code):
+        # A table op's body, coded by its schema, is `value`; it takes no options.
+        if options:
+            raise ValidationError(f"op {op_code} takes a body, not options")
+        payload.extend(value)
+    else:
+        # Value: [len:u32][data]
+        payload.extend(struct.pack("<I", len(value)))
+        payload.extend(value)
 
-    # Options: [len:u16][data]
-    payload.extend(struct.pack("<H", len(options)))
-    payload.extend(options)
+        # Options: [len:u16][data]
+        payload.extend(struct.pack("<H", len(options)))
+        payload.extend(options)
 
     payload_bytes = bytes(payload)
 

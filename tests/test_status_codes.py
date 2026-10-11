@@ -79,7 +79,7 @@ async def _client_answering(first_status: int) -> tuple[FloClient, asyncio.Serve
                 if served == 0:
                     reply = _frame(request_id, first_status, _refusal(b"first reply's message"))
                 else:
-                    reply = _frame(request_id, 0, struct.pack("<Q", 7) + b"second")
+                    reply = _frame(request_id, 0, struct.pack("<QI", 7, len(b"second")) + b"second")
                 served += 1
                 writer.write(reply)
         except (asyncio.IncompleteReadError, ConnectionError):

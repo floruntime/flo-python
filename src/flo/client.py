@@ -268,12 +268,17 @@ class FloClient:
         return self._request_id
 
     @staticmethod
-    def _server_wait_ms(op_code: OpCode, options: bytes) -> int:
+    def _server_wait_ms(op_code: OpCode, value: bytes, options: bytes) -> int:
         """How long the server may hold this request before answering."""
+        if op_code == OpCode.KV_GET:
+            # kv.get's body opens with wait_ms: [present:u8][u64].
+            if len(value) >= 9 and value[0] == 1:
+                return int.from_bytes(value[1:9], "little")
+            return 0
         waits = {
             opt.tag: opt.as_u32() or 0
             for opt in OptionsIterator(options)
-            if opt.tag in (OptionTag.BLOCK_MS, OptionTag.WAIT_MS)
+            if opt.tag == OptionTag.BLOCK_MS
         }
         if op_code == OpCode.ACTION_AWAIT:
             # An await that names no block_ms waits the server's default.
@@ -329,7 +334,7 @@ class FloClient:
 
             # The server may hold a blocking request for its whole wait, so it
             # gets the operation timeout on top of that wait.
-            read_timeout = self._timeout + self._server_wait_ms(op_code, options) / 1000.0
+            read_timeout = self._timeout + self._server_wait_ms(op_code, value, options) / 1000.0
             writer, reader = self._writer, self._reader
             try:
                 writer.write(request)

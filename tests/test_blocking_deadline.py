@@ -78,7 +78,9 @@ class FakeServer:
                 delay = self.delays[min(self.served, len(self.delays) - 1)]
                 self.served += 1
                 asyncio.get_running_loop().call_later(
-                    delay, writer.write, _response(request_id, struct.pack("<Q", 1) + key)
+                    delay,
+                    writer.write,
+                    _response(request_id, struct.pack("<QI", 1, len(key)) + key),
                 )
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
@@ -105,7 +107,7 @@ async def test_blocking_call_waits_past_the_operation_timeout(
     # The server answers after 0.4 s: past the 0.2 s operation timeout, but
     # within the 0.5 s the call asked the server to block.
     client = await _client(server_factory, [0.4], timeout_ms=200)
-    result = await client.kv.get("k", GetOptions(block_ms=500))
+    result = await client.kv.get("k", GetOptions(wait_ms=500))
     assert result is not None and result.value == b"k"
     await client.close()
 
@@ -115,7 +117,7 @@ async def test_blocking_call_still_times_out_after_its_wait(
 ) -> None:
     client = await _client(server_factory, [1.0], timeout_ms=100)
     with pytest.raises(RequestTimeoutError) as raised:
-        await client.kv.get("k", GetOptions(block_ms=200))
+        await client.kv.get("k", GetOptions(wait_ms=200))
     assert isinstance(raised.value, FloError)
     assert isinstance(raised.value, asyncio.TimeoutError)
     # The connection was dropped, so workers must take the reconnect path.
@@ -170,7 +172,7 @@ async def _bad_frame_client(reply: Any) -> tuple[FloClient, asyncio.Server]:
 
 
 def _corrupt(request_id: int) -> bytes:
-    frame = bytearray(_response(request_id, struct.pack("<Q", 1) + b"k"))
+    frame = bytearray(_response(request_id, struct.pack("<QI", 1, 1) + b"k"))
     frame[-1] ^= 0xFF
     return bytes(frame)
 
@@ -178,10 +180,10 @@ def _corrupt(request_id: int) -> bytes:
 @pytest.mark.parametrize(
     ("reply", "error"),
     [
-        (lambda rid: _response(rid + 1, struct.pack("<Q", 1) + b"k"), ProtocolError),
+        (lambda rid: _response(rid + 1, struct.pack("<QI", 1, 1) + b"k"), ProtocolError),
         (_corrupt, InvalidChecksumError),
         (
-            lambda rid: _response(rid, struct.pack("<Q", 1) + b"k")[:HEADER_SIZE],
+            lambda rid: _response(rid, struct.pack("<QI", 1, 1) + b"k")[:HEADER_SIZE],
             RequestTimeoutError,
         ),
     ],
@@ -286,8 +288,17 @@ def test_action_await_wait(block_ms: int | None, expected: int) -> None:
     builder = OptionsBuilder()
     if block_ms is not None:
         builder.add_u32(OptionTag.BLOCK_MS, block_ms)
-    assert FloClient._server_wait_ms(OpCode.ACTION_AWAIT, builder.build()) == expected
-    assert FloClient._server_wait_ms(OpCode.KV_GET, builder.build()) == (block_ms or 0)
+    assert FloClient._server_wait_ms(OpCode.ACTION_AWAIT, b"", builder.build()) == expected
+
+
+def test_kv_get_waits_its_wait_ms() -> None:
+    from flo import GetOptions
+    from flo.kv_body import encode_get_body
+    from flo.types import OpCode
+
+    for wait_ms in (0, 1500):
+        body = encode_get_body(GetOptions(wait_ms=wait_ms))
+        assert FloClient._server_wait_ms(OpCode.KV_GET, body, b"") == wait_ms
 
 
 async def test_server_error_for_an_unparsable_request_surfaces() -> None:

@@ -4,7 +4,7 @@ import struct
 
 import pytest
 
-from flo.exceptions import IncompleteResponseError, TableMismatchError
+from flo.exceptions import IncompleteResponseError, TableMismatchError, ValidationError
 from flo.types import (
     HEADER_SIZE,
     MAGIC,
@@ -170,35 +170,29 @@ class TestSerializeRequest:
         assert request_id == 42
         assert op_code == OpCode.KV_GET
         assert flags == 0
-        assert table_hash == 0x2827F6F0631754FE
+        assert table_hash == 0x28D9C77CF6F88FD5
 
-    def test_request_with_value(self) -> None:
+    def test_table_op_payload_is_namespace_key_body(self) -> None:
         request = serialize_request(
             request_id=1,
             op_code=OpCode.KV_PUT,
             namespace=b"ns",
             key=b"key",
-            value=b"value",
+            value=b"body",
             options=b"",
         )
+        assert request[HEADER_SIZE:] == b"\x02\x00ns\x03\x00keybody"
 
-        # Verify payload contains namespace, key, value
-        payload = request[HEADER_SIZE:]
-
-        offset = 0
-        ns_len = struct.unpack("<H", payload[offset : offset + 2])[0]
-        offset += 2
-        assert payload[offset : offset + ns_len] == b"ns"
-        offset += ns_len
-
-        key_len = struct.unpack("<H", payload[offset : offset + 2])[0]
-        offset += 2
-        assert payload[offset : offset + key_len] == b"key"
-        offset += key_len
-
-        val_len = struct.unpack("<I", payload[offset : offset + 4])[0]
-        offset += 4
-        assert payload[offset : offset + val_len] == b"value"
+    def test_table_op_takes_no_options(self) -> None:
+        with pytest.raises(ValidationError):
+            serialize_request(
+                request_id=1,
+                op_code=OpCode.KV_GET,
+                namespace=b"",
+                key=b"k",
+                value=b"",
+                options=b"\x01",
+            )
 
     def test_request_with_options(self) -> None:
         builder = OptionsBuilder()
@@ -207,7 +201,7 @@ class TestSerializeRequest:
 
         request = serialize_request(
             request_id=1,
-            op_code=OpCode.KV_PUT,
+            op_code=OpCode.KV_TOUCH,
             namespace=b"ns",
             key=b"key",
             value=b"val",
