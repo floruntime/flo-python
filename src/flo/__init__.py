@@ -116,6 +116,8 @@ from .types import (
     ProcessingSyncResult,
     PutOptions,
     PutResult,
+    Ran,
+    Reason,
     ScanOptions,
     ScanResult,
     StatusCode,
@@ -234,6 +236,8 @@ __all__ = [
     "is_connection_error",
     # Types
     "OpCode",
+    "Ran",
+    "Reason",
     "StatusCode",
     "OptionTag",
     # Result types

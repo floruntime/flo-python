@@ -5,8 +5,9 @@ Exception classes for Flo client errors.
 
 import asyncio
 import contextlib
+from collections.abc import Callable
 
-from .types import TABLE_HASH, VERSION, StatusCode
+from .types import TABLE_HASH, VERSION, Ran, Reason, StatusCode
 
 
 class FloError(Exception):
@@ -161,6 +162,10 @@ class ServerError(FloError):
     """Base class for server-returned errors."""
 
     status_code: StatusCode
+    # Why; Reason.UNCLASSIFIED when the server didn't say.
+    reason: Reason = Reason.UNCLASSIFIED
+    # Whether the request took effect.
+    ran: Ran = Ran.NO
 
     def __init__(self, message: str, status_code: StatusCode):
         super().__init__(message)
@@ -260,13 +265,27 @@ def raise_for_status(status: StatusCode, data: bytes = b"") -> None:
     if status == StatusCode.OK:
         return
 
-    # Try to decode error message from data
+    # A refusal's body: [reason:u16][ran:u8][message].
+    if len(data) < 3:
+        raise IncompleteResponseError(f"a refusal body of {len(data)} bytes")
+    try:
+        reason = Reason(int.from_bytes(data[0:2], "little"))
+        ran = Ran(data[2])
+    except ValueError as e:
+        raise IncompleteResponseError(f"a refusal with reason and ran {data[0:3].hex()}") from e
     message = status.message()
-    if data:
+    if len(data) > 3:
         with contextlib.suppress(UnicodeDecodeError, ValueError):
-            message = data.decode("utf-8")
+            message = data[3:].decode("utf-8")
+    error = _error_for(status, message)
+    error.reason = reason
+    error.ran = ran
+    raise error
 
-    error_map = {
+
+def _error_for(status: StatusCode, message: str) -> ServerError:
+
+    error_map: dict[StatusCode, Callable[[str], ServerError]] = {
         StatusCode.NOT_FOUND: NotFoundError,
         StatusCode.BAD_REQUEST: BadRequestError,
         StatusCode.CONFLICT: ConflictError,
@@ -280,7 +299,7 @@ def raise_for_status(status: StatusCode, data: bytes = b"") -> None:
 
     error_class = error_map.get(status)
     if error_class is not None:
-        raise error_class(message)
+        return error_class(message)
     if status.name not in StatusCode.__members__:
         message = f"Unknown status {int(status)}: {message}"
-    raise GenericServerError(message, status)
+    return GenericServerError(message, status)

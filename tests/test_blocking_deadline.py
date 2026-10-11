@@ -294,7 +294,7 @@ async def test_server_error_for_an_unparsable_request_surfaces() -> None:
     # The server answers a request it cannot parse with request id 0, its
     # error, and a close.
     client, server = await _bad_frame_client(
-        lambda rid: _response(0, b"Invalid request", StatusCode.BAD_REQUEST)
+        lambda rid: _response(0, b"\x02\x00\x00Invalid request", StatusCode.BAD_REQUEST)
     )
     with pytest.raises(BadRequestError, match="Invalid request"):
         await client.kv.get("k")
