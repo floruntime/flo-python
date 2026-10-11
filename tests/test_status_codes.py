@@ -173,7 +173,8 @@ def test_a_refusal_carries_its_reason_and_ran() -> None:
     assert str(raised.value) == "do not resend"
 
 
-@pytest.mark.parametrize("body", [b"\x01\x00", b"\xff\xff\x00", b"\x01\x00\x09"])
+# b"\x01\x01" is reason 257: read as a byte it would pass as unknown_op.
+@pytest.mark.parametrize("body", [b"\x01\x00", b"\xff\xff\x00", b"\x01\x00\x09", b"\x01\x01\x00"])
 def test_a_body_that_is_not_a_refusal_is_refused(body: bytes) -> None:
     with pytest.raises(IncompleteResponseError):
         raise_for_status(StatusCode.BAD_REQUEST, body)
