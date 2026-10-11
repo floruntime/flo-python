@@ -170,7 +170,7 @@ class TestSerializeRequest:
         assert request_id == 42
         assert op_code == OpCode.KV_GET
         assert flags == 0
-        assert table_hash == 0x28D9C77CF6F88FD5
+        assert table_hash == 0x02E15EE74C0AD72C
 
     def test_table_op_payload_is_namespace_key_body(self) -> None:
         request = serialize_request(

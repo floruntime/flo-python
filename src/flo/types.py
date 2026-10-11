@@ -17,7 +17,7 @@ VERSION: int = 0x02
 # The hash of the op table this SDK was built for, written into every request
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses.
-TABLE_HASH: int = 0x28D9C77CF6F88FD5
+TABLE_HASH: int = 0x02E15EE74C0AD72C
 
 
 class Reason(IntEnum):
@@ -49,7 +49,7 @@ class Reason(IntEnum):
     NO_SUCH_TRANSACTION = 17
     # The routing key (the key, when none is given) isn't the one the
     # transaction was begun with.
-    TXN_ROUTING_KEY = 18
+    WRONG_ROUTING_KEY = 18
     # The transaction holds as many ops or bytes as it may.
     TXN_TOO_LARGE = 19
     # The shard holds as many waiting reads as it may.
