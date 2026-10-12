@@ -17,7 +17,7 @@ VERSION: int = 0x02
 # The hash of the op table this SDK was built for, written into every request
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses.
-TABLE_HASH: int = 0x2827F6F0631754FE
+TABLE_HASH: int = 0x02E15EE74C0AD72C
 
 
 class Reason(IntEnum):
@@ -37,6 +37,29 @@ class Reason(IntEnum):
     ANSWER_LOST = 11
     # A refusal from an op family the server hasn't classified yet.
     UNCLASSIFIED = 12
+    # What the request names doesn't exist.
+    NOT_FOUND = 13
+    # The key is in a prefix the server keeps for itself.
+    RESERVED_KEY = 14
+    # The write's cas_version isn't the key's version.
+    CAS_MISMATCH = 15
+    # The write's condition didn't hold.
+    CONDITION_FAILED = 16
+    # No open transaction has this id here.
+    NO_SUCH_TRANSACTION = 17
+    # The routing key (the key, when none is given) isn't the one the
+    # transaction was begun with.
+    WRONG_ROUTING_KEY = 18
+    # The transaction holds as many ops or bytes as it may.
+    TXN_TOO_LARGE = 19
+    # The shard holds as many waiting reads as it may.
+    TOO_MANY_WAITERS = 20
+    # Two fields given together that don't go together.
+    CONFLICTING_FIELDS = 21
+    # The shard stopped taking writes until the node restarts.
+    WRITES_STOPPED = 22
+    # Too many writes wait for commit.
+    TOO_MANY_PROPOSALS = 23
 
 
 class Ran(IntEnum):
@@ -59,6 +82,10 @@ MAX_VALUE_SIZE: int = 16 * 1024 * 1024  # 16 MB practical limit
 # Longest blocking wait (block_ms) the server accepts; checked client-side so
 # it fails before the round trip.
 MAX_BLOCK_MS: int = 300_000  # 5 minutes
+# Longest a KV get may wait (wait_ms).
+MAX_WAIT_MS: int = 300_000
+# Longest value a KV put takes.
+MAX_KV_VALUE_SIZE: int = 253_817
 # A worker always long-polls: block_ms=0 ("don't wait") would turn its poll
 # loop into a busy spin against the server, so a worker reads 0 (or unset) as this.
 _DEFAULT_WORKER_BLOCK_MS: int = 30_000
@@ -279,7 +306,6 @@ class OptionTag(IntEnum):
     PRIORITY = 0x10  # u8: Message priority (0-255, lower is taken first)
     COUNT = 0x15  # u32: Number of messages to dequeue
     BLOCK_MS = 0x17  # u32: Block timeout - wait for data (0=don't wait, max 300000)
-    WAIT_MS = 0x18  # u32: Watch timeout - wait for NEXT version change (0=don't wait, max 300000)
 
     # Stream Options (0x20 - 0x2F) - StreamID-native ONLY
     # All stream positioning uses StreamID (timestamp_ms + sequence)
@@ -546,12 +572,34 @@ class StreamInfo:
 # =============================================================================
 
 
+class WaitFor(IntEnum):
+    """What a KV get with wait_ms waits for."""
+
+    # The key to exist; one that exists answers at once.
+    EXISTS = 0
+    # The key's next version.
+    CHANGE = 1
+
+
+class Condition(IntEnum):
+    """When a KV put may write."""
+
+    ALWAYS = 0
+    IF_ABSENT = 1
+    IF_PRESENT = 2
+
+
 @dataclass
 class GetOptions:
     """Options for KV get operations."""
 
     namespace: str | None = None
-    block_ms: int | None = None  # Block until value available (0 = don't wait, max 300000)
+    # Wait up to this long for what wait_for names (0 = don't wait, max 300000).
+    wait_ms: int = 0
+    # The key to exist (the default), or its next version.
+    wait_for: WaitFor = WaitFor.EXISTS
+    # Routes the request in place of the key.
+    routing_key: str | None = None
 
 
 @dataclass
@@ -560,9 +608,12 @@ class PutOptions:
 
     namespace: str | None = None
     ttl_ms: int | None = None  # Time-to-live in milliseconds (0 = no expiration)
+    # When the write may happen.
+    condition: Condition = Condition.ALWAYS
+    # The key's version the write requires; 0 means it doesn't exist.
     cas_version: int | None = None
-    if_not_exists: bool = False
-    if_exists: bool = False
+    # Routes the request in place of the key.
+    routing_key: str | None = None
 
 
 @dataclass

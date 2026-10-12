@@ -9,7 +9,7 @@ from flo.worker import ActionWorkerOptions, StreamWorkerOptions
 
 
 class TestOptionsBuilder:
-    @pytest.mark.parametrize("tag", [OptionTag.BLOCK_MS, OptionTag.WAIT_MS])
+    @pytest.mark.parametrize("tag", [OptionTag.BLOCK_MS])
     def test_ceiling(self, tag: OptionTag) -> None:
         OptionsBuilder().add_u32(tag, 0)
         OptionsBuilder().add_u32(tag, MAX_BLOCK_MS)
@@ -36,7 +36,7 @@ async def test_refused_before_the_round_trip() -> None:
     # Unconnected: without the check this would raise NotConnectedError.
     client = FloClient("localhost:1")
     with pytest.raises(BlockTooLongError):
-        await client.kv.get("k", GetOptions(block_ms=MAX_BLOCK_MS + 1))
+        await client.kv.get("k", GetOptions(wait_ms=MAX_BLOCK_MS + 1))
 
 
 class TestWorkerBlockMs:

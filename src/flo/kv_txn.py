@@ -17,11 +17,14 @@ The following operations are NOT supported inside a transaction and raise
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import struct
 from typing import TYPE_CHECKING, Any
 
+from .kv import kv_get, kv_set
 from .types import (
     DeleteOptions,
+    GetOptions,
     GetResult,
     KVCommitResult,
     OpCode,
@@ -99,49 +102,21 @@ class Transaction:
         value: bytes,
         options: PutOptions | None = None,
     ) -> PutResult:
-        """Buffer a put inside the transaction."""
+        """Buffer a put inside the transaction; it has no version until commit (0)."""
         self._check_alive()
-        opts = options or PutOptions()
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        builder = self._txn_options()
-        if opts.ttl_ms is not None:
-            builder.add_u64(OptionTag.TTL_MS, opts.ttl_ms)
-        if opts.cas_version is not None:
-            builder.add_u64(OptionTag.CAS_VERSION, opts.cas_version)
-        if opts.if_not_exists:
-            builder.add_flag(OptionTag.IF_NOT_EXISTS)
-        if opts.if_exists:
-            builder.add_flag(OptionTag.IF_EXISTS)
-        response = await self._client._send_and_check(
-            OpCode.KV_PUT,
-            self._namespace,
-            key_bytes,
-            value,
-            builder.build(),
-        )
-        if not response.data or len(response.data) < 8:
-            return PutResult(version=0)
-        return PutResult(version=struct.unpack("<Q", response.data[:8])[0])
+        opts = dataclasses.replace(options or PutOptions(), routing_key=self._routing_key)
+        return await kv_set(self._client, self._namespace, key, value, opts, self._txn_id)
 
     async def get(self, key: str | bytes) -> GetResult | None:
         """Read a key inside the transaction (sees buffered writes)."""
         self._check_alive()
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        builder = self._txn_options()
-        response = await self._client._send_and_check(
-            OpCode.KV_GET,
+        return await kv_get(
+            self._client,
             self._namespace,
-            key_bytes,
-            b"",
-            builder.build(),
-            allow_not_found=True,
+            key,
+            GetOptions(routing_key=self._routing_key),
+            self._txn_id,
         )
-        if response.is_not_found():
-            return None
-        if not response.data or len(response.data) < 8:
-            return GetResult(value=b"", version=0)
-        version = struct.unpack("<Q", response.data[:8])[0]
-        return GetResult(value=bytes(response.data[8:]), version=version)
 
     async def delete(
         self,
@@ -255,13 +230,11 @@ class Transaction:
         self._check_alive()
         self._done = True
         builder = OptionsBuilder()
-        if self._routing_key:
-            builder.add_bytes(OptionTag.ROUTING_KEY, self._routing_key.encode("utf-8"))
         builder.add_u64(OptionTag.TXN_ID, self._txn_id)
         response = await self._client._send_and_check(
             OpCode.KV_COMMIT_TXN,
             self._namespace,
-            self._routing_key.encode("utf-8"),
+            b"",
             b"",
             builder.build(),
         )
@@ -284,13 +257,11 @@ class Transaction:
             return
         self._done = True
         builder = OptionsBuilder()
-        if self._routing_key:
-            builder.add_bytes(OptionTag.ROUTING_KEY, self._routing_key.encode("utf-8"))
         builder.add_u64(OptionTag.TXN_ID, self._txn_id)
         await self._client._send_and_check(
             OpCode.KV_ROLLBACK_TXN,
             self._namespace,
-            self._routing_key.encode("utf-8"),
+            b"",
             b"",
             builder.build(),
         )
