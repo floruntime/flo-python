@@ -118,6 +118,12 @@ while result.cursor is not None:
 for e in await client.kv.mget(["user:1", "user:2"]):
     if e.found:
         print(e.key, e.version, e.value)
+
+# Keys all written with one routing key: look them all up on its shard
+# (without it, each key is looked up on its own shard)
+from flo import KVMGetOptions
+
+await client.kv.mget(["user:1:name", "user:1:email"], KVMGetOptions(routing_key="user:1"))
 ```
 
 ### History

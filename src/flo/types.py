@@ -18,7 +18,7 @@ VERSION: int = 0x02
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0x5194DD26F737DBA9
+TABLE_HASH: int = 0xC8A2C3C65E95D11D
 
 
 class Reason(IntEnum):
@@ -690,6 +690,9 @@ class KVMGetOptions:
     """Options for KV mget operations."""
 
     namespace: str | None = None
+    # The routing key every key was written with: all are looked up on its
+    # shard. Without it, each key is looked up on its own.
+    routing_key: str | None = None
 
 
 @dataclass

@@ -252,7 +252,8 @@ class KVOperations:
 
         Args:
             keys: Keys to fetch (max 256). Empty list returns ``[]``.
-            options: Optional namespace override.
+            options: Optional namespace override, and the routing key every
+                key was written with (all are then looked up on its shard).
 
         Returns:
             List of :class:`MGetEntry`. ``found=False`` indicates a missing key.
@@ -268,11 +269,12 @@ class KVOperations:
         namespace = self._client.get_namespace(opts.namespace)
         encoded = [_key(k) for k in keys]
         names = [k if isinstance(k, str) else k.decode("utf-8", errors="replace") for k in keys]
+        encode_mget_body(encoded[:1], opts.routing_key)  # refuses a bad routing key up front
         out: list[MGetEntry] = []
         for run in split_mget_keys(encoded):
             done = 0
             while done < len(run):
-                body = encode_mget_body(run[done:])
+                body = encode_mget_body(run[done:], opts.routing_key)
                 response = await self._client._send_and_check(OpCode.KV_MGET, namespace, b"", body)
                 entries, next_index = decode_mget_answer(
                     response.data, names[len(out) : len(out) + len(run) - done]
