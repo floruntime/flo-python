@@ -15,7 +15,7 @@ from flo.exceptions import (
 )
 from flo.kv_body import decode_get_answer, decode_set_answer
 from flo.kv_txn import Transaction
-from flo.types import MAX_KV_VALUE_SIZE, MAX_WAIT_MS, OpCode, OptionTag, Ran, Reason, StatusCode
+from flo.types import MAX_KV_VALUE_SIZE, MAX_WAIT_MS, OpCode, Ran, Reason, StatusCode
 from flo.wire import RawResponse
 
 Call = tuple[OpCode, str, bytes, bytes, bytes]
@@ -123,11 +123,11 @@ async def test_a_transaction_sends_its_id_and_commits_by_id_alone(
     assert (await txn.put("k", b"v")).version == 0
     assert calls[0][3].endswith(b"\x01\x02\x00rk" + b"\x01" + struct.pack("<Q", txn_id))
 
-    client, calls = _client(monkeypatch, _ok(b"\x01" + struct.pack("<QH", 5, 1)))
-    await Transaction(client, "ns", "rk", txn_id=txn_id, pinned_hash=0).commit()
+    client, calls = _client(monkeypatch, _ok(struct.pack("<QH", 5, 1)))
+    res = await Transaction(client, "ns", "rk", txn_id=txn_id, pinned_hash=0).commit()
+    assert (res.commit_index, res.op_count) == (5, 1)
     _, _, key, value, options = calls[0]
-    assert (key, value) == (b"", b"")
-    assert options == bytes([OptionTag.TXN_ID, 8]) + struct.pack("<Q", txn_id)
+    assert (key, value, options) == (b"", struct.pack("<Q", txn_id), b"")
 
 
 def test_answers_decode_whole_or_not_at_all() -> None:
@@ -139,4 +139,4 @@ def test_answers_decode_whole_or_not_at_all() -> None:
 
 
 def test_new_reasons_are_known() -> None:
-    assert [r.value for r in Reason if r.value >= 13] == list(range(13, 24))
+    assert [r.value for r in Reason if r.value >= 13] == list(range(13, 26))

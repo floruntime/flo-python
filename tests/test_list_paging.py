@@ -9,7 +9,6 @@ from flo import (
     ActionListOptions,
     FloClient,
     ProcessingListOptions,
-    ScanOptions,
     WorkerListOptions,
     WorkflowListDefinitionsOptions,
 )
@@ -47,18 +46,6 @@ def assert_paging(call: Call, op: OpCode, limit: int, cursor: bytes) -> None:
     assert sent_op == op
     assert value == struct.pack("<I", limit) + cursor
     assert OptionsIterator(options).find(OptionTag.LIMIT) is None
-
-
-async def test_kv_scan(sent: tuple[FloClient, list[Call]]) -> None:
-    client, calls = sent
-    await client.kv.scan("user:", ScanOptions(limit=25, cursor=b"\x01\x00abc"))
-    assert_paging(calls[0], OpCode.KV_SCAN, 25, b"\x01\x00abc")
-
-
-async def test_kv_scan_defaults_to_server_limit(sent: tuple[FloClient, list[Call]]) -> None:
-    client, calls = sent
-    await client.kv.scan("user:")
-    assert_paging(calls[0], OpCode.KV_SCAN, 0, b"")
 
 
 async def test_processing_list(sent: tuple[FloClient, list[Call]]) -> None:

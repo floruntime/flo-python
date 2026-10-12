@@ -87,7 +87,13 @@ await client.kv.put("key", b"value", PutOptions(condition=Condition.IF_PRESENT))
 ### Delete
 
 ```python
-await client.kv.delete("key")
+from flo import DeleteOptions
+
+# Returns whether the key existed; deleting a missing key is not an error
+existed = await client.kv.delete("key")
+
+# Delete only at a known version
+await client.kv.delete("lock:resource", DeleteOptions(cas_version=held_version))
 ```
 
 ### Scan
@@ -95,16 +101,23 @@ await client.kv.delete("key")
 ```python
 from flo import ScanOptions
 
-# Scan all keys with prefix
+# Names of keys with a prefix ("" for all), up to 1024 per page by default
 result = await client.kv.scan("user:")
-for entry in result.entries:
-    print(f"{entry.key.decode()}: {entry.value.decode()}")
+for name in result.names:
+    print(name)
 
-# Paginated scan
-result = await client.kv.scan("user:", ScanOptions(limit=100))
-while result.has_more:
-    # Process entries...
+# Next pages: the cursor is None on the last page (limit is 1..1024)
+while result.cursor is not None:
     result = await client.kv.scan("user:", ScanOptions(cursor=result.cursor, limit=100))
+```
+
+### MGet
+
+```python
+# One entry per key, in order (at most 256 keys of at most 4096 bytes each)
+for e in await client.kv.mget(["user:1", "user:2"]):
+    if e.found:
+        print(e.key, e.version, e.value)
 ```
 
 ### History
@@ -112,10 +125,51 @@ while result.has_more:
 ```python
 from flo import HistoryOptions
 
-# Get version history for a key
+# Versions newest first (limit 1..65, default 10), each with its write time in ms;
+# empty for a missing key
 history = await client.kv.history("user:123", HistoryOptions(limit=10))
 for entry in history:
-    print(f"v{entry.version} at {entry.timestamp}: {entry.value.decode()}")
+    print(f"v{entry.version} at {entry.at_ms}: {entry.value.decode()}")
+```
+
+### Counters, TTL and exists
+
+```python
+from flo import KVExpireOptions, KVIncrOptions
+
+res = await client.kv.incr("visits")  # +1
+res = await client.kv.incr("visits", KVIncrOptions(delta=-5))
+print(res.value, res.version)
+
+# Set a key's TTL in ms; 0 clears it. cas_version makes lease renewal race-free.
+await client.kv.expire("session:abc", 60_000)
+await client.kv.expire("lease", 30_000, KVExpireOptions(cas_version=lease_version))
+await client.kv.expire("session:abc", 0)
+
+if await client.kv.exists("session:abc"):
+    ...
+```
+
+### JSON documents
+
+```python
+# Path defaults to "$" (the whole document)
+await client.kv.json_set("user:1", "$", b'{"name": "Ada", "tags": []}')
+doc = await client.kv.json_get("user:1", "$.name")  # GetJsonResult or None
+await client.kv.json_del("user:1", "$.tags")  # returns the new version
+await client.kv.json_del("user:1")  # "$" deletes the key: returns None
+```
+
+### Transactions
+
+```python
+# Every op inside is routed by the transaction's routing key
+async with await client.kv.begin("user:123") as txn:
+    await txn.put("user:123:name", b"Jane")
+    await txn.incr("user:123:visits")
+    await txn.expire("user:123:session", 60_000)
+    result = await txn.commit()
+    print(result.commit_index, result.op_count)
 ```
 
 ## Queue Operations

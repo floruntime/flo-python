@@ -49,12 +49,13 @@ async def kv_example(client: FloClient) -> None:
     # Scan with prefix
     print("\nScanning keys with prefix 'user:'")
     result = await client.kv.scan("user:", ScanOptions(limit=10))
-    for entry in result.entries:
-        print(f"  {entry.key.decode()} = {entry.value.decode() if entry.value else '(no value)'}")
+    for name in result.names:
+        print(f"  {name}")
 
     # Delete a key
     print("\nDeleting 'user:2'")
-    await client.kv.delete("user:2")
+    existed = await client.kv.delete("user:2")
+    print(f"'user:2' existed: {existed}")
 
     # Verify deletion
     value = await client.kv.get("user:2")
