@@ -4,25 +4,49 @@ Key-value store operations for Flo client.
 """
 
 import json
-import struct
 from typing import TYPE_CHECKING, Any
 
-from .exceptions import ServerError, raise_for_status
-from .kv_body import decode_get_answer, decode_set_answer, encode_get_body, encode_set_body
+from .exceptions import IncompleteResponseError, ServerError, raise_for_status
+from .kv_body import (
+    decode_delete_answer,
+    decode_empty_answer,
+    decode_exists_answer,
+    decode_get_answer,
+    decode_history_answer,
+    decode_incr_answer,
+    decode_json_del_answer,
+    decode_json_get_answer,
+    decode_json_set_answer,
+    decode_mget_answer,
+    decode_scan_answer,
+    decode_set_answer,
+    encode_delete_body,
+    encode_exists_body,
+    encode_expire_body,
+    encode_get_body,
+    encode_history_body,
+    encode_incr_body,
+    encode_json_del_body,
+    encode_json_get_body,
+    encode_json_set_body,
+    encode_mget_body,
+    encode_scan_body,
+    encode_set_body,
+)
 from .types import (
     DeleteOptions,
     GetJsonResult,
     GetOptions,
     GetResult,
     HistoryOptions,
+    IncrResult,
     KVExistsOptions,
+    KVExpireOptions,
     KVIncrOptions,
     KVJsonOptions,
     KVMGetOptions,
-    KVTouchOptions,
     MGetEntry,
     OpCode,
-    OptionTag,
     PutOptions,
     PutResult,
     Reason,
@@ -30,29 +54,40 @@ from .types import (
     ScanResult,
     VersionEntry,
 )
-from .wire import OptionsBuilder, parse_history_response, parse_scan_response
+from .wire import RawResponse
 
 if TYPE_CHECKING:
     from .client import FloClient
     from .kv_txn import Transaction
 
 
+def _key(key: str | bytes) -> bytes:
+    return key.encode("utf-8") if isinstance(key, str) else key
+
+
+def _absent(response: RawResponse) -> bool:
+    """Whether a not-found answer says the thing is absent; any other not-found
+    (no such transaction) is raised."""
+    if not response.is_not_found():
+        return False
+    try:
+        raise_for_status(response.status, response.data)
+    except ServerError as e:
+        if e.reason == Reason.NOT_FOUND:
+            return True
+        raise
+    return False  # pragma: no cover - raise_for_status always raises here
+
+
 async def kv_get(
     client: "FloClient", namespace: str, key: str | bytes, opts: GetOptions, txn: int | None = None
 ) -> GetResult | None:
     """kv.get, inside transaction ``txn`` when given."""
-    key_bytes = key.encode("utf-8") if isinstance(key, str) else key
     response = await client._send_and_check(
-        OpCode.KV_GET, namespace, key_bytes, encode_get_body(opts, txn), b"", allow_not_found=True
+        OpCode.KV_GET, namespace, _key(key), encode_get_body(opts, txn), allow_not_found=True
     )
-    if response.is_not_found():
-        # Absent; any other not-found (no such transaction) is an error.
-        try:
-            raise_for_status(response.status, response.data)
-        except ServerError as e:
-            if e.reason == Reason.NOT_FOUND:
-                return None
-            raise
+    if _absent(response):
+        return None
     return decode_get_answer(response.data)
 
 
@@ -65,11 +100,74 @@ async def kv_set(
     txn: int | None = None,
 ) -> PutResult:
     """kv.set, inside transaction ``txn`` when given."""
-    key_bytes = key.encode("utf-8") if isinstance(key, str) else key
     response = await client._send_and_check(
-        OpCode.KV_PUT, namespace, key_bytes, encode_set_body(value, opts, txn), b""
+        OpCode.KV_PUT, namespace, _key(key), encode_set_body(value, opts, txn)
     )
     return decode_set_answer(response.data)
+
+
+async def kv_delete(
+    client: "FloClient",
+    namespace: str,
+    key: str | bytes,
+    opts: DeleteOptions,
+    txn: int | None = None,
+) -> bool | None:
+    """kv.delete, inside transaction ``txn`` when given: whether the key existed
+    (None inside a transaction)."""
+    response = await client._send_and_check(
+        OpCode.KV_DELETE,
+        namespace,
+        _key(key),
+        encode_delete_body(opts.cas_version, opts.routing_key, txn),
+    )
+    return decode_delete_answer(response.data)
+
+
+async def kv_incr(
+    client: "FloClient",
+    namespace: str,
+    key: str | bytes,
+    opts: KVIncrOptions,
+    txn: int | None = None,
+) -> tuple[int | None, int | None]:
+    """kv.incr, inside transaction ``txn`` when given: (version, value)."""
+    response = await client._send_and_check(
+        OpCode.KV_INCR, namespace, _key(key), encode_incr_body(opts.delta, opts.routing_key, txn)
+    )
+    return decode_incr_answer(response.data)
+
+
+async def kv_expire(
+    client: "FloClient",
+    namespace: str,
+    key: str | bytes,
+    ttl_ms: int,
+    opts: KVExpireOptions,
+    txn: int | None = None,
+) -> None:
+    """kv.expire, inside transaction ``txn`` when given."""
+    response = await client._send_and_check(
+        OpCode.KV_EXPIRE,
+        namespace,
+        _key(key),
+        encode_expire_body(ttl_ms, opts.cas_version, opts.routing_key, txn),
+    )
+    decode_empty_answer("kv.expire", response.data)
+
+
+async def kv_exists(
+    client: "FloClient",
+    namespace: str,
+    key: str | bytes,
+    opts: KVExistsOptions,
+    txn: int | None = None,
+) -> bool:
+    """kv.exists, inside transaction ``txn`` when given."""
+    response = await client._send_and_check(
+        OpCode.KV_EXISTS, namespace, _key(key), encode_exists_body(opts.routing_key, txn)
+    )
+    return decode_exists_answer(response.data)[0]
 
 
 class KVOperations:
@@ -121,52 +219,34 @@ class KVOperations:
         self,
         key: str | bytes,
         options: DeleteOptions | None = None,
-    ) -> None:
-        """Delete a key.
+    ) -> bool:
+        """Delete a key and return whether it existed.
 
-        Args:
-            key: The key to delete.
-            options: Optional operation options.
-
-        Note:
-            This operation succeeds even if the key doesn't exist (unless
-            ``if_match`` is set, in which case a missing key is treated as a
-            CAS mismatch).
+        Deleting a missing key is not an error. A ``cas_version`` that isn't
+        the key's raises a conflict with reason CAS_MISMATCH.
 
         Example:
-            await client.kv.delete("user:123")
-            # CAS-protected release — only the owner deletes:
-            await client.kv.delete("lock:resource",
-                                   DeleteOptions(if_match=tag_version))
+            existed = await client.kv.delete("user:123")
+            # Only the owner releases the lock:
+            await client.kv.delete("lock:resource", DeleteOptions(cas_version=held))
         """
         opts = options or DeleteOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-
-        builder = OptionsBuilder()
-        if opts.if_match is not None:
-            builder.add_u64(OptionTag.CAS_VERSION, opts.if_match)
-
-        # Delete succeeds for both OK and NOT_FOUND (when if_match is unset).
-        await self._client._send_and_check(
-            OpCode.KV_DELETE,
-            namespace,
-            key_bytes,
-            b"",
-            builder.build(),
-            allow_not_found=opts.if_match is None,
+        existed = await kv_delete(
+            self._client, self._client.get_namespace(opts.namespace), key, opts
         )
+        if existed is None:
+            raise IncompleteResponseError("kv.delete answer has no existed outside a transaction")
+        return existed
 
     async def mget(
         self,
         keys: list[str | bytes],
         options: KVMGetOptions | None = None,
     ) -> list[MGetEntry]:
-        """Look up many keys in a single round trip.
+        """Look up many keys, one entry per key in the order asked.
 
-        Keys may live on different shards — the server gathers results in
-        parallel and returns one entry per requested key in the same order.
+        The server answers as many keys as fit one answer; this asks again
+        from where it stopped until every key is answered.
 
         Args:
             keys: Keys to fetch (max 256). Empty list returns ``[]``.
@@ -182,232 +262,101 @@ class KVOperations:
         """
         if not keys:
             return []
-        if len(keys) > 256:
-            raise ValueError("mget: too many keys (max 256)")
         opts = options or KVMGetOptions()
         namespace = self._client.get_namespace(opts.namespace)
-
-        # Pack request: [count:u16 LE]([key_len:u16 LE][key])*
-        encoded: list[bytes] = [(k.encode("utf-8") if isinstance(k, str) else k) for k in keys]
-        for k in encoded:
-            if len(k) > 0xFFFF:
-                raise ValueError("mget: key too long")
-        parts: list[bytes] = [struct.pack("<H", len(encoded))]
-        for k in encoded:
-            parts.append(struct.pack("<H", len(k)))
-            parts.append(k)
-        value = b"".join(parts)
-
-        response = await self._client._send_and_check(
-            OpCode.KV_MGET,
-            namespace,
-            b"",
-            value,
-        )
-
-        data = bytes(response.data or b"")
-        if len(data) < 4:
-            return []
-        (count,) = struct.unpack("<I", data[:4])
+        encoded = [_key(k) for k in keys]
+        names = [k if isinstance(k, str) else k.decode("utf-8", errors="replace") for k in keys]
+        body = encode_mget_body(encoded)  # refuses a bad key list before any round trip
         out: list[MGetEntry] = []
-        off = 4
-        for _ in range(count):
-            if off + 1 + 2 > len(data):
-                break
-            status = data[off]
-            off += 1
-            (klen,) = struct.unpack("<H", data[off : off + 2])
-            off += 2
-            if off + klen + 8 + 4 > len(data):
-                break
-            key_bytes = data[off : off + klen]
-            off += klen
-            (version,) = struct.unpack("<Q", data[off : off + 8])
-            off += 8
-            (vlen,) = struct.unpack("<I", data[off : off + 4])
-            off += 4
-            if off + vlen > len(data):
-                break
-            val = data[off : off + vlen]
-            off += vlen
-            out.append(
-                MGetEntry(
-                    key=key_bytes.decode("utf-8", errors="replace"),
-                    value=bytes(val),
-                    version=version,
-                    found=status == 0,
-                )
-            )
-        return out
+        while True:
+            response = await self._client._send_and_check(OpCode.KV_MGET, namespace, b"", body)
+            entries, next_index = decode_mget_answer(response.data, names[len(out) :])
+            if next_index == 0:
+                raise IncompleteResponseError("kv.mget answered none of the keys asked")
+            out.extend(entries)
+            if next_index is None:
+                return out
+            body = encode_mget_body(encoded[len(out) :])
 
     async def scan(
         self,
-        prefix: str | bytes,
+        prefix: str | bytes = "",
         options: ScanOptions | None = None,
     ) -> ScanResult:
-        """Scan keys with a prefix.
-
-        Args:
-            prefix: Key prefix to scan.
-            options: Optional scan options (cursor, limit).
-
-        Returns:
-            ScanResult with entries, cursor, and has_more flag.
+        """List the names of keys with a prefix ("" for all), a page at a time.
 
         Example:
-            # Scan all users
             result = await client.kv.scan("user:")
-            for entry in result.entries:
-                print(f"{entry.key}: {entry.value}")
+            for name in result.names:
+                print(name)
 
-            # Paginated scan
-            result = await client.kv.scan("user:", ScanOptions(limit=100))
-            while result.has_more:
+            # Next pages
+            while result.cursor is not None:
                 result = await client.kv.scan("user:", ScanOptions(cursor=result.cursor))
         """
         opts = options or ScanOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        prefix_bytes = prefix.encode("utf-8") if isinstance(prefix, str) else prefix
-
-        # Value: [limit:u32][cursor...]
-        limit = opts.limit if opts.limit is not None else 0  # 0 = server default
-        cursor = opts.cursor if opts.cursor is not None else b""
-        value = struct.pack("<I", limit) + cursor
-
         response = await self._client._send_and_check(
             OpCode.KV_SCAN,
-            namespace,
-            prefix_bytes,
-            value,
-            b"",
+            self._client.get_namespace(opts.namespace),
+            _key(prefix),
+            encode_scan_body(opts.limit, opts.cursor),
         )
-
-        return parse_scan_response(response.data)
+        names, cursor = decode_scan_answer(response.data)
+        return ScanResult(names=names, cursor=cursor)
 
     async def history(
         self,
         key: str | bytes,
         options: HistoryOptions | None = None,
     ) -> list[VersionEntry]:
-        """Get version history for a key.
-
-        Args:
-            key: The key to get history for.
-            options: Optional history options (limit).
-
-        Returns:
-            List of VersionEntry with version, timestamp, and value.
+        """A key's versions, newest first, each with when it was written.
 
         Example:
-            history = await client.kv.history("user:123", HistoryOptions(limit=10))
-            for entry in history:
-                print(f"v{entry.version}: {entry.value} at {entry.timestamp}")
+            for entry in await client.kv.history("user:123", HistoryOptions(limit=10)):
+                print(f"v{entry.version} at {entry.at_ms}: {entry.value}")
         """
         opts = options or HistoryOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-
-        # Build TLV options
-        builder = OptionsBuilder()
-
-        if opts.limit is not None:
-            builder.add_u32(OptionTag.LIMIT, opts.limit)
-
         response = await self._client._send_and_check(
             OpCode.KV_HISTORY,
-            namespace,
-            key_bytes,
-            b"",
-            builder.build(),
+            self._client.get_namespace(opts.namespace),
+            _key(key),
+            encode_history_body(opts.limit),
         )
+        return decode_history_answer(response.data)
 
-        return parse_history_response(response.data)
-
-    # ── Extended ops: counters, TTL lifecycle, exists, JSON paths ──────
+    # ── Counters, TTL, exists, JSON paths ──────────────────────────────
 
     async def incr(
         self,
         key: str | bytes,
         options: KVIncrOptions | None = None,
-    ) -> int:
+    ) -> IncrResult:
         """Atomically add ``delta`` (default +1) to the i64 counter at ``key``.
 
-        The first ``incr`` on a missing key creates it at the delta value.
-        Raises a server error if the key already holds a non-counter value.
-
-        Returns:
-            The new counter value as a Python int.
+        The first ``incr`` on a missing key creates it at the delta value. A
+        key that holds something else raises with reason WRONG_TYPE.
         """
         opts = options or KVIncrOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-
-        value = b""
-        if opts.delta is not None:
-            value = struct.pack("<q", opts.delta)
-
-        response = await self._client._send_and_check(
-            OpCode.KV_INCR,
-            namespace,
-            key_bytes,
-            value,
-            b"",
+        version, value = await kv_incr(
+            self._client, self._client.get_namespace(opts.namespace), key, opts
         )
-        # Wire body: [version:u64][counter:i64 LE]
-        if not response.data or len(response.data) < 16:
-            raise ValueError("incr: short response")
-        return int(struct.unpack("<q", response.data[8:16])[0])
+        if version is None or value is None:
+            raise IncompleteResponseError("kv.incr answer has no value outside a transaction")
+        return IncrResult(value=value, version=version)
 
-    async def touch(
+    async def expire(
         self,
         key: str | bytes,
         ttl_ms: int,
-        options: KVTouchOptions | None = None,
+        options: KVExpireOptions | None = None,
     ) -> None:
-        """Set the TTL on an existing key, in milliseconds. ``ttl_ms=0`` clears the TTL.
+        """Set the TTL on an existing key, in milliseconds; ``ttl_ms=0`` clears it.
 
-        When ``options.if_match`` is set, the touch only succeeds if the
-        current key version equals it — enabling race-free lease renewal.
+        With ``cas_version`` it only succeeds when the key's version is that,
+        for race-free lease renewal.
         """
-        opts = options or KVTouchOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        builder = OptionsBuilder()
-        if opts.if_match is not None:
-            builder.add_u64(OptionTag.CAS_VERSION, opts.if_match)
-        await self._client._send_and_check(
-            OpCode.KV_TOUCH,
-            namespace,
-            key_bytes,
-            struct.pack("<Q", ttl_ms),
-            builder.build(),
-        )
-
-    async def persist(
-        self,
-        key: str | bytes,
-        options: KVTouchOptions | None = None,
-    ) -> None:
-        """Clear the TTL on an existing key, making it permanent.
-
-        When ``options.if_match`` is set, the persist only succeeds if the
-        current key version equals it.
-        """
-        opts = options or KVTouchOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        builder = OptionsBuilder()
-        if opts.if_match is not None:
-            builder.add_u64(OptionTag.CAS_VERSION, opts.if_match)
-        await self._client._send_and_check(
-            OpCode.KV_PERSIST,
-            namespace,
-            key_bytes,
-            b"",
-            builder.build(),
-        )
+        opts = options or KVExpireOptions()
+        await kv_expire(self._client, self._client.get_namespace(opts.namespace), key, ttl_ms, opts)
 
     async def exists(
         self,
@@ -416,19 +365,7 @@ class KVOperations:
     ) -> bool:
         """Return ``True`` if ``key`` is present without transferring its value."""
         opts = options or KVExistsOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        response = await self._client._send_and_check(
-            OpCode.KV_EXISTS,
-            namespace,
-            key_bytes,
-            b"",
-            b"",
-        )
-        # Wire body: [version:u64][1 byte 0/1]
-        if not response.data or len(response.data) < 9:
-            return False
-        return response.data[8] == 1
+        return await kv_exists(self._client, self._client.get_namespace(opts.namespace), key, opts)
 
     async def json_get(
         self,
@@ -438,32 +375,22 @@ class KVOperations:
     ) -> GetJsonResult[Any] | None:
         """Extract the value at ``path`` from the JSON document at ``key``.
 
-        Returns a :class:`GetJsonResult` whose ``value`` is the already-parsed
-        JSON (the ``KV_JSON_GET`` wire body is always a JSON document, so it is
-        decoded for you) together with the document's current version, or
-        ``None`` if the key or path is missing.
+        Returns a :class:`GetJsonResult` whose ``value`` is the parsed JSON,
+        with the document's current version, or ``None`` if the key or path
+        is missing.
         """
         opts = options or KVJsonOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        path_bytes = path.encode("utf-8") if isinstance(path, str) else path
-
         response = await self._client._send_and_check(
             OpCode.KV_JSON_GET,
-            namespace,
-            key_bytes,
-            path_bytes,
-            b"",
+            self._client.get_namespace(opts.namespace),
+            _key(key),
+            encode_json_get_body(path, opts.routing_key),
             allow_not_found=True,
         )
-        if response.is_not_found():
+        if _absent(response):
             return None
-        # Wire body: [version:u64 LE][json bytes]
-        if not response.data or len(response.data) < 8:
-            return None
-        version = int.from_bytes(response.data[:8], "little")
-        value = json.loads(bytes(response.data[8:]).decode("utf-8"))
-        return GetJsonResult(value=value, version=version)
+        version, document = decode_json_get_answer(response.data)
+        return GetJsonResult(value=json.loads(document.decode("utf-8")), version=version)
 
     async def json_set(
         self,
@@ -472,69 +399,46 @@ class KVOperations:
         json_value: bytes,
         options: KVJsonOptions | None = None,
     ) -> PutResult:
-        """Set the JSON value at ``path`` inside the document at ``key``.
+        """Set the JSON value at ``path`` ("$" when empty) inside the document at ``key``.
 
         Path ``"$"`` replaces the whole document (and creates the key if missing).
-        Sub-paths require the key to already exist. Returns a :class:`PutResult`
-        with the new document version.
+        Sub-paths require the key to already exist. Returns the new version.
         """
         opts = options or KVJsonOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        path_str = path or "$"
-        path_bytes = path_str.encode("utf-8")
-        if len(path_bytes) > 0xFFFF:
-            raise ValueError("json_set: path too long")
-        value = struct.pack("<H", len(path_bytes)) + path_bytes + json_value
         response = await self._client._send_and_check(
             OpCode.KV_JSON_SET,
-            namespace,
-            key_bytes,
-            value,
-            b"",
+            self._client.get_namespace(opts.namespace),
+            _key(key),
+            encode_json_set_body(path, json_value, opts.routing_key),
         )
-        version = (
-            int.from_bytes(response.data[:8], "little")
-            if response.data and len(response.data) >= 8
-            else 0
-        )
-        return PutResult(version=version)
+        return PutResult(version=decode_json_set_answer(response.data))
 
     async def json_del(
         self,
         key: str | bytes,
         path: str = "$",
         options: KVJsonOptions | None = None,
-    ) -> PutResult:
+    ) -> PutResult | None:
         """Remove the value at ``path`` from the JSON document at ``key``.
 
-        For sub-paths the returned :class:`PutResult` carries the new document
-        version. For ``"$"`` (whole document delete) the version is ``0`` since
-        the key is gone.
+        Returns the document's new version, or ``None`` for ``"$"``, which
+        deletes the key.
         """
         opts = options or KVJsonOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        path_bytes = (path or "$").encode("utf-8")
         response = await self._client._send_and_check(
             OpCode.KV_JSON_DEL,
-            namespace,
-            key_bytes,
-            path_bytes,
-            b"",
+            self._client.get_namespace(opts.namespace),
+            _key(key),
+            encode_json_del_body(path, opts.routing_key),
         )
-        version = (
-            int.from_bytes(response.data[:8], "little")
-            if response.data and len(response.data) >= 8
-            else 0
-        )
-        return PutResult(version=version)
+        version = decode_json_del_answer(response.data)
+        return None if version is None else PutResult(version=version)
 
     async def begin(self, routing_key: str) -> "Transaction":
         """Open a per-shard KV transaction pinned to ``routing_key``'s partition.
 
-        Every key written or read inside the transaction must hash to the same
-        partition; otherwise the server returns a "kv_txn_cross_shard" error.
+        Every op inside the transaction is routed by ``routing_key``; the
+        server refuses one routed otherwise with reason WRONG_ROUTING_KEY.
 
         Returns a :class:`Transaction` handle. Use as an async context manager
         for automatic rollback on exception::

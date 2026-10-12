@@ -24,7 +24,6 @@ from flo.wire import (
     parse_enqueue_response,
     parse_pending_entries,
     parse_response,
-    parse_scan_response,
     serialize_action_invoke_value,
     serialize_group_claim_value,
     serialize_group_pending_value,
@@ -54,34 +53,34 @@ class TestOptionsBuilder:
 
     def test_add_u64(self) -> None:
         builder = OptionsBuilder()
-        builder.add_u64(OptionTag.TTL_MS, 3_600_000)
+        builder.add_u64(OptionTag.MAX_AGE_SECONDS, 3_600_000)
         result = builder.build()
 
-        assert result[0] == 0x01  # TTL_MS tag
+        assert result[0] == 0x26  # MAX_AGE_SECONDS tag
         assert result[1] == 8  # length
         assert struct.unpack("<Q", result[2:])[0] == 3_600_000
 
     def test_add_bytes(self) -> None:
         builder = OptionsBuilder()
-        builder.add_bytes(OptionTag.ROUTING_KEY, b"abc123")
+        builder.add_bytes(OptionTag.PARTITION_KEY, b"abc123")
         result = builder.build()
 
-        assert result[0] == 0x08  # ROUTING_KEY tag
+        assert result[0] == 0x25  # PARTITION_KEY tag
         assert result[1] == 6  # length
         assert result[2:] == b"abc123"
 
     def test_add_flag(self) -> None:
         builder = OptionsBuilder()
-        builder.add_flag(OptionTag.IF_NOT_EXISTS)
+        builder.add_flag(OptionTag.DRY_RUN)
         result = builder.build()
 
-        assert result == bytes([0x03, 0])  # IF_NOT_EXISTS tag, length 0
+        assert result == bytes([0x28, 0])  # DRY_RUN tag, length 0
 
     def test_multiple_options(self) -> None:
         builder = OptionsBuilder()
-        builder.add_u64(OptionTag.TTL_MS, 3_600_000)
+        builder.add_u64(OptionTag.MAX_AGE_SECONDS, 3_600_000)
         builder.add_u8(OptionTag.PRIORITY, 5)
-        builder.add_bytes(OptionTag.ROUTING_KEY, b"abc")
+        builder.add_bytes(OptionTag.PARTITION_KEY, b"abc")
         result = builder.build()
 
         assert len(result) == 10 + 3 + 5  # u64(10) + u8(3) + bytes(2+3)
@@ -89,7 +88,7 @@ class TestOptionsBuilder:
     def test_bytes_too_large(self) -> None:
         builder = OptionsBuilder()
         with pytest.raises(ValueError, match="too large"):
-            builder.add_bytes(OptionTag.ROUTING_KEY, b"x" * 256)
+            builder.add_bytes(OptionTag.PARTITION_KEY, b"x" * 256)
 
 
 class TestOptionsIterator:
@@ -98,7 +97,7 @@ class TestOptionsIterator:
     def test_iterate_options(self) -> None:
         # Build options
         builder = OptionsBuilder()
-        builder.add_u64(OptionTag.TTL_MS, 3_600_000)
+        builder.add_u64(OptionTag.MAX_AGE_SECONDS, 3_600_000)
         builder.add_u8(OptionTag.PRIORITY, 5)
         data = builder.build()
 
@@ -106,7 +105,7 @@ class TestOptionsIterator:
         options = list(OptionsIterator(data))
         assert len(options) == 2
 
-        assert options[0].tag == OptionTag.TTL_MS
+        assert options[0].tag == OptionTag.MAX_AGE_SECONDS
         assert options[0].as_u64() == 3_600_000
 
         assert options[1].tag == OptionTag.PRIORITY
@@ -114,7 +113,7 @@ class TestOptionsIterator:
 
     def test_find_option(self) -> None:
         builder = OptionsBuilder()
-        builder.add_u64(OptionTag.TTL_MS, 7_200_000)
+        builder.add_u64(OptionTag.MAX_AGE_SECONDS, 7_200_000)
         builder.add_u8(OptionTag.PRIORITY, 10)
         data = builder.build()
 
@@ -125,22 +124,22 @@ class TestOptionsIterator:
         assert priority is not None
         assert priority.as_u8() == 10
 
-        # Find TTL
-        ttl = iter.find(OptionTag.TTL_MS)
-        assert ttl is not None
-        assert ttl.as_u64() == 7_200_000
+        # Find max age
+        age = iter.find(OptionTag.MAX_AGE_SECONDS)
+        assert age is not None
+        assert age.as_u64() == 7_200_000
 
         # Find non-existent
-        cas = iter.find(OptionTag.CAS_VERSION)
+        cas = iter.find(OptionTag.ACK_TIMEOUT_MS)
         assert cas is None
 
     def test_flag_option(self) -> None:
         builder = OptionsBuilder()
-        builder.add_flag(OptionTag.IF_NOT_EXISTS)
+        builder.add_flag(OptionTag.DRY_RUN)
         data = builder.build()
 
         iter = OptionsIterator(data)
-        opt = iter.find(OptionTag.IF_NOT_EXISTS)
+        opt = iter.find(OptionTag.DRY_RUN)
         assert opt is not None
         assert opt.is_flag()
 
@@ -170,7 +169,7 @@ class TestSerializeRequest:
         assert request_id == 42
         assert op_code == OpCode.KV_GET
         assert flags == 0
-        assert table_hash == 0x02E15EE74C0AD72C
+        assert table_hash == 0x8AA29E7A0C35FD78
 
     def test_table_op_payload_is_namespace_key_body(self) -> None:
         request = serialize_request(
@@ -196,12 +195,12 @@ class TestSerializeRequest:
 
     def test_request_with_options(self) -> None:
         builder = OptionsBuilder()
-        builder.add_u64(OptionTag.TTL_MS, 3_600_000)
+        builder.add_u64(OptionTag.MAX_AGE_SECONDS, 3_600_000)
         options = builder.build()
 
         request = serialize_request(
             request_id=1,
-            op_code=OpCode.KV_TOUCH,
+            op_code=OpCode.STREAM_READ,
             namespace=b"ns",
             key=b"key",
             value=b"val",
@@ -310,50 +309,6 @@ class TestParseResponse:
         parsed = parse_response(response_data)
 
         assert parsed.data == b""
-
-
-class TestParseScanResponse:
-    """Tests for scan response parsing."""
-
-    def test_parse_scan_response(self) -> None:
-        # Build scan response:
-        # [count:u32][entries...][has_more:u8][cursor_len:u16][cursor]
-        data = bytearray()
-        data.extend(struct.pack("<I", 2))  # count
-
-        # Entry 1: key="key1", value="val1"
-        data.extend(struct.pack("<H", 4))
-        data.extend(b"key1")
-        data.extend(struct.pack("<I", 4))
-        data.extend(b"val1")
-
-        # Entry 2: key="key2", value=""
-        data.extend(struct.pack("<H", 4))
-        data.extend(b"key2")
-        data.extend(struct.pack("<I", 0))
-
-        data.append(1)  # has_more = true
-        data.extend(struct.pack("<H", 4))  # cursor_len
-        data.extend(b"curs")  # cursor
-
-        result = parse_scan_response(bytes(data))
-
-        assert result.has_more is True
-        assert result.cursor == b"curs"
-        assert len(result.entries) == 2
-        assert result.entries[0].key == b"key1"
-        assert result.entries[0].value == b"val1"
-        assert result.entries[1].key == b"key2"
-        assert result.entries[1].value is None
-
-    def test_parse_scan_last_page(self) -> None:
-        data = struct.pack("<I", 0) + b"\x00" + struct.pack("<H", 0)
-
-        result = parse_scan_response(data)
-
-        assert result.entries == []
-        assert result.has_more is False
-        assert result.cursor is None
 
 
 class TestParseDequeueResponse:

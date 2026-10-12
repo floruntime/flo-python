@@ -17,7 +17,7 @@ VERSION: int = 0x02
 # The hash of the op table this SDK was built for, written into every request
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses.
-TABLE_HASH: int = 0x02E15EE74C0AD72C
+TABLE_HASH: int = 0x8AA29E7A0C35FD78
 
 
 class Reason(IntEnum):
@@ -60,6 +60,10 @@ class Reason(IntEnum):
     WRITES_STOPPED = 22
     # Too many writes wait for commit.
     TOO_MANY_PROPOSALS = 23
+    # The key's value isn't what the op works on (a counter, a JSON document).
+    WRONG_TYPE = 24
+    # The shard holds as many open transactions as it may.
+    TOO_MANY_TRANSACTIONS = 25
 
 
 class Ran(IntEnum):
@@ -138,9 +142,8 @@ class OpCode(IntEnum):
     KV_BEGIN_TXN = 0x110
     KV_COMMIT_TXN = 0x111
     KV_ROLLBACK_TXN = 0x112
-    # KV Extended (TTL lifecycle, exists)
-    KV_TOUCH = 0x113
-    KV_PERSIST = 0x114
+    # KV Extended (TTL, exists)
+    KV_EXPIRE = 0x113
     KV_EXISTS = 0x115
 
     # ── Streams (0x130 – 0x14F) ──
@@ -293,14 +296,8 @@ class OptionTag(IntEnum):
     Organized by feature area, matching proto.zig definitions.
     """
 
-    # KV Options (0x01 - 0x0F)
-    TTL_MS = 0x01  # u64: Time-to-live in milliseconds (0 = no expiration)
-    CAS_VERSION = 0x02  # u64: Expected version for compare-and-swap
-    IF_NOT_EXISTS = 0x03  # void: Only set if key doesn't exist (NX)
-    IF_EXISTS = 0x04  # void: Only set if key exists (XX)
-    LIMIT = 0x05  # u32: Maximum number of results for scan/list operations
-    ROUTING_KEY = 0x08  # string: Explicit routing key for shard co-location
-    TXN_ID = 0x09  # u64: Transaction ID for per-shard transactions
+    # General Options (0x01 - 0x0F)
+    LIMIT = 0x05  # u32: Maximum number of results for list operations
 
     # Queue Options (0x10 - 0x1F)
     PRIORITY = 0x10  # u8: Message priority (0-255, lower is taken first)
@@ -340,29 +337,32 @@ class OptionTag(IntEnum):
 
 
 @dataclass
-class KVEntry:
-    """KV entry from scan results."""
-
-    key: bytes
-    value: bytes | None
-
-
-@dataclass
 class ScanResult:
-    """Result of a KV scan operation."""
+    """A page of a KV scan: the keys' names, and the cursor for the next page."""
 
-    entries: list[KVEntry]
-    cursor: bytes | None  # None if no more pages
-    has_more: bool
+    names: list[str]
+    cursor: bytes | None  # None on the last page
+
+    @property
+    def has_more(self) -> bool:
+        return self.cursor is not None
 
 
 @dataclass
 class VersionEntry:
-    """KV version entry from history."""
+    """One version of a key from KV history."""
 
     version: int
-    timestamp: int
+    at_ms: int  # When it was written, unix ms
     value: bytes
+
+
+@dataclass
+class IncrResult:
+    """A KV incr's new counter value and the key's new version."""
+
+    value: int
+    version: int
 
 
 @dataclass
@@ -621,7 +621,10 @@ class DeleteOptions:
     """Options for KV delete operations."""
 
     namespace: str | None = None
-    if_match: int | None = None  # CAS: only delete when current version equals if_match
+    # Only delete when the key's version is this.
+    cas_version: int | None = None
+    # Routes the request in place of the key.
+    routing_key: str | None = None
 
 
 @dataclass
@@ -629,8 +632,9 @@ class ScanOptions:
     """Options for KV scan operations."""
 
     namespace: str | None = None
+    # The cursor from the previous page; None for the first.
     cursor: bytes | None = None
-    limit: int | None = None
+    limit: int = 100  # 1..1024 names per page
 
 
 @dataclass
@@ -638,7 +642,7 @@ class HistoryOptions:
     """Options for KV history operations."""
 
     namespace: str | None = None
-    limit: int | None = None
+    limit: int = 10  # 1..65 versions, newest first
 
 
 @dataclass
@@ -646,15 +650,20 @@ class KVIncrOptions:
     """Options for KV incr operations."""
 
     namespace: str | None = None
-    delta: int | None = None  # default +1 when None
+    delta: int = 1
+    # Routes the request in place of the key.
+    routing_key: str | None = None
 
 
 @dataclass
-class KVTouchOptions:
-    """Options for KV touch / persist operations."""
+class KVExpireOptions:
+    """Options for KV expire operations."""
 
     namespace: str | None = None
-    if_match: int | None = None  # CAS: only succeed when current version equals if_match
+    # Only succeed when the key's version is this.
+    cas_version: int | None = None
+    # Routes the request in place of the key.
+    routing_key: str | None = None
 
 
 @dataclass
@@ -662,6 +671,8 @@ class KVExistsOptions:
     """Options for KV exists operations."""
 
     namespace: str | None = None
+    # Routes the request in place of the key.
+    routing_key: str | None = None
 
 
 @dataclass
@@ -669,6 +680,8 @@ class KVJsonOptions:
     """Options for KV JSON.* operations."""
 
     namespace: str | None = None
+    # Routes the request in place of the key.
+    routing_key: str | None = None
 
 
 @dataclass

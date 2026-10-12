@@ -1,9 +1,7 @@
 """Flo KV Per-Shard Transactions
 
-Transactions are pinned to a single partition (chosen by the routing key
-passed to ``begin``). Every key written or read inside the transaction must
-hash to the same partition; otherwise the server returns a
-"kv_txn_cross_shard" error.
+Transactions are pinned to a single partition, chosen by the routing key
+passed to ``begin``; every op inside the transaction is routed by it.
 
 Caps (server-enforced):
     * 256 ops per transaction
@@ -18,21 +16,28 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import struct
 from typing import TYPE_CHECKING, Any
 
-from .kv import kv_get, kv_set
+from .exceptions import ValidationError
+from .kv import kv_delete, kv_exists, kv_expire, kv_get, kv_incr, kv_set
+from .kv_body import (
+    decode_empty_answer,
+    decode_txn_begin_answer,
+    decode_txn_commit_answer,
+    encode_txn_body,
+)
 from .types import (
     DeleteOptions,
     GetOptions,
     GetResult,
     KVCommitResult,
+    KVExistsOptions,
+    KVExpireOptions,
+    KVIncrOptions,
     OpCode,
-    OptionTag,
     PutOptions,
     PutResult,
 )
-from .wire import OptionsBuilder
 
 if TYPE_CHECKING:
     from .client import FloClient
@@ -85,13 +90,6 @@ class Transaction:
         """The partition hash this transaction is bound to."""
         return self._pinned_hash
 
-    def _txn_options(self) -> OptionsBuilder:
-        b = OptionsBuilder()
-        if self._routing_key:
-            b.add_bytes(OptionTag.ROUTING_KEY, self._routing_key.encode("utf-8"))
-        b.add_u64(OptionTag.TXN_ID, self._txn_id)
-        return b
-
     def _check_alive(self) -> None:
         if self._done:
             raise TxnFinishedError("transaction already committed or rolled back")
@@ -123,81 +121,33 @@ class Transaction:
         key: str | bytes,
         options: DeleteOptions | None = None,
     ) -> None:
-        """Buffer a delete inside the transaction."""
+        """Buffer a delete inside the transaction; whether the key existed is unknown."""
         self._check_alive()
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        builder = self._txn_options()
-        await self._client._send_and_check(
-            OpCode.KV_DELETE,
-            self._namespace,
-            key_bytes,
-            b"",
-            builder.build(),
-            allow_not_found=True,
-        )
+        opts = dataclasses.replace(options or DeleteOptions(), routing_key=self._routing_key)
+        await kv_delete(self._client, self._namespace, key, opts, self._txn_id)
 
-    async def incr(self, key: str | bytes, delta: int = 1) -> int:
-        """Buffer an atomic counter increment inside the transaction."""
+    async def incr(self, key: str | bytes, delta: int = 1) -> None:
+        """Buffer an atomic counter increment; its value is unknown until commit."""
         self._check_alive()
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        builder = self._txn_options()
-        value = struct.pack("<q", delta)
-        response = await self._client._send_and_check(
-            OpCode.KV_INCR,
-            self._namespace,
-            key_bytes,
-            value,
-            builder.build(),
-        )
-        if not response.data or len(response.data) < 8:
-            return 0
-        return int(struct.unpack("<q", response.data[:8])[0])
+        opts = KVIncrOptions(delta=delta, routing_key=self._routing_key)
+        await kv_incr(self._client, self._namespace, key, opts, self._txn_id)
 
-    async def touch(self, key: str | bytes, ttl_ms: int) -> None:
-        """Set the TTL on an existing key inside the transaction, in milliseconds.
-
-        ``ttl_ms=0`` clears the TTL.
-        """
+    async def expire(
+        self,
+        key: str | bytes,
+        ttl_ms: int,
+        options: KVExpireOptions | None = None,
+    ) -> None:
+        """Buffer setting the TTL on a key, in milliseconds; ``ttl_ms=0`` clears it."""
         self._check_alive()
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        builder = self._txn_options()
-        await self._client._send_and_check(
-            OpCode.KV_TOUCH,
-            self._namespace,
-            key_bytes,
-            struct.pack("<Q", ttl_ms),
-            builder.build(),
-        )
-
-    async def persist(self, key: str | bytes) -> None:
-        """Remove the TTL on a key inside the transaction."""
-        self._check_alive()
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        builder = self._txn_options()
-        await self._client._send_and_check(
-            OpCode.KV_PERSIST,
-            self._namespace,
-            key_bytes,
-            b"",
-            builder.build(),
-        )
+        opts = dataclasses.replace(options or KVExpireOptions(), routing_key=self._routing_key)
+        await kv_expire(self._client, self._namespace, key, ttl_ms, opts, self._txn_id)
 
     async def exists(self, key: str | bytes) -> bool:
-        """Check key existence inside the transaction."""
+        """Check key existence inside the transaction (sees buffered writes)."""
         self._check_alive()
-        key_bytes = key.encode("utf-8") if isinstance(key, str) else key
-        builder = self._txn_options()
-        response = await self._client._send_and_check(
-            OpCode.KV_EXISTS,
-            self._namespace,
-            key_bytes,
-            b"",
-            builder.build(),
-        )
-        # Wire body: [version:u64 LE][1 byte 0/1]
-        if not response.data or len(response.data) < 9:
-            return False
-        return response.data[8] == 1
+        opts = KVExistsOptions(routing_key=self._routing_key)
+        return await kv_exists(self._client, self._namespace, key, opts, self._txn_id)
 
     # ── Disallowed inside a transaction ───────────────────────────────
 
@@ -229,24 +179,11 @@ class Transaction:
         """
         self._check_alive()
         self._done = True
-        builder = OptionsBuilder()
-        builder.add_u64(OptionTag.TXN_ID, self._txn_id)
         response = await self._client._send_and_check(
-            OpCode.KV_COMMIT_TXN,
-            self._namespace,
-            b"",
-            b"",
-            builder.build(),
+            OpCode.KV_COMMIT_TXN, self._namespace, b"", encode_txn_body(self._txn_id)
         )
-        # Wire body: [variant:u8=1][commit_index:u64 LE][op_count:u16 LE]
-        if not response.data or len(response.data) < 11:
-            raise RuntimeError(
-                f"flo: short KV commit reply ({len(response.data) if response.data else 0} bytes)"
-            )
-        return KVCommitResult(
-            commit_index=struct.unpack("<Q", response.data[1:9])[0],
-            op_count=struct.unpack("<H", response.data[9:11])[0],
-        )
+        commit_index, op_count = decode_txn_commit_answer(response.data)
+        return KVCommitResult(commit_index=commit_index, op_count=op_count)
 
     async def rollback(self) -> None:
         """Discard the buffered operations without committing.
@@ -256,15 +193,10 @@ class Transaction:
         if self._done:
             return
         self._done = True
-        builder = OptionsBuilder()
-        builder.add_u64(OptionTag.TXN_ID, self._txn_id)
-        await self._client._send_and_check(
-            OpCode.KV_ROLLBACK_TXN,
-            self._namespace,
-            b"",
-            b"",
-            builder.build(),
+        response = await self._client._send_and_check(
+            OpCode.KV_ROLLBACK_TXN, self._namespace, b"", encode_txn_body(self._txn_id)
         )
+        decode_empty_answer("kv.txn_rollback", response.data)
 
     async def __aenter__(self) -> Transaction:
         return self
@@ -281,28 +213,19 @@ async def begin(
     namespace: str,
     routing_key: str,
 ) -> Transaction:
-    """Open a new per-shard KV transaction."""
-    builder = OptionsBuilder()
-    if routing_key:
-        builder.add_bytes(OptionTag.ROUTING_KEY, routing_key.encode("utf-8"))
+    """Open a new per-shard KV transaction: its routing key is the request's key."""
+    if not routing_key:
+        raise ValidationError("a transaction needs a routing key")
     response = await client._send_and_check(
-        OpCode.KV_BEGIN_TXN,
-        namespace,
-        routing_key.encode("utf-8"),
-        b"",
-        builder.build(),
+        OpCode.KV_BEGIN_TXN, namespace, routing_key.encode("utf-8"), b""
     )
-    # Wire body: [variant:u8=0][txn_id:u64 LE][pinned_hash:u64 LE]
-    if not response.data or len(response.data) < 17:
-        raise RuntimeError(
-            f"flo: short KV begin reply ({len(response.data) if response.data else 0} bytes)"
-        )
+    txn_id, pinned_hash = decode_txn_begin_answer(response.data)
     return Transaction(
         client=client,
         namespace=namespace,
         routing_key=routing_key,
-        txn_id=struct.unpack("<Q", response.data[1:9])[0],
-        pinned_hash=struct.unpack("<Q", response.data[9:17])[0],
+        txn_id=txn_id,
+        pinned_hash=pinned_hash,
     )
 
 

@@ -33,12 +33,10 @@ from .types import (
     TABLE_HASH,
     VERSION,
     DequeueResult,
-    KVEntry,
     Message,
     OpCode,
     OptionTag,
     PendingEntry,
-    ScanResult,
     StatusCode,
     StorageTier,
     StreamAppendResult,
@@ -46,7 +44,6 @@ from .types import (
     StreamInfo,
     StreamReadResult,
     StreamRecord,
-    VersionEntry,
 )
 
 # Request header (32 bytes):
@@ -388,95 +385,6 @@ def parse_response(data: bytes) -> RawResponse:
 # =============================================================================
 # Response Data Parsing
 # =============================================================================
-
-
-def parse_scan_response(data: bytes) -> ScanResult:
-    """Parse scan response data.
-
-    Format: [count:u32][entries...][has_more:u8][cursor_len:u16][cursor]
-    Entry format: [key_len:u16][key][value_len:u32][value]
-    """
-    if len(data) < 4:
-        raise IncompleteResponseError("Scan response too short")
-
-    count = struct.unpack("<I", data[0:4])[0]
-    offset = 4
-
-    entries: list[KVEntry] = []
-    for _ in range(count):
-        if len(data) < offset + 2:
-            raise IncompleteResponseError("Scan response key length incomplete")
-        key_len = struct.unpack("<H", data[offset : offset + 2])[0]
-        offset += 2
-
-        if len(data) < offset + key_len:
-            raise IncompleteResponseError("Scan response key incomplete")
-        key = data[offset : offset + key_len]
-        offset += key_len
-
-        if len(data) < offset + 4:
-            raise IncompleteResponseError("Scan response value length incomplete")
-        value_len = struct.unpack("<I", data[offset : offset + 4])[0]
-        offset += 4
-
-        value: bytes | None = None
-        if value_len > 0:
-            if len(data) < offset + value_len:
-                raise IncompleteResponseError("Scan response value incomplete")
-            value = data[offset : offset + value_len]
-            offset += value_len
-
-        entries.append(KVEntry(key=key, value=value))
-
-    if len(data) < offset + 3:
-        raise IncompleteResponseError("Scan response pagination trailer incomplete")
-    has_more = data[offset] != 0
-    cursor_len = struct.unpack("<H", data[offset + 1 : offset + 3])[0]
-    offset += 3
-    if len(data) < offset + cursor_len:
-        raise IncompleteResponseError("Scan response cursor incomplete")
-    cursor = data[offset : offset + cursor_len] if cursor_len > 0 else None
-
-    return ScanResult(entries=entries, cursor=cursor, has_more=has_more)
-
-
-def parse_history_response(data: bytes) -> list[VersionEntry]:
-    """Parse history response data.
-
-    Format: [count:u32][entries...]
-    Entry format: [version:u64][timestamp:i64][value_len:u32][value]
-    """
-    if len(data) < 4:
-        raise IncompleteResponseError("History response too short")
-
-    offset = 0
-
-    count = struct.unpack("<I", data[offset : offset + 4])[0]
-    offset += 4
-
-    entries: list[VersionEntry] = []
-    for _ in range(count):
-        if len(data) < offset + 20:
-            raise IncompleteResponseError("History response entry incomplete")
-
-        version = struct.unpack("<Q", data[offset : offset + 8])[0]
-        offset += 8
-
-        timestamp = struct.unpack("<q", data[offset : offset + 8])[0]
-        offset += 8
-
-        value_len = struct.unpack("<I", data[offset : offset + 4])[0]
-        offset += 4
-
-        if len(data) < offset + value_len:
-            raise IncompleteResponseError("History response value incomplete")
-
-        value = data[offset : offset + value_len]
-        offset += value_len
-
-        entries.append(VersionEntry(version=version, timestamp=timestamp, value=value))
-
-    return entries
 
 
 def parse_dequeue_response(data: bytes) -> DequeueResult:
