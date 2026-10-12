@@ -73,7 +73,8 @@ H = bytes.fromhex
 def test_request_bodies_match_the_servers_schemas() -> None:
     assert kb.encode_delete_body(7, "rk", None) == H("010700000000000000010200726b00")
     assert kb.encode_scan_body(2, b"c1") == H("0102000000026331")
-    assert kb.encode_history_body(2) == H("0102000000")
+    assert kb.encode_history_body(2, None) == H("010200000000")
+    assert kb.encode_history_body(2, "rk") == H("0102000000010200726b")
     assert kb.encode_mget_body([b"a", b"b"]) == H("0200010061010062")
     assert kb.encode_incr_body(-5, None, 9) == H("01fbffffffffffffff00010900000000000000")
     assert kb.encode_expire_body(60000, None, None, None) == H("60ea000000000000000000")
@@ -189,7 +190,7 @@ async def test_scan_sends_the_prefix_as_key_and_pages_by_cursor(
         (b"p", H("0102000000026332")),
     ]
     await client.kv.scan()
-    assert calls[2][2:4] == (b"", b"\x01" + struct.pack("<I", 100) + b"\x00")
+    assert calls[2][2:4] == (b"", b"\x01" + struct.pack("<I", 1024) + b"\x00")
 
 
 async def test_history_carries_each_versions_time(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -197,8 +198,21 @@ async def test_history_carries_each_versions_time(monkeypatch: pytest.MonkeyPatc
     assert await client.kv.history("k", HistoryOptions(limit=2)) == [
         VersionEntry(version=3, at_ms=1000, value=b"v3")
     ]
-    await client.kv.history("k")
-    assert [c[3] for c in calls] == [H("0102000000"), b"\x01" + struct.pack("<I", 10)]
+    await client.kv.history("k", HistoryOptions(routing_key="rk"))
+    assert [c[3] for c in calls] == [
+        H("010200000000"),
+        b"\x01" + struct.pack("<I", 10) + H("010200726b"),
+    ]
+
+
+async def test_history_of_a_missing_key_is_empty_and_other_not_founds_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = _client(monkeypatch, _refused(StatusCode.NOT_FOUND, Reason.NOT_FOUND))
+    assert await client.kv.history("missing") == []
+    client, _ = _client(monkeypatch, _refused(StatusCode.NOT_FOUND, Reason.NO_SUCH_TRANSACTION))
+    with pytest.raises(NotFoundError):
+        await client.kv.history("k")
 
 
 def _mget_answer(entries: list[tuple[bool, int, bytes]], next_index: int | None) -> bytes:
@@ -228,6 +242,42 @@ async def test_mget_follows_next_until_every_key_is_answered(
         (OpCode.KV_MGET, b"", kb.encode_mget_body([b"a", b"b", b"c", b"d"])),
         (OpCode.KV_MGET, b"", kb.encode_mget_body([b"c", b"d"])),
         (OpCode.KV_MGET, b"", kb.encode_mget_body([b"d"])),
+    ]
+
+
+async def test_mget_splits_keys_so_each_request_fits_its_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = [f"{i:04d}".encode().ljust(2000, b"x") for i in range(200)]
+    client, calls = _client(
+        monkeypatch,
+        lambda _op, _key, body: _ok(
+            _mget_answer([(True, 1, b"v")] * struct.unpack("<H", body[:2])[0], None)
+        ),
+    )
+    got = await client.kv.mget(list(keys))
+    assert [e.key for e in got] == [k.decode() for k in keys]
+    bodies = [c[3] for c in calls]
+    assert len(bodies) == 2
+    assert all(len(b) <= kb.MAX_MGET_BODY for b in bodies)
+    # 2 + 128 * 2002 = 256258 fits; one more key doesn't.
+    assert bodies[0] == kb.encode_mget_body(keys[:128])
+    assert bodies[1] == kb.encode_mget_body(keys[128:])
+
+
+async def test_mget_follows_next_within_a_split_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    keys = [f"{i:04d}".encode().ljust(2000, b"x") for i in range(130)]
+    client, calls = _client(
+        monkeypatch,
+        _ok(_mget_answer([(True, 1, b"")] * 100, 100)),
+        _ok(_mget_answer([(True, 1, b"")] * 28, None)),
+        _ok(_mget_answer([(True, 1, b"")] * 2, None)),
+    )
+    assert len(await client.kv.mget(list(keys))) == 130
+    assert [c[3] for c in calls] == [
+        kb.encode_mget_body(keys[:128]),
+        kb.encode_mget_body(keys[100:128]),
+        kb.encode_mget_body(keys[128:]),
     ]
 
 
@@ -313,6 +363,7 @@ async def test_bounds_are_refused_before_a_round_trip(monkeypatch: pytest.Monkey
         client.kv.history("k", HistoryOptions(limit=66)),
         client.kv.history("k", HistoryOptions(limit=0)),
         client.kv.mget([f"k{i}" for i in range(257)]),
+        client.kv.mget(["k", "x" * 4097]),
         client.kv.incr("n", KVIncrOptions(delta=1 << 63)),
         client.kv.delete("k", DeleteOptions(routing_key="r" * 4097)),
         client.kv.delete("k", DeleteOptions(cas_version=-1)),

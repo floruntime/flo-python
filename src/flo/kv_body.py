@@ -32,6 +32,8 @@ _MAX_JSON_DOCUMENT = 252_819
 _MAX_SCAN_CURSOR = 64
 MAX_SCAN = 1024
 MAX_MGET = 256
+# The longest mget body that fits one request frame.
+MAX_MGET_BODY = 257_949
 MAX_HISTORY = 65
 # The longest TTL whose nanoseconds fit a u64.
 MAX_TTL_MS = 18_446_744_073_709
@@ -162,16 +164,39 @@ def encode_scan_body(limit: int, cursor: bytes | None) -> bytes:
     return _limit("scan limit", limit, MAX_SCAN) + bytes([len(cursor)]) + cursor
 
 
-def encode_history_body(limit: int) -> bytes:
-    """kv.history's request: limit."""
-    return _limit("history limit", limit, MAX_HISTORY)
+def encode_history_body(limit: int, routing_key: str | None) -> bytes:
+    """kv.history's request: limit, routing_key."""
+    return _limit("history limit", limit, MAX_HISTORY) + _routing_key(routing_key)
 
 
 def encode_mget_body(keys: Sequence[bytes]) -> bytes:
     """kv.mget's request: keys."""
     if not 1 <= len(keys) <= MAX_MGET:
         raise ValidationError(f"mget takes 1..{MAX_MGET} keys, got {len(keys)}")
-    return struct.pack("<H", len(keys)) + b"".join(_bytes16("mget key", k, 0xFFFF) for k in keys)
+    body = struct.pack("<H", len(keys)) + b"".join(
+        _bytes16("mget key", k, _MAX_ROUTING_KEY) for k in keys
+    )
+    if len(body) > MAX_MGET_BODY:
+        raise ValidationError(f"mget body is {len(body)} bytes, at most {MAX_MGET_BODY}")
+    return body
+
+
+def split_mget_keys(keys: Sequence[bytes]) -> list[Sequence[bytes]]:
+    """The keys in runs whose mget bodies each fit one request frame; refuses a
+    bad key list before any round trip."""
+    if not 1 <= len(keys) <= MAX_MGET:
+        raise ValidationError(f"mget takes 1..{MAX_MGET} keys, got {len(keys)}")
+    runs: list[Sequence[bytes]] = []
+    start, size = 0, 2
+    for i, k in enumerate(keys):
+        if len(k) > _MAX_ROUTING_KEY:
+            raise ValidationError(f"mget key is {len(k)} bytes, at most {_MAX_ROUTING_KEY}")
+        if size + 2 + len(k) > MAX_MGET_BODY:
+            runs.append(keys[start:i])
+            start, size = i, 2
+        size += 2 + len(k)
+    runs.append(keys[start:])
+    return runs
 
 
 def encode_incr_body(delta: int, routing_key: str | None, txn: int | None = None) -> bytes:

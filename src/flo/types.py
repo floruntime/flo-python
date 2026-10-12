@@ -17,7 +17,7 @@ VERSION: int = 0x02
 # The hash of the op table this SDK was built for, written into every request
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses.
-TABLE_HASH: int = 0x8AA29E7A0C35FD78
+TABLE_HASH: int = 0xC93E40AA0F2795FE
 
 
 class Reason(IntEnum):
@@ -634,7 +634,7 @@ class ScanOptions:
     namespace: str | None = None
     # The cursor from the previous page; None for the first.
     cursor: bytes | None = None
-    limit: int = 100  # 1..1024 names per page
+    limit: int = 1024  # 1..1024 names per page
 
 
 @dataclass
@@ -643,6 +643,8 @@ class HistoryOptions:
 
     namespace: str | None = None
     limit: int = 10  # 1..65 versions, newest first
+    # Routes the request in place of the key.
+    routing_key: str | None = None
 
 
 @dataclass

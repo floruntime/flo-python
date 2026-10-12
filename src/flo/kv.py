@@ -32,6 +32,7 @@ from .kv_body import (
     encode_mget_body,
     encode_scan_body,
     encode_set_body,
+    split_mget_keys,
 )
 from .types import (
     DeleteOptions,
@@ -245,7 +246,8 @@ class KVOperations:
     ) -> list[MGetEntry]:
         """Look up many keys, one entry per key in the order asked.
 
-        The server answers as many keys as fit one answer; this asks again
+        Keys are split across requests so each fits one request frame, and
+        the server answers as many keys as fit one answer; this asks again
         from where it stopped until every key is answered.
 
         Args:
@@ -266,17 +268,20 @@ class KVOperations:
         namespace = self._client.get_namespace(opts.namespace)
         encoded = [_key(k) for k in keys]
         names = [k if isinstance(k, str) else k.decode("utf-8", errors="replace") for k in keys]
-        body = encode_mget_body(encoded)  # refuses a bad key list before any round trip
         out: list[MGetEntry] = []
-        while True:
-            response = await self._client._send_and_check(OpCode.KV_MGET, namespace, b"", body)
-            entries, next_index = decode_mget_answer(response.data, names[len(out) :])
-            if next_index == 0:
-                raise IncompleteResponseError("kv.mget answered none of the keys asked")
-            out.extend(entries)
-            if next_index is None:
-                return out
-            body = encode_mget_body(encoded[len(out) :])
+        for run in split_mget_keys(encoded):
+            done = 0
+            while done < len(run):
+                body = encode_mget_body(run[done:])
+                response = await self._client._send_and_check(OpCode.KV_MGET, namespace, b"", body)
+                entries, next_index = decode_mget_answer(
+                    response.data, names[len(out) : len(out) + len(run) - done]
+                )
+                if next_index == 0:
+                    raise IncompleteResponseError("kv.mget answered none of the keys asked")
+                out.extend(entries)
+                done += len(entries)
+        return out
 
     async def scan(
         self,
@@ -309,7 +314,8 @@ class KVOperations:
         key: str | bytes,
         options: HistoryOptions | None = None,
     ) -> list[VersionEntry]:
-        """A key's versions, newest first, each with when it was written.
+        """A key's versions, newest first, each with when it was written; empty
+        for a missing key.
 
         Example:
             for entry in await client.kv.history("user:123", HistoryOptions(limit=10)):
@@ -320,8 +326,11 @@ class KVOperations:
             OpCode.KV_HISTORY,
             self._client.get_namespace(opts.namespace),
             _key(key),
-            encode_history_body(opts.limit),
+            encode_history_body(opts.limit, opts.routing_key),
+            allow_not_found=True,
         )
+        if _absent(response):
+            return []
         return decode_history_answer(response.data)
 
     # ── Counters, TTL, exists, JSON paths ──────────────────────────────

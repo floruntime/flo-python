@@ -101,7 +101,7 @@ await client.kv.delete("lock:resource", DeleteOptions(cas_version=held_version))
 ```python
 from flo import ScanOptions
 
-# Names of keys with a prefix ("" for all), up to 100 per page by default
+# Names of keys with a prefix ("" for all), up to 1024 per page by default
 result = await client.kv.scan("user:")
 for name in result.names:
     print(name)
@@ -114,7 +114,7 @@ while result.cursor is not None:
 ### MGet
 
 ```python
-# One entry per key, in order (at most 256 keys)
+# One entry per key, in order (at most 256 keys of at most 4096 bytes each)
 for e in await client.kv.mget(["user:1", "user:2"]):
     if e.found:
         print(e.key, e.version, e.value)
@@ -125,7 +125,8 @@ for e in await client.kv.mget(["user:1", "user:2"]):
 ```python
 from flo import HistoryOptions
 
-# Versions newest first (limit 1..65, default 10), each with its write time in ms
+# Versions newest first (limit 1..65, default 10), each with its write time in ms;
+# empty for a missing key
 history = await client.kv.history("user:123", HistoryOptions(limit=10))
 for entry in history:
     print(f"v{entry.version} at {entry.at_ms}: {entry.value.decode()}")
