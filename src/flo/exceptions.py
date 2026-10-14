@@ -164,8 +164,8 @@ class ServerError(FloError):
     status_code: StatusCode
     # Why; Reason.UNCLASSIFIED when the server didn't say.
     reason: Reason = Reason.UNCLASSIFIED
-    # Whether the request took effect.
-    ran: Ran = Ran.NO
+    # Whether the request took effect; unknown unless the server said.
+    ran: Ran = Ran.UNKNOWN
 
     def __init__(self, message: str, status_code: StatusCode):
         super().__init__(message)

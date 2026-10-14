@@ -6,7 +6,7 @@ import struct
 
 import pytest
 
-from flo import FloClient
+from flo import FloClient, RetryPolicy
 from flo.exceptions import (
     GenericServerError,
     IncompleteResponseError,
@@ -87,7 +87,9 @@ async def _client_answering(first_status: int) -> tuple[FloClient, asyncio.Serve
 
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
-    return await FloClient(f"127.0.0.1:{port}", timeout_ms=1000).connect(), server
+    # Not retried, so the second call reads the next reply.
+    client = FloClient(f"127.0.0.1:{port}", timeout_ms=1000, retry=RetryPolicy(max_attempts=1))
+    return await client.connect(), server
 
 
 @pytest.mark.parametrize(

@@ -32,6 +32,7 @@ from typing import Any
 
 from .client import FloClient
 from .exceptions import NonRetryableError, is_connection_error
+from .retry import _sleep_unless_stopped, _worker_backoff, is_refused_unrun
 from .types import (
     _DEFAULT_WORKER_BLOCK_MS,
     ActionType,
@@ -341,6 +342,7 @@ class ActionWorker:
             namespace=self._parent_client.namespace,
             debug=self._parent_client._debug,
             timeout_ms=worker_timeout_ms,
+            retry=self._parent_client._retry,
         )
         await self._client.connect()
 
@@ -352,6 +354,7 @@ class ActionWorker:
             namespace=self._parent_client.namespace,
             debug=self._parent_client._debug,
             timeout_ms=worker_timeout_ms,
+            retry=self._parent_client._retry,
         )
         await self._result_client.connect()
 
@@ -436,6 +439,7 @@ class ActionWorker:
         reconnect_pause = 0.0
         loop = asyncio.get_running_loop()
         backoff = _EmptyPollBackoff(self.config.block_ms, self._stop_event)
+        failed = _worker_backoff()
         while self._running and not self._stop_event.is_set():
             try:
                 # Wait for semaphore slot
@@ -454,6 +458,7 @@ class ActionWorker:
                     WorkerAwaitOptions(block_ms=self.config.block_ms),
                 )
                 reconnect_pause = 0.0
+                failed.reset()
 
                 if result.task is None:
                     # No task available, release semaphore and continue
@@ -505,8 +510,9 @@ class ActionWorker:
                     except Exception as recon_err:
                         logger.error(f"Reconnect failed: {recon_err}, retrying...")
                 else:
-                    logger.error(f"Await error: {e}, retrying...")
-                    await asyncio.sleep(1)
+                    d = failed.next()
+                    logger.error(f"Await error: {e}, retrying in {d:.3f}s...")
+                    await _sleep_unless_stopped(self._stop_event, d)
 
     async def _send_with_retry(self, op: str, fn: Callable[[], Awaitable[None]]) -> None:
         """Attempt to send a result (Complete/Fail), reconnecting on connection error."""
@@ -881,6 +887,7 @@ class StreamWorker:
             namespace=self._parent_client.namespace,
             debug=self._parent_client._debug,
             timeout_ms=worker_timeout_ms,
+            retry=self._parent_client._retry,
         )
         await self._client.connect()
 
@@ -892,6 +899,7 @@ class StreamWorker:
             namespace=self._parent_client.namespace,
             debug=self._parent_client._debug,
             timeout_ms=worker_timeout_ms,
+            retry=self._parent_client._retry,
         )
         try:
             await self._ack_client.connect()
@@ -948,6 +956,7 @@ class StreamWorker:
         assert self._semaphore is not None
         loop = asyncio.get_running_loop()
         backoff = _EmptyPollBackoff(self.config.block_ms, self._stop_event)
+        failed = _worker_backoff()
 
         while self._running and not self._stop_event.is_set():
             try:
@@ -968,6 +977,7 @@ class StreamWorker:
                         block_ms=self.config.block_ms,
                     ),
                 )
+                failed.reset()
 
                 if not result.records:
                     self._semaphore.release()
@@ -1005,17 +1015,21 @@ class StreamWorker:
                         logger.error(f"Stream worker reconnect failed: {recon_err}, retrying...")
                         await asyncio.sleep(1)
                 else:
-                    logger.error(f"Stream read error: {e}, retrying...")
-                    await asyncio.sleep(1)
+                    d = failed.next()
+                    logger.error(f"Stream read error: {e}, retrying in {d:.3f}s...")
+                    await _sleep_unless_stopped(self._stop_event, d)
 
     async def _join_group(self) -> None:
         """Join the consumer group, retrying on connection errors.
 
         A connection error (a stalled or dropped connection at startup) triggers
-        a reconnect-and-retry instead of failing the worker. Non-connection
+        a reconnect-and-retry instead of failing the worker. A join the server
+        refused without running it (overloaded or unavailable, past the
+        client's own retries) is tried again with the worker backoff. Other
         errors (e.g. an invalid request) remain fatal and are raised.
         """
         assert self._client is not None
+        failed = _worker_backoff()
         while True:
             if self._stop_event.is_set():
                 return
@@ -1027,6 +1041,11 @@ class StreamWorker:
                 )
                 return
             except Exception as e:
+                if is_refused_unrun(e):
+                    d = failed.next()
+                    logger.warning(f"Group join refused: {e}, retrying in {d:.3f}s...")
+                    await _sleep_unless_stopped(self._stop_event, d)
+                    continue
                 if not is_connection_error(e):
                     raise
                 logger.warning(f"Connection lost during group join: {e}, reconnecting...")

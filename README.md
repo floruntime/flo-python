@@ -482,6 +482,7 @@ client = FloClient(
     namespace="myapp",      # Default namespace for all operations
     timeout_ms=5000,        # Connection and operation timeout
     debug=True,             # Enable debug logging
+    retry=RetryPolicy(),    # Retries of refused, not-run requests (the default)
 )
 ```
 
@@ -533,13 +534,50 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 | `BadRequestError` | Invalid request parameters |
 | `ConflictError` | CAS version mismatch |
 | `UnauthorizedError` | Authentication failed |
-| `OverloadedError` | Server is overloaded; retryable |
-| `UnavailableError` | No leader, or the shard isn't taking writes or is offline; retryable (the message says why) |
+| `OverloadedError` | Server is overloaded, and the client's retries ran out |
+| `UnavailableError` | No leader, or the shard isn't taking writes or is offline, and the client's retries ran out (the message says why, and whether an operator must act first) |
 | `InternalServerError` | Server internal error; not retryable (may mean committed but not applied) |
 | `GenericServerError` | Any other error status, including one this SDK doesn't know (`status_code` carries it) |
 | `ConnectionFailedError` | Failed to connect |
 | `RequestTimeoutError` | No response within the timeout |
 | `InvalidChecksumError` | Response CRC32 mismatch |
+
+### Retries
+
+When the server refuses a request as `overloaded` or `unavailable` and says it
+didn't run it (`error.ran == Ran.NO`), the client sends it again itself, as a
+new request, after a jittered wait. Because the server never ran it, this is
+safe for writes too. Any other refusal, or one that may have run, comes
+straight back.
+
+| `RetryPolicy` field | Default | |
+|---|---|---|
+| `max_attempts` | 4 | Tries in all, the first included; 1 turns retrying off |
+| `initial_backoff_ms` | 50 | Ceiling of the first wait, in ms; it doubles each retry |
+| `max_backoff_ms` | 1000 | Largest ceiling, in ms |
+
+Each wait is uniform between 0 and its ceiling, so with the defaults a refused
+request is given back after at most about 350 ms of waiting. A negative backoff
+counts as 0, and a `max_backoff_ms` below `initial_backoff_ms` as
+`initial_backoff_ms`. The request goes again on the same connection; the server
+routes it afresh. Other calls on the client are not held up by the wait.
+
+The action and stream workers use their client's policy, and wait the same way
+between failed polls, from 100 ms up to 5 s, starting again from 100 ms after a
+poll that succeeds; `stop()` cuts the wait short. A stream worker retries a
+group join refused this way instead of stopping.
+
+```python
+from flo import FloClient, RetryPolicy
+
+# Up to 8 tries, waiting at most 2 s between them
+client = FloClient("localhost:9000", retry=RetryPolicy(
+    max_attempts=8, initial_backoff_ms=100, max_backoff_ms=2000,
+))
+
+# No retries
+client = FloClient("localhost:9000", retry=RetryPolicy(max_attempts=1))
+```
 
 ## Requirements
 
