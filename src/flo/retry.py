@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import math
 import random
 from dataclasses import dataclass
 
@@ -28,8 +29,10 @@ class RetryPolicy:
             uniform in [0, ceiling].
         max_backoff_ms: Largest ceiling, in milliseconds.
 
-    A negative backoff counts as 0, and a ``max_backoff_ms`` below
-    ``initial_backoff_ms`` as ``initial_backoff_ms``.
+    A negative or non-finite ``initial_backoff_ms`` counts as 0; a
+    ``max_backoff_ms`` that is non-finite or below ``initial_backoff_ms``
+    counts as ``initial_backoff_ms``; a non-finite ``max_attempts`` counts
+    as 1, and a fractional one is truncated.
     """
 
     max_attempts: int = 4
@@ -37,11 +40,22 @@ class RetryPolicy:
     max_backoff_ms: float = 1000
 
     def __post_init__(self) -> None:
-        # A negative bound would reach random.uniform, and a max below the
-        # initial would make the ceiling jump down after the first wait.
-        initial = max(self.initial_backoff_ms, 0)
+        # A negative or non-finite bound would reach random.uniform or
+        # asyncio.sleep (where nan and inf never return), a max below the
+        # initial would make the ceiling jump down after the first wait, and
+        # a nan attempt count would never be reached.
+        initial = _finite_or(self.initial_backoff_ms, 0.0)
+        initial = max(initial, 0.0)
+        top = max(_finite_or(self.max_backoff_ms, initial), initial)
+        attempts = self.max_attempts
+        attempts = int(attempts) if math.isfinite(attempts) else 1
         object.__setattr__(self, "initial_backoff_ms", initial)
-        object.__setattr__(self, "max_backoff_ms", max(self.max_backoff_ms, initial))
+        object.__setattr__(self, "max_backoff_ms", top)
+        object.__setattr__(self, "max_attempts", attempts)
+
+
+def _finite_or(v: float, default: float) -> float:
+    return v if math.isfinite(v) else default
 
 
 # The default waits at most about 350 ms in all before giving back the refusal.

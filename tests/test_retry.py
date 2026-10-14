@@ -165,8 +165,18 @@ def test_backoff_stays_under_its_doubling_ceiling() -> None:
         (RetryPolicy(initial_backoff_ms=-50, max_backoff_ms=-1), 0),
         (RetryPolicy(initial_backoff_ms=-50, max_backoff_ms=20), 20),
         (RetryPolicy(initial_backoff_ms=100, max_backoff_ms=10), 100),
+        (RetryPolicy(initial_backoff_ms=float("nan"), max_backoff_ms=float("nan")), 0),
+        (RetryPolicy(initial_backoff_ms=float("inf"), max_backoff_ms=20), 20),
+        (RetryPolicy(initial_backoff_ms=40, max_backoff_ms=float("inf")), 40),
     ],
-    ids=["both-negative", "initial-negative", "max-below-initial"],
+    ids=[
+        "both-negative",
+        "initial-negative",
+        "max-below-initial",
+        "both-nan",
+        "initial-inf",
+        "max-inf",
+    ],
 )
 def test_a_policy_is_normalised_so_waits_stay_in_bounds(
     policy: RetryPolicy, ceiling_ms: float
@@ -177,6 +187,22 @@ def test_a_policy_is_normalised_so_waits_stay_in_bounds(
     b = _policy_backoff(policy)
     for _ in range(50):
         assert 0 <= b.next() <= ceiling_ms / 1000.0
+
+
+@pytest.mark.parametrize(
+    ("given", "attempts"),
+    [(float("nan"), 1), (float("inf"), 1), (3.7, 3), (0, 0)],
+    ids=["nan", "inf", "fraction", "zero"],
+)
+def test_max_attempts_is_a_whole_finite_count(given: float, attempts: int) -> None:
+    assert RetryPolicy(max_attempts=given).max_attempts == attempts  # type: ignore[arg-type]
+
+
+def test_a_server_error_not_from_a_refusal_is_not_taken_as_unrun() -> None:
+    from flo.exceptions import OverloadedError
+    from flo.retry import is_refused_unrun
+
+    assert not is_refused_unrun(OverloadedError("built here"))
 
 
 def test_the_backoff_helper_normalises_its_own_bounds() -> None:
