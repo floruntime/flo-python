@@ -18,6 +18,7 @@ from .exceptions import (
     UnexpectedEofError,
     raise_for_status,
 )
+from .retry import DEFAULT_RETRY_POLICY, RetryPolicy, _policy_backoff, _refused_unrun
 from .types import _DEFAULT_WORKER_BLOCK_MS, HEADER_SIZE, OpCode, OptionTag, StatusCode
 from .wire import (
     OptionsIterator,
@@ -51,6 +52,7 @@ class FloClient:
         namespace: str = "default",
         timeout_ms: int = 5000,
         debug: bool = False,
+        retry: RetryPolicy = DEFAULT_RETRY_POLICY,
     ):
         """Initialize Flo client.
 
@@ -62,11 +64,16 @@ class FloClient:
                 top of its wait. A call that times out or is cancelled drops
                 the connection; call reconnect() before reusing the client.
             debug: Enable debug logging.
+            retry: How a request the server refused without running it
+                (overloaded or unavailable, ran = no) is sent again; backoffs
+                are in milliseconds. RetryPolicy(max_attempts=1) turns
+                retrying off. Workers made from this client use it too.
         """
         self._endpoint = endpoint
         self._namespace = namespace
         self._timeout = timeout_ms / 1000.0  # Convert to seconds
         self._debug = debug
+        self._retry = retry
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -293,7 +300,35 @@ class FloClient:
         value: bytes,
         options: bytes = b"",
     ) -> RawResponse:
-        """Send a request and wait for response.
+        """Send a request and wait for its response, sending it again as the
+        retry policy allows while the server refuses it without running it.
+
+        Each try is a new request with a new id. The wait between tries is
+        taken outside the connection lock, so other calls proceed meanwhile.
+        """
+        wait = _policy_backoff(self._retry)
+        attempt = 1
+        while True:
+            response = await self._send_once(op_code, namespace, key, value, options)
+            if attempt >= self._retry.max_attempts or not _refused_unrun(
+                response.status, response.data
+            ):
+                return response
+            d = wait.next()
+            if self._debug:
+                logger.debug(f"[flo] {response.status.name}, not run: retrying in {d:.3f}s")
+            await asyncio.sleep(d)
+            attempt += 1
+
+    async def _send_once(
+        self,
+        op_code: OpCode,
+        namespace: str,
+        key: bytes,
+        value: bytes,
+        options: bytes = b"",
+    ) -> RawResponse:
+        """Send a request, under a new request id, and wait for its response.
 
         Args:
             op_code: Operation code.

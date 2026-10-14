@@ -65,6 +65,7 @@ from .exceptions import (
 )
 from .kv_txn import Transaction, TxnFinishedError, TxnUnsupportedOpError
 from .processing import ProcessingOperations
+from .retry import DEFAULT_RETRY_POLICY, RetryPolicy
 from .types import (
     AckOptions,
     ActionDeleteOptions,
@@ -196,6 +197,8 @@ __all__ = [
     "IncrResult",
     # Client
     "FloClient",
+    "RetryPolicy",
+    "DEFAULT_RETRY_POLICY",
     # High-level Worker API
     "ActionWorker",
     "ActionWorkerOptions",
