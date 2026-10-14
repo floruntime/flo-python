@@ -16,8 +16,9 @@ MAGIC: int = 0x004F4C46  # "FLO\0" in little-endian
 VERSION: int = 0x02
 # The hash of the op table this SDK was built for, written into every request
 # header. A server built from another table refuses the request, and its
-# answers carry its own hash, which this SDK refuses.
-TABLE_HASH: int = 0xC93E40AA0F2795FE
+# answers carry its own hash, which this SDK refuses. CI's live tests run
+# against the flo commit in .github/flo-ref.env: change both in one commit.
+TABLE_HASH: int = 0x5194DD26F737DBA9
 
 
 class Reason(IntEnum):
@@ -64,6 +65,9 @@ class Reason(IntEnum):
     WRONG_TYPE = 24
     # The shard holds as many open transactions as it may.
     TOO_MANY_TRANSACTIONS = 25
+    # An action complete or fail for a run that has moved on (another worker
+    # holds it, or it finished). It was dropped; resending it is refused too.
+    STALE_REPORT = 26
 
 
 class Ran(IntEnum):
@@ -230,9 +234,6 @@ class OpCode(IntEnum):
     PROCESSING_CANCEL = 0x362
     PROCESSING_STATUS = 0x363
     PROCESSING_LIST = 0x364
-    PROCESSING_SAVEPOINT = 0x365
-    PROCESSING_RESTORE = 0x366
-    PROCESSING_RESCALE = 0x367
 
 
 class StatusCode(IntEnum):
@@ -1183,27 +1184,6 @@ class ProcessingCancelOptions:
 
 
 @dataclass
-class ProcessingSavepointOptions:
-    """Options for triggering a savepoint."""
-
-    namespace: str | None = None
-
-
-@dataclass
-class ProcessingRestoreOptions:
-    """Options for restoring from a savepoint."""
-
-    namespace: str | None = None
-
-
-@dataclass
-class ProcessingRescaleOptions:
-    """Options for rescaling a processing job."""
-
-    namespace: str | None = None
-
-
-@dataclass
 class ProcessingSyncOptions:
     """Options for declarative processing sync."""
 
@@ -1217,7 +1197,6 @@ class ProcessingStatusResult:
     job_id: str
     name: str
     status: str
-    parallelism: int
     batch_size: int
     records_processed: int
     created_at: int
@@ -1230,7 +1209,6 @@ class ProcessingListEntry:
     name: str
     job_id: str
     status: str
-    parallelism: int
     created_at: int
 
 
