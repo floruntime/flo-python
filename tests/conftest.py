@@ -15,6 +15,9 @@ from flo import ActionContext, ActionResult, FloClient
 from flo.worker import ActionWorker
 
 FLO_ENDPOINT = os.environ.get("FLO_ENDPOINT", "localhost:4453")
+# CI provides a server (the pinned flo release), so a missing one is a
+# failure there, not a skip.
+IN_CI = bool(os.environ.get("CI"))
 
 
 # ---------------------------------------------------------------------------
@@ -160,12 +163,15 @@ def register_all_actions(worker: ActionWorker) -> None:
 async def client():
     """Session-scoped Flo client connected to the test server.
 
-    Skips all dependent tests if the server is unreachable (e.g. CI).
+    Skips all dependent tests if the server is unreachable, except in CI,
+    where that fails them.
     """
     c = FloClient(FLO_ENDPOINT, namespace="default", timeout_ms=35000)
     try:
         await c.connect()
-    except Exception:
+    except Exception as e:
+        if IN_CI:
+            pytest.fail(f"Flo server not reachable at {FLO_ENDPOINT}: {e}")
         pytest.skip(f"Flo server not reachable at {FLO_ENDPOINT}")
     yield c
     await c.close()
