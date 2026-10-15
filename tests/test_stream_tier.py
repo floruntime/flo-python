@@ -22,3 +22,12 @@ def test_tier_bytes_read_as_the_server_sends_them(byte: int, tier: StorageTier) 
 def test_an_unknown_tier_refuses_the_answer() -> None:
     with pytest.raises(IncompleteResponseError):
         parse_stream_read_response(_one_record(2))
+
+
+def test_an_answer_short_of_its_record_count_is_refused() -> None:
+    one = _one_record(0)
+    two = struct.pack("<I", 2) + one[4:] + one[4:]
+    assert len(parse_stream_read_response(two).records) == 2
+    # One whole record under a count of two.
+    with pytest.raises(IncompleteResponseError):
+        parse_stream_read_response(struct.pack("<I", 2) + one[4:])

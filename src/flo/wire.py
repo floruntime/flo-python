@@ -496,11 +496,10 @@ def parse_stream_read_response(data: bytes) -> StreamReadResult:
     count = struct.unpack("<I", data[pos : pos + 4])[0]
     pos += 4
 
+    # An answer that ends before its count of records is refused, not
+    # returned short: each field below checks it's there.
     records: list[StreamRecord] = []
     for _ in range(count):
-        if pos >= len(data):
-            break
-
         # Read sequence
         if pos + 8 > len(data):
             raise IncompleteResponseError("Stream record: missing sequence")
