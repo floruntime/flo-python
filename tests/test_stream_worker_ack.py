@@ -318,20 +318,27 @@ async def test_concurrent_reconnects_leave_one_connection_open() -> None:
     await server.wait_closed()
 
 
-async def test_ack_that_keeps_failing_raises(caplog: pytest.LogCaptureFixture) -> None:
+async def test_ack_that_keeps_failing_is_dropped_after_three_sends(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     class DeadClient:
         async def reconnect(self) -> None:
             pass
 
+    sends = 0
+
     async def send(_: Any) -> None:
+        nonlocal sends
+        sends += 1
         raise UnexpectedEofError("gone")
 
     worker = FloClient("127.0.0.1:1").new_stream_worker(stream="s", group="g", handler=_noop)
     worker._ack_client = DeadClient()  # type: ignore[assignment]
     worker._running = True
     record_id = StreamID(timestamp_ms=1000, sequence=7)
-    with caplog.at_level(logging.WARNING, logger="flo"), pytest.raises(RuntimeError):
-        await worker._on_ack_connection("ack", record_id, send)
+    with caplog.at_level(logging.ERROR, logger="flo"):
+        assert not await worker._on_ack_connection("ack", record_id, send)
+    assert sends == 3
     assert any(str(record_id) in r.getMessage() for r in caplog.records)
 
 

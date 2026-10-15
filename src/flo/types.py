@@ -820,7 +820,7 @@ class StreamGroupAckOptions:
     """Options for acknowledging records in a consumer group."""
 
     namespace: str | None = None
-    consumer: str = ""  # Consumer ID (required for correct ack matching)
+    consumer: str = ""  # Sent, but the server doesn't check it: any consumer can ack an entry
 
 
 @dataclass
@@ -828,7 +828,7 @@ class StreamGroupNackOptions:
     """Options for negatively acknowledging records in a consumer group."""
 
     namespace: str | None = None
-    consumer: str = ""  # Consumer ID (required for correct nack matching)
+    consumer: str = ""  # Sent, but the server doesn't check it: any consumer can nack an entry
 
 
 # =============================================================================

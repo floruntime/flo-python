@@ -469,6 +469,10 @@ class StreamOperations:
             ids: StreamIDs of records to acknowledge.
             options: Optional ack options (including consumer name).
 
+        Raises:
+            NotFoundError: If the stream or group does not exist, so the ack
+                did not take effect.
+
         Example:
             result = await client.stream.group_read("events", "processors", "worker-1")
             for record in result.records:
@@ -492,7 +496,6 @@ class StreamOperations:
             namespace,
             stream.encode("utf-8"),
             value,
-            allow_not_found=True,
         )
 
     async def group_nack(

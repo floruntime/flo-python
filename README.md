@@ -447,6 +447,8 @@ async def run_worker():
 asyncio.run(run_worker())
 ```
 
+Delivery is at-least-once: a result lost to a dropped connection is resent, and one that never arrives lets the lease run out, so a handler may see the same task or record again. `worker.stop()` waits for running handlers, and their results are still sent.
+
 ### StreamWorker Example
 
 ```python
