@@ -30,12 +30,12 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python_version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ matrix.python_version }}
       - name: Install
         run: |
           python -m pip install --upgrade pip
@@ -47,8 +47,7 @@ jobs:
           curl -fsSL -o flo.tar.gz "https://github.com/floruntime/flo/releases/download/$FLO_TAG/flo-x86_64-linux.tar.gz"
           echo "$FLO_SHA256  flo.tar.gz" | sha256sum -c -
           tar xzf flo.tar.gz
-          curl -fsSL -o proto.zig "https://raw.githubusercontent.com/floruntime/flo/$FLO_TAG/src/protocol/proto.zig"
-          echo "FLO_PROTO_ZIG=$RUNNER_TEMP/proto.zig" >> "$GITHUB_ENV"
+          echo "FLO_BINARY=$RUNNER_TEMP/flo" >> "$GITHUB_ENV"
           mkdir -p flo-data
           ./flo server start --port 4453 --data-dir "$RUNNER_TEMP/flo-data" > flo-server.log 2>&1 &
           for _ in $(seq 1 50); do
@@ -57,7 +56,8 @@ jobs:
           done
           echo "flo server did not start"; cat flo-server.log; exit 1
       - name: Run tests
-        # CI=1 turns a missing server or proto.zig into a failure, not a skip.
+        # CI=1 turns a missing server into a failure, not a skip; FLO_BINARY
+        # runs the version test against the pinned release.
         env:
           CI: "1"
           FLO_ENDPOINT: localhost:4453

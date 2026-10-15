@@ -2,7 +2,7 @@ kind: Workflow
 name: order-processing
 version: "1.4.0"
 
-searchAttributes:
+search_attributes:
   - name: customer_id
     type: string
     from: "$.input.customerId"
@@ -21,17 +21,17 @@ plans:
         run: "@actions/process-payment"
         priority: 1
         retry:
-          maxAttempts: 3
-          backoffMs: 1000
+          max_attempts: 3
+          initial_delay_ms: 100
         breaker:
-          failureThreshold: 5
-          cooldownMs: 30000
+          failure_threshold: 5
+          cooldown_ms: 30000
       - name: paypal
         run: "@actions/process-payment-fallback"
         priority: 2
         retry:
-          maxAttempts: 2
-          backoffMs: 2000
+          max_attempts: 2
+          initial_delay_ms: 200
 
 start:
   run: "@actions/validate-payment"
@@ -65,10 +65,10 @@ steps:
       failure: flo.Failed
 
   manual_review:
-    waitForSignal:
+    wait_for_signal:
       type: "review_decision"
-      timeoutMs: 86400000
-      onTimeout: flo.Failed
+      timeout_ms: 86400000
+      on_timeout: flo.Failed
     transitions:
       success: fulfill
       failure: rejected
