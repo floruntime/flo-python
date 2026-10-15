@@ -516,7 +516,10 @@ def parse_stream_read_response(data: bytes) -> StreamReadResult:
         # Read tier
         if pos + 1 > len(data):
             raise IncompleteResponseError("Stream record: missing tier")
-        tier = StorageTier(data[pos])
+        try:
+            tier = StorageTier(data[pos])
+        except ValueError:
+            raise IncompleteResponseError(f"Stream record: unknown tier {data[pos]}") from None
         pos += 1
 
         # Skip partition
