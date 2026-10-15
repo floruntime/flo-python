@@ -494,12 +494,10 @@ class StreamID:
 
 
 class StorageTier(IntEnum):
-    """Storage tier of a stream record."""
+    """The tier a stream record was served from; the server sends only these two."""
 
-    HOT = 0
-    PENDING = 1
-    WARM = 2
-    COLD = 3
+    HOT = 0  # the in-memory log
+    WARM = 1  # the warm store, after the record left the log
 
 
 @dataclass
