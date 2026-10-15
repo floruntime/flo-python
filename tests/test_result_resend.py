@@ -397,12 +397,15 @@ async def test_a_lost_or_refused_ack_is_never_nacked(
 
 async def test_stop_during_a_poll_neither_reconnects_nor_registers_again() -> None:
     connections = 0
+    eofs = 0
     registers: list[int] = []
     polling = asyncio.Event()
+    writers: list[asyncio.StreamWriter] = []
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        nonlocal connections
+        nonlocal connections, eofs
         connections += 1
+        writers.append(writer)
         try:
             while True:
                 header = await reader.readexactly(HEADER_SIZE)
@@ -417,7 +420,7 @@ async def test_stop_during_a_poll_neither_reconnects_nor_registers_again() -> No
                     continue  # park: the poll is in flight when stop() comes
                 writer.write(_frame(request_id, StatusCode.OK, b""))
         except (asyncio.IncompleteReadError, ConnectionError):
-            pass
+            eofs += 1  # the worker closed its side
 
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
@@ -429,6 +432,12 @@ async def test_stop_during_a_poll_neither_reconnects_nor_registers_again() -> No
     worker.stop()
     await asyncio.wait_for(run, timeout=10)
     await asyncio.sleep(0.3)
+    # Closing the server's writers below must not hide a socket the worker kept.
+    assert eofs == connections
     server.close()
+    # Python 3.12+ wait_closed() also waits for open connections, and the
+    # server side of each stays open until its writer is closed.
+    for writer in writers:
+        writer.close()
     await server.wait_closed()
     assert (connections, len(registers)) == before
