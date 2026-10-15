@@ -117,23 +117,13 @@ class _EmptyPollBackoff:
 # task or record is delivered again, so delivery stays at-least-once.
 _RESULT_SENDS = 3
 
+# A result to send: the op name, the send on a given client, and whether the
+# handler was cancelled.
+_Report = tuple[str, Callable[[FloClient], Awaitable[None]], bool]
 
-async def _unless_stopped(aw: Awaitable[None], stop: asyncio.Event) -> bool:
-    """Await `aw` unless `stop` is set first; False if it was cut short."""
-    task = asyncio.ensure_future(aw)
-    waiter = asyncio.ensure_future(stop.wait())
-    try:
-        await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        waiter.cancel()
-        if not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-    if task.cancelled():
-        return False
-    task.result()
-    return True
+# How long a stopping worker keeps reconnecting to resend a lost result, so
+# stop() can't hang on a server that is gone.
+_STOP_RECONNECT_S = 2.0
 
 
 async def _send_result(
@@ -146,9 +136,38 @@ async def _send_result(
     """Send a result, resending the identical request after a reconnect when
     the connection drops or the request times out.
 
-    A refusal is not resent: the server read the request and said no. Nothing
+    A refusal is not resent: the server read the request and said no. Once
+    the worker is stopping, reconnects get _STOP_RECONNECT_S in all. Nothing
     here raises; a result that can't be sent is logged and dropped.
     """
+    loop = asyncio.get_running_loop()
+    stop_deadline: float | None = None
+
+    async def reconnect_bounded(seen: int) -> bool:
+        """Reconnect; False if the stop allowance ran out first."""
+        nonlocal stop_deadline
+        task = asyncio.ensure_future(reconnect(seen))
+        try:
+            if not stop.is_set():
+                waiter = asyncio.ensure_future(stop.wait())
+                try:
+                    await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    waiter.cancel()
+            if not task.done():
+                if stop_deadline is None:
+                    stop_deadline = loop.time() + _STOP_RECONNECT_S
+                await asyncio.wait({task}, timeout=max(stop_deadline - loop.time(), 0.0))
+        finally:
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        if task.cancelled():
+            return False
+        task.result()
+        return True
+
     for attempt in range(1, _RESULT_SENDS + 1):
         seen = generation()
         try:
@@ -161,15 +180,17 @@ async def _send_result(
             if attempt == _RESULT_SENDS:
                 logger.error(f"Dropped {what} after {_RESULT_SENDS} sends: {e}")
                 return False
-            if stop.is_set():
+            if stop.is_set() and stop_deadline is None:
+                stop_deadline = loop.time() + _STOP_RECONNECT_S
+            if stop_deadline is not None and loop.time() >= stop_deadline:
                 logger.error(f"Dropped {what}: connection lost while the worker stops: {e}")
                 return False
             logger.warning(
                 f"Lost {what} (send {attempt}/{_RESULT_SENDS}): {e}; reconnecting to resend"
             )
             try:
-                if not await _unless_stopped(reconnect(seen), stop):
-                    logger.error(f"Dropped {what}: the worker stopped while reconnecting")
+                if not await reconnect_bounded(seen):
+                    logger.error(f"Dropped {what}: no connection before the worker stopped")
                     return False
             except Exception as rc_err:
                 # The next send fails fast on the closed connection and
@@ -563,7 +584,7 @@ class ActionWorker:
                         # Also reconnect result client
                         if self._result_client is not None:
                             try:
-                                await self._reconnect_result_client()
+                                await self._reconnect_result_client(only_if_down=True)
                             except Exception as rc_err:
                                 logger.warning(f"Failed to reconnect result client: {rc_err}")
                         # Re-register worker after reconnect
@@ -588,12 +609,20 @@ class ActionWorker:
                     logger.error(f"Await error: {e}, retrying in {d:.3f}s...")
                     await _sleep_unless_stopped(self._stop_event, d)
 
-    async def _reconnect_result_client(self, failed_generation: int | None = None) -> None:
+    async def _reconnect_result_client(
+        self, failed_generation: int | None = None, *, only_if_down: bool = False
+    ) -> None:
         """Reconnect the result connection, unless it was reconnected since
-        `failed_generation` was observed."""
+        `failed_generation` was observed, or, with `only_if_down`, it is up.
+
+        The poll connection dropping says nothing certain about this one, and
+        replacing a healthy connection would cut off results in flight on it.
+        """
         assert self._result_client is not None
         async with self._result_reconnect_lock:
             if failed_generation is not None and failed_generation != self._result_generation:
+                return
+            if only_if_down and self._result_client.is_connected:
                 return
             await self._result_client.reconnect()
             self._result_generation += 1
@@ -603,44 +632,49 @@ class ActionWorker:
         rc = self._result_client
         assert rc is not None
         try:
-            op, send = await self._run_handler(task)
+            op, send, cancelled = await self._run_handler(task)
             # Reporting stays outside the handler's error handling: a complete
             # that can't be delivered must not turn into a fail.
-            await _send_result(
+            sent = await _send_result(
                 f"{op} for task {task.task_id}",
                 lambda: send(rc),
                 lambda: self._result_generation,
                 self._reconnect_result_client,
                 self._stop_event,
             )
+            if sent and op == "complete":
+                logger.info(f"Action completed: {task.task_type} (task={task.task_id})")
+            if cancelled:
+                raise asyncio.CancelledError()
         except Exception as e:
             logger.error(f"Failed to report result for task {task.task_id}: {e}")
         finally:
             if self._semaphore is not None:
                 self._semaphore.release()
 
-    async def _run_handler(
-        self, task: TaskAssignment
-    ) -> tuple[str, Callable[[FloClient], Awaitable[None]]]:
-        """Run the task's handler. Its outcome alone decides complete or fail;
-        returns the result to send."""
+    async def _run_handler(self, task: TaskAssignment) -> "_Report":
+        """Run the task's handler. Its outcome alone decides complete or fail.
+
+        Returns the result to send, and whether the handler was cancelled, in
+        which case the caller re-raises the cancellation after reporting.
+        """
         from .types import WorkerCompleteOptions, WorkerFailOptions
 
         wid = self.config.worker_id
 
-        def fail(
-            message: str, retry: bool = True
-        ) -> tuple[str, Callable[[FloClient], Awaitable[None]]]:
+        def fail(message: str, retry: bool = True, cancelled: bool = False) -> _Report:
             options = WorkerFailOptions(retry=retry)
-            return "fail", lambda c: c.worker.fail(
-                wid, task.task_type, task.task_id, message, options
+            return (
+                "fail",
+                lambda c: c.worker.fail(wid, task.task_type, task.task_id, message, options),
+                cancelled,
             )
 
-        def complete(
-            data: bytes, options: WorkerCompleteOptions | None = None
-        ) -> tuple[str, Callable[[FloClient], Awaitable[None]]]:
-            return "complete", lambda c: c.worker.complete(
-                wid, task.task_type, task.task_id, data, options
+        def complete(data: bytes, options: WorkerCompleteOptions | None = None) -> _Report:
+            return (
+                "complete",
+                lambda c: c.worker.complete(wid, task.task_type, task.task_id, data, options),
+                False,
             )
 
         logger.info(
@@ -660,19 +694,31 @@ class ActionWorker:
             namespace=self._parent_client.namespace,
             _worker=self,
         )
+        # Not wait_for: a TimeoutError the handler raises itself would look
+        # the same as the deadline passing. Only the deadline is final.
+        run = asyncio.ensure_future(handler(ctx))
         try:
-            result = await asyncio.wait_for(handler(ctx), timeout=self.config.action_timeout)
-        except asyncio.TimeoutError:
+            await asyncio.wait({run}, timeout=self.config.action_timeout)
+        except asyncio.CancelledError:
+            run.cancel()
+            logger.warning(f"Action cancelled: {task.task_type}")
+            return fail("Action cancelled", cancelled=True)
+        if not run.done():
+            run.cancel()
+            with contextlib.suppress(BaseException):
+                await run
             logger.error(f"Action timed out: {task.task_type}")
-            return fail("Action timed out")
+            return fail("Action timed out", retry=False)
+        try:
+            result = run.result()
         except asyncio.CancelledError:
             logger.warning(f"Action cancelled: {task.task_type}")
-            return fail("Action cancelled")
+            return fail("Action cancelled", cancelled=True)
         except Exception as exc:
-            logger.error(f"Action failed: {task.task_type} - {exc}")
-            return fail(str(exc), retry=not isinstance(exc, NonRetryableError))
+            logger.error(f"Action failed: {task.task_type} - {exc!r}")
+            message = str(exc) or type(exc).__name__
+            return fail(message, retry=not isinstance(exc, NonRetryableError))
 
-        logger.info(f"Action completed: {task.task_type}")
         if isinstance(result, ActionResult):
             return complete(result.data, WorkerCompleteOptions(outcome=result.outcome))
         if isinstance(result, dict):

@@ -14,6 +14,7 @@ from flo import FloClient
 from flo.types import HEADER_SIZE, OpCode, Ran, StatusCode
 from flo.wire import (
     REQUEST_HEADER_FORMAT,
+    parse_task_assignment,
     serialize_worker_complete_value,
     serialize_worker_fail_value,
 )
@@ -148,10 +149,14 @@ async def test_a_complete_that_times_out_is_resent_not_failed() -> None:
     assert fake.ops() == [OpCode.ACTION_COMPLETE, OpCode.ACTION_COMPLETE]
 
 
-async def test_a_refused_complete_is_neither_resent_nor_failed() -> None:
+async def test_a_refused_complete_is_neither_resent_nor_failed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     fake = FakeActionServer(lambda n: "refuse")
-    await _run_action(fake, _done, lambda: len(fake.results) >= 1)
+    with caplog.at_level(logging.INFO, logger="flo.worker"):
+        await _run_action(fake, _done, lambda: len(fake.results) >= 1)
     assert fake.ops() == [OpCode.ACTION_COMPLETE]
+    assert not any("Action completed" in r.getMessage() for r in caplog.records)
 
 
 async def test_a_result_is_sent_at_most_three_times(caplog: pytest.LogCaptureFixture) -> None:
@@ -177,17 +182,11 @@ async def test_stop_lets_a_running_handler_finish_and_completes_it() -> None:
     assert serialize_worker_complete_value(ACTION, TASK_ID, b"done", "success") in frame
 
 
-async def test_a_handler_timeout_still_fails_as_timed_out() -> None:
-    fake = FakeActionServer()
-
-    async def slow(ctx: ActionContext) -> bytes:
-        await asyncio.sleep(10)
-        return b""
-
+async def _run_with_timeout(fake: FakeActionServer, handler: Any) -> None:
     server = await asyncio.start_server(fake.handle, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     worker = FloClient(f"127.0.0.1:{port}").new_action_worker(block_ms=100, action_timeout=0.1)
-    worker.register_action(ACTION, slow)
+    worker.register_action(ACTION, handler)
     run = asyncio.create_task(worker.start())
     try:
         await _until(lambda: len(fake.results) >= 1)
@@ -198,17 +197,137 @@ async def test_a_handler_timeout_still_fails_as_timed_out() -> None:
         for writer in fake.writers:
             writer.close()
         await server.wait_closed()
+
+
+async def test_a_handler_timeout_fails_for_good() -> None:
+    fake = FakeActionServer()
+
+    async def slow(ctx: ActionContext) -> bytes:
+        await asyncio.sleep(10)
+        return b""
+
+    await _run_with_timeout(fake, slow)
     assert fake.ops() == [OpCode.ACTION_FAIL]
     frame = fake.results[0][1]
-    assert serialize_worker_fail_value(ACTION, TASK_ID, "Action timed out", True) in frame
+    assert serialize_worker_fail_value(ACTION, TASK_ID, "Action timed out", False) in frame
+
+
+async def test_a_timeout_error_raised_by_the_handler_is_an_ordinary_failure() -> None:
+    fake = FakeActionServer()
+
+    async def raises(ctx: ActionContext) -> bytes:
+        raise asyncio.TimeoutError("upstream call timed out")
+
+    await _run_with_timeout(fake, raises)
+    assert fake.ops() == [OpCode.ACTION_FAIL]
+    frame = fake.results[0][1]
+    assert serialize_worker_fail_value(ACTION, TASK_ID, "upstream call timed out", True) in frame
+
+
+async def test_a_cancelled_task_is_failed_and_the_cancellation_kept() -> None:
+    fails: list[tuple[str, bool]] = []
+
+    class Results:
+        async def fail(self, wid: str, action: str, tid: str, message: str, opts: Any) -> None:
+            fails.append((message, opts.retry))
+
+    class ResultClient:
+        worker = Results()
+
+    worker = FloClient("127.0.0.1:1").new_action_worker()
+    started = asyncio.Event()
+
+    async def forever(ctx: ActionContext) -> bytes:
+        started.set()
+        await asyncio.Event().wait()
+        return b""
+
+    worker.register_action(ACTION, forever)
+    worker._result_client = ResultClient()  # type: ignore[assignment]
+    worker._semaphore = asyncio.Semaphore(0)
+    task = parse_task_assignment(_task())
+    run = asyncio.create_task(worker._execute_task(task))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    assert fails == [("Action cancelled", True)]
+    assert worker._semaphore.locked() is False
+
+
+async def test_a_poll_reconnect_leaves_a_healthy_result_connection_alone() -> None:
+    reconnects = 0
+
+    class Healthy:
+        is_connected = True
+
+        async def reconnect(self) -> None:
+            nonlocal reconnects
+            reconnects += 1
+
+    worker = FloClient("127.0.0.1:1").new_action_worker()
+    worker._result_client = Healthy()  # type: ignore[assignment]
+    await worker._reconnect_result_client(only_if_down=True)
+    assert reconnects == 0
+    Healthy.is_connected = False
+    await worker._reconnect_result_client(only_if_down=True)
+    assert reconnects == 1
+
+
+async def test_a_result_lost_after_stop_is_resent() -> None:
+    fake = FakeActionServer(lambda n: "drop" if n == 0 else "ok")
+    started = asyncio.Event()
+
+    async def slow(ctx: ActionContext) -> bytes:
+        started.set()
+        await asyncio.sleep(0.2)
+        return b"done"
+
+    await _run_action(fake, slow, started.is_set, settle=0.0)
+    assert fake.ops() == [OpCode.ACTION_COMPLETE, OpCode.ACTION_COMPLETE]
+
+
+async def test_stop_gives_up_on_a_gone_server_after_a_bounded_wait(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = FakeActionServer(lambda n: "drop")
+    started = asyncio.Event()
+
+    async def slow(ctx: ActionContext) -> bytes:
+        started.set()
+        await asyncio.sleep(0.2)
+        return b"done"
+
+    server = await asyncio.start_server(fake.handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    worker = FloClient(f"127.0.0.1:{port}").new_action_worker(block_ms=100)
+    worker.register_action(ACTION, slow)
+    run = asyncio.create_task(worker.start())
+    try:
+        await _until(started.is_set)
+        server.close()  # no new connections: every reconnect is refused
+        loop = asyncio.get_running_loop()
+        stopped = loop.time()
+        with caplog.at_level(logging.ERROR, logger="flo.worker"):
+            worker.stop()
+            await asyncio.wait_for(run, timeout=10)
+        elapsed = loop.time() - stopped
+    finally:
+        for writer in fake.writers:
+            writer.close()
+        await server.wait_closed()
+    assert fake.ops() == [OpCode.ACTION_COMPLETE]
+    assert 1.5 < elapsed < 4.0
+    assert any(TASK_ID in r.getMessage() and "Dropped" in r.getMessage() for r in caplog.records)
 
 
 class AckDropServer:
     """Hands out one record, then answers reads empty; closes the connection
     that sent each of the first `drops` acks without answering it."""
 
-    def __init__(self, drops: int) -> None:
+    def __init__(self, drops: int, not_found: bool = False) -> None:
         self.drops = drops
+        self.not_found = not_found
         self.delivered = False
         self.acks = 0
         self.nacks = 0
@@ -233,6 +352,9 @@ class AckDropServer:
                     continue
                 if op_code == OpCode.STREAM_GROUP_ACK:
                     self.acks += 1
+                    if self.not_found:
+                        writer.write(_refusal(request_id, StatusCode.NOT_FOUND, Ran.UNKNOWN))
+                        continue
                     if self.acks <= self.drops:
                         writer.close()
                         return
@@ -243,9 +365,13 @@ class AckDropServer:
             pass
 
 
-@pytest.mark.parametrize(("drops", "acks"), [(1, 2), (3, 3)])
-async def test_an_ack_whose_connection_drops_is_resent_not_nacked(drops: int, acks: int) -> None:
-    fake = AckDropServer(drops)
+@pytest.mark.parametrize(
+    ("drops", "not_found", "acks"), [(1, False, 2), (3, False, 3), (0, True, 1)]
+)
+async def test_a_lost_or_refused_ack_is_never_nacked(
+    drops: int, not_found: bool, acks: int
+) -> None:
+    fake = AckDropServer(drops, not_found)
     server = await asyncio.start_server(fake.handle, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
 
