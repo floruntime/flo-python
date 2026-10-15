@@ -513,6 +513,10 @@ class StreamOperations:
             ids: StreamIDs of records to negatively acknowledge.
             options: Optional nack options (consumer name).
 
+        Raises:
+            NotFoundError: If the stream or group does not exist, so the nack
+                did not take effect.
+
         Example:
             result = await client.stream.group_read("events", "processors", "worker-1")
             for record in result.records:
@@ -535,5 +539,4 @@ class StreamOperations:
             namespace,
             stream.encode("utf-8"),
             value,
-            allow_not_found=True,
         )

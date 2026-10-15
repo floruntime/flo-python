@@ -6,10 +6,11 @@ import struct
 
 import pytest
 
-from flo import FloClient, RetryPolicy
+from flo import FloClient, RetryPolicy, StreamID
 from flo.exceptions import (
     GenericServerError,
     IncompleteResponseError,
+    NotFoundError,
     ServerError,
     TableMismatchError,
     UnavailableError,
@@ -180,3 +181,12 @@ def test_a_refusal_carries_its_reason_and_ran() -> None:
 def test_a_body_that_is_not_a_refusal_is_refused(body: bytes) -> None:
     with pytest.raises(IncompleteResponseError):
         raise_for_status(StatusCode.BAD_REQUEST, body)
+
+
+@pytest.mark.parametrize("op", ["group_ack", "group_nack"])
+async def test_an_ack_or_nack_on_a_missing_group_raises(op: str) -> None:
+    client, server = await _client_answering(int(StatusCode.NOT_FOUND))
+    with pytest.raises(NotFoundError):
+        await getattr(client.stream, op)("events", "workers", [StreamID(1, 0)])
+    await client.close()
+    server.close()
