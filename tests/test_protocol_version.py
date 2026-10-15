@@ -2,7 +2,7 @@
 match the server's.
 
 Set ``FLO_BINARY`` to a flo binary built from the runtime revision this SDK
-targets; these tests ask its ``flo -V`` and fail on drift. Without it they are
+targets; these tests ask its ``flo version --verbose`` and fail on drift. Without it they are
 skipped: a checkout found nearby may be on any branch, its build stale.
 """
 
@@ -33,7 +33,7 @@ def server_version(tmp_path: Path) -> tuple[int, int]:
     env = {**os.environ, "HOME": str(tmp_path)}
     try:
         out = subprocess.run(
-            [binary, "-V"], capture_output=True, text=True, check=True, env=env
+            [binary, "version", "--verbose"], capture_output=True, text=True, check=True, env=env
         ).stdout
     except OSError:
         pytest.skip(f"{binary} doesn't run here (built for another platform?)")
