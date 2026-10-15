@@ -547,6 +547,10 @@ class ActionWorker:
             except Exception as e:
                 self._semaphore.release()
                 if is_connection_error(e):
+                    # stop() interrupts the poll connection: that is not a
+                    # drop to recover from.
+                    if self._stop_event.is_set():
+                        break
                     if reconnect_pause:
                         with contextlib.suppress(asyncio.TimeoutError):
                             await asyncio.wait_for(self._stop_event.wait(), reconnect_pause)

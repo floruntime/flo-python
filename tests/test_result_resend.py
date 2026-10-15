@@ -267,3 +267,42 @@ async def test_an_ack_whose_connection_drops_is_resent_not_nacked(drops: int, ac
             writer.close()
         await server.wait_closed()
     assert (fake.acks, fake.nacks) == (acks, 0)
+
+
+async def test_stop_during_a_poll_neither_reconnects_nor_registers_again() -> None:
+    connections = 0
+    registers: list[int] = []
+    polling = asyncio.Event()
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal connections
+        connections += 1
+        try:
+            while True:
+                header = await reader.readexactly(HEADER_SIZE)
+                _, payload_len, request_id, _, op_code, *_ = struct.unpack(
+                    REQUEST_HEADER_FORMAT, header
+                )
+                await reader.readexactly(payload_len)
+                if op_code in (OpCode.ACTION_REGISTER, OpCode.WORKER_REGISTER):
+                    registers.append(op_code)
+                if op_code == OpCode.ACTION_AWAIT:
+                    polling.set()
+                    continue  # park: the poll is in flight when stop() comes
+                writer.write(_frame(request_id, StatusCode.OK, b""))
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    worker = FloClient(f"127.0.0.1:{port}").new_action_worker(block_ms=30000)
+    worker.register_action(ACTION, _done)
+    run = asyncio.create_task(worker.start())
+    await _until(polling.is_set)
+    before = (connections, len(registers))
+    worker.stop()
+    await asyncio.wait_for(run, timeout=10)
+    await asyncio.sleep(0.3)
+    server.close()
+    await server.wait_closed()
+    assert (connections, len(registers)) == before
