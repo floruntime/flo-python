@@ -413,11 +413,6 @@ class TestHappyPath:
 class TestRejectionPath:
     """Test the order-processing workflow with a large amount that triggers rejection."""
 
-    # On v0.1.0-dev.12 the run reaches `rejected`, but only after the payment
-    # plan has started its exhausted executors again round after round until
-    # their breakers open, which takes longer than the 30 s allowed. Ticketed
-    # in flo as plan selection re-running exhausted executors.
-    @pytest.mark.xfail(reason="flo re-runs exhausted plan executors until their breakers open", strict=False)
     async def test_rejection_path(self, client: FloClient, worker: ActionWorker):
         await sync_test_workflows(client)
 
