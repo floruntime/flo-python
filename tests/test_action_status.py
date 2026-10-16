@@ -74,6 +74,15 @@ def test_a_status_byte_this_client_doesnt_know_is_refused() -> None:
 
 def test_an_invoke_answer_is_the_run_id_alone() -> None:
     assert decode_action_invoke_answer(struct.pack("<H", 5) + b"act-1" + b"\x00") == "act-1"
-    for bad in (b"", b"\x00\x00\x00", struct.pack("<H", 9) + b"a"):
+    run = struct.pack("<H", 5) + b"act-1"
+    # The has_output byte is there and 0, and nothing follows it.
+    for bad in (
+        b"",
+        b"\x00\x00\x00",
+        struct.pack("<H", 9) + b"a",
+        run,
+        run + b"\x01",
+        run + b"\x00\x00",
+    ):
         with pytest.raises(IncompleteResponseError):
             decode_action_invoke_answer(bad)

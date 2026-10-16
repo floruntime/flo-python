@@ -483,4 +483,7 @@ def decode_action_invoke_answer(data: bytes) -> str:
     run_id = a.bytes16()
     if not run_id:
         raise IncompleteResponseError("action.invoke answer has no run id")
+    if a.present():
+        raise IncompleteResponseError("action.invoke answer carries an output")
+    a.done()
     return run_id.decode("utf-8")
