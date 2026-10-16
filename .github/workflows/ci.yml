@@ -26,7 +26,38 @@ jobs:
           pip install -e .
           mypy src/flo/
 
+  # The flo the live tests run against: the commit pinned in
+  # .github/flo-ref.env, built once and handed to every test job.
+  flo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the pinned flo commit
+        run: |
+          . ./.github/flo-ref.env
+          echo "FLO_REF=$FLO_REF" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: floruntime/flo
+          ref: ${{ env.FLO_REF }}
+          path: flo-src
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      # For x86-64-v2, not this runner's CPU: the test jobs run on other
+      # machines, where a native build can die on an illegal instruction.
+      - name: Build flo
+        working-directory: flo-src
+        run: zig build --release=safe -Dcpu=x86_64_v2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flo
+          path: flo-src/zig-out/bin/flo
+          retention-days: 1
+
   test:
+    needs: flo
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -41,16 +72,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-      - name: Start the pinned flo release
+      - uses: actions/download-artifact@v4
+        with:
+          name: flo
+          path: ${{ runner.temp }}/flo-bin
+      - name: Start the pinned flo
         run: |
-          . ./.github/flo-release.env
           cd "$RUNNER_TEMP"
-          curl -fsSL -o flo.tar.gz "https://github.com/floruntime/flo/releases/download/$FLO_TAG/flo-x86_64-linux.tar.gz"
-          echo "$FLO_SHA256  flo.tar.gz" | sha256sum -c -
-          tar xzf flo.tar.gz
-          echo "FLO_BINARY=$RUNNER_TEMP/flo" >> "$GITHUB_ENV"
+          chmod +x flo-bin/flo
+          echo "FLO_BINARY=$RUNNER_TEMP/flo-bin/flo" >> "$GITHUB_ENV"
           mkdir -p flo-data
-          ./flo server start --port 4453 --data-dir "$RUNNER_TEMP/flo-data" > flo-server.log 2>&1 &
+          ./flo-bin/flo server start --port 4453 --data-dir "$RUNNER_TEMP/flo-data" > flo-server.log 2>&1 &
           for _ in $(seq 1 50); do
             if (exec 3<>/dev/tcp/127.0.0.1/4453) 2>/dev/null; then exit 0; fi
             sleep 0.2
@@ -58,7 +90,7 @@ jobs:
           echo "flo server did not start"; cat flo-server.log; exit 1
       - name: Run tests
         # CI=1 turns a missing server into a failure, not a skip; FLO_BINARY
-        # runs the version test against the pinned release.
+        # runs the version test against the pinned flo.
         env:
           CI: "1"
           FLO_ENDPOINT: localhost:4453
