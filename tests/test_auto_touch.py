@@ -9,7 +9,7 @@ import pytest
 from flo import ActionRegisterOptions, FloClient, RetryPolicy
 from flo.types import HEADER_SIZE, ActionType, OpCode, Ran, StatusCode
 from flo.wire import REQUEST_HEADER_FORMAT, serialize_action_register_value
-from flo.worker import ActionContext
+from flo.worker import ActionContext, _touch_pace
 
 from .test_result_resend import ACTION, TASK_ID, _task, _until
 from .test_retry import _frame, _refusal
@@ -150,3 +150,24 @@ async def test_an_action_that_never_times_out_is_not_touched() -> None:
     fake = FakeServer()
     await _run(fake, auto_touch=True, timeout_ms=0, handler_s=0.3)
     assert fake.of(OpCode.ACTION_TOUCH) == []
+
+
+@pytest.mark.parametrize(
+    ("timeout_ms", "interval_s", "extend_ms"),
+    [(300, 0.1, 300), (30000, 10.0, 30000), (60, 0.1, 60), (4 * 3_600_000, 1200.0, 3_600_000)],
+)
+def test_touch_pace_is_a_third_of_the_lease_it_asks_for(
+    timeout_ms: int, interval_s: float, extend_ms: int
+) -> None:
+    assert _touch_pace(timeout_ms) == (interval_s, extend_ms)
+
+
+@pytest.mark.parametrize(
+    ("timeout_ms", "max_retries", "owner"),
+    [(-1, 3, None), (30000, 2**32, None), (30000, 3, "x" * 65536)],
+)
+def test_the_register_encoder_refuses_what_its_fields_cant_hold(
+    timeout_ms: int, max_retries: int, owner: str | None
+) -> None:
+    with pytest.raises(ValueError):
+        serialize_action_register_value(ActionType.USER, timeout_ms, max_retries, owner)
