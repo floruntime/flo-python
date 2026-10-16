@@ -18,7 +18,7 @@ VERSION: int = 0x02
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0x0594D65E5909AF22
+TABLE_HASH: int = 0x3AC05A0A877BDA48
 
 
 class Reason(IntEnum):
