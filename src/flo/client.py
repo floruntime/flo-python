@@ -485,6 +485,7 @@ class FloClient:
         concurrency: int = 10,
         action_timeout: float = 300.0,
         block_ms: int = _DEFAULT_WORKER_BLOCK_MS,
+        auto_touch: bool = False,
     ) -> "ActionWorker":
         """Create a new ActionWorker from this client.
 
@@ -497,6 +498,9 @@ class FloClient:
             action_timeout: Timeout for action handlers in seconds.
             block_ms: Long-poll wait per await in milliseconds, at most 300000.
                 0 means the 30000 default.
+            auto_touch: Touch each run every third of its action's timeout
+                while its handler runs. Off by default: a handler that runs
+                past the timeout without touching is taken back and run again.
 
         Returns:
             A new ActionWorker instance ready to register actions and start.
@@ -517,6 +521,7 @@ class FloClient:
             concurrency=concurrency,
             action_timeout=action_timeout,
             block_ms=block_ms,
+            auto_touch=auto_touch,
         )
 
     def new_stream_worker(

@@ -78,7 +78,7 @@ class ActionOperations:
             action_type=action_type,
             timeout_ms=opts.timeout_ms,
             max_retries=opts.max_retries,
-            description=opts.description,
+            owner=opts.owner,
         )
 
         await self._client._send_and_check(

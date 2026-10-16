@@ -429,14 +429,14 @@ await client.worker.touch(
 
 ```python
 import asyncio
-from flo import FloClient
+from flo import ActionRegisterOptions, FloClient
 
 async def run_worker():
     async with FloClient("localhost:9000", namespace="myapp") as client:
         # Create an action worker from the client
-        worker = client.new_action_worker(concurrency=5)
+        worker = client.new_action_worker(concurrency=5, auto_touch=True)
 
-        @worker.action("process-image")
+        @worker.action("process-image", ActionRegisterOptions(timeout_ms=60000))
         async def process_image(ctx):
             data = ctx.json()
             result = await do_processing(data)
@@ -446,6 +446,10 @@ async def run_worker():
 
 asyncio.run(run_worker())
 ```
+
+The worker registers each action with the server when it starts, with exactly the options given (the server's defaults when none: a 30 s timeout, 3 attempts). Registering replaces the action's settings, so workers that register one action with different options leave it with whichever registered last.
+
+A run whose handler goes past the action's `timeout_ms` without touching it is taken back and run again, by this worker or another. `auto_touch=True` touches each run every third of its action's timeout while the handler runs; it's off by default. Without it, call `await ctx.touch()` from long handlers. The worker also stops any handler after its own `action_timeout` (300 s by default) whatever the action's `timeout_ms`, so raise it for actions that run longer.
 
 Delivery is at-least-once: a result lost to a dropped connection is resent, and one that never arrives lets the lease run out, so a handler may see the same task or record again. `worker.stop()` waits for running handlers, and their results are still sent.
 

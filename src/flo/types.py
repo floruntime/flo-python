@@ -883,12 +883,23 @@ class ActionListResult:
 
 @dataclass
 class ActionRegisterOptions:
-    """Options for registering an action."""
+    """Options for registering an action. Registering an action replaces
+    the settings it had: the last registration wins."""
 
     namespace: str | None = None
+    # How long a run may go without its worker completing, failing or
+    # touching it before it's taken back; 0 means never.
     timeout_ms: int = 30000
+    # Attempts in all, counting the first.
     max_retries: int = 3
-    description: str | None = None
+    owner: str | None = None
+
+    def __post_init__(self) -> None:
+        # Both go on the wire as u32.
+        for name in ("timeout_ms", "max_retries"):
+            value = getattr(self, name)
+            if not 0 <= value < 2**32:
+                raise ValueError(f"{name} must be in [0, 2**32), not {value}")
 
 
 @dataclass
