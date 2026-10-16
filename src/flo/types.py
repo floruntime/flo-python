@@ -18,7 +18,7 @@ VERSION: int = 0x02
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0xC8A2C3C65E95D11D
+TABLE_HASH: int = 0x0594D65E5909AF22
 
 
 class Reason(IntEnum):
@@ -855,14 +855,31 @@ class ActionInfo:
     description: str | None = None
 
 
+class RunStatus(IntEnum):
+    """An action run's status."""
+
+    PENDING = 0
+    RUNNING = 1
+    COMPLETED = 2
+    FAILED = 3
+    CANCELLED = 4
+    TIMED_OUT = 5
+
+
 @dataclass
 class ActionRunStatus:
-    """Status of an action run."""
+    """Status of an action run. Times are ms since the epoch; ``attempt``
+    counts from 1 once a worker has taken the run. ``output`` is a completed
+    run's result, and ``error_message`` the last failure's message."""
 
     run_id: str
-    status: str  # "pending", "running", "completed", "failed"
-    result: bytes | None = None
-    error: str | None = None
+    status: RunStatus
+    created_at_ms: int
+    attempt: int
+    started_at_ms: int | None = None
+    completed_at_ms: int | None = None
+    output: bytes | None = None
+    error_message: str | None = None
 
 
 @dataclass

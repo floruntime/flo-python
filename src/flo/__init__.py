@@ -117,6 +117,7 @@ from .types import (
     PutResult,
     Ran,
     Reason,
+    RunStatus,
     ScanOptions,
     ScanResult,
     StatusCode,
@@ -284,6 +285,7 @@ __all__ = [
     "StreamGroupNackOptions",
     # Action types
     "ActionType",
+    "RunStatus",
     "ActionInfo",
     "ActionRunStatus",
     "ActionInvokeResult",

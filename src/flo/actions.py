@@ -9,6 +9,7 @@ For a higher-level API, see `Worker` in worker.py.
 
 from typing import TYPE_CHECKING
 
+from .kv_body import decode_action_invoke_answer, decode_action_status_answer
 from .types import (
     ActionDeleteOptions,
     ActionInvokeOptions,
@@ -119,9 +120,7 @@ class ActionOperations:
             value,
         )
 
-        # Response contains run_id as string
-        run_id = response.data.decode("utf-8") if response.data else ""
-        return ActionInvokeResult(run_id=run_id)
+        return ActionInvokeResult(run_id=decode_action_invoke_answer(response.data))
 
     async def status(
         self,
@@ -147,13 +146,7 @@ class ActionOperations:
             b"",
         )
 
-        # Parse status response - format TBD based on server implementation
-        # For now return basic status
-        return ActionRunStatus(
-            run_id=run_id,
-            status="unknown",
-            result=response.data if response.data else None,
-        )
+        return decode_action_status_answer(run_id, response.data)
 
     async def list(
         self,

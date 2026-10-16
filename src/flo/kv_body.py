@@ -1,4 +1,4 @@
-"""KV ops as table ops.
+"""KV ops, and action.status, as table ops.
 
 The request is ``[namespace][key][body]``, the body coded by the op's
 schema, field by field in order. An optional field is a presence byte then
@@ -14,6 +14,7 @@ from .exceptions import BlockTooLongError, IncompleteResponseError, ValidationEr
 from .types import (
     MAX_KV_VALUE_SIZE,
     MAX_WAIT_MS,
+    ActionRunStatus,
     Condition,
     GetOptions,
     GetResult,
@@ -21,6 +22,7 @@ from .types import (
     OpCode,
     PutOptions,
     PutResult,
+    RunStatus,
     VersionEntry,
     WaitFor,
 )
@@ -59,6 +61,7 @@ _TABLE_OPS = frozenset(
         OpCode.KV_ROLLBACK_TXN,
         OpCode.KV_EXPIRE,
         OpCode.KV_EXISTS,
+        OpCode.ACTION_STATUS,
     }
 )
 
@@ -441,3 +444,43 @@ def decode_txn_commit_answer(data: bytes) -> tuple[int, int]:
     commit_index, ops = a.u64(), a.u16()
     a.done()
     return commit_index, ops
+
+
+def decode_action_status_answer(run_id: str, data: bytes) -> ActionRunStatus:
+    """action.status's answer: status, created_at, started_at?, completed_at?,
+    attempt, output?, error_message?, with u16 lengths."""
+    a = _Answer("action.status", data)
+    code = a.u8()
+    try:
+        status = RunStatus(code)
+    except ValueError:
+        raise IncompleteResponseError(
+            f"action.status answer has an unknown status {code}"
+        ) from None
+    created_at_ms = a.i64()
+    started_at_ms = a.i64() if a.present() else None
+    completed_at_ms = a.i64() if a.present() else None
+    attempt = a.u32()
+    output = a.bytes16() if a.present() else None
+    error = a.bytes16() if a.present() else None
+    a.done()
+    return ActionRunStatus(
+        run_id=run_id,
+        status=status,
+        created_at_ms=created_at_ms,
+        attempt=attempt,
+        started_at_ms=started_at_ms,
+        completed_at_ms=completed_at_ms,
+        output=output,
+        error_message=error.decode("utf-8", errors="replace") if error is not None else None,
+    )
+
+
+def decode_action_invoke_answer(data: bytes) -> str:
+    """action.invoke's answer: [run_id_len:u16][run_id][has_output:u8]; the
+    server never sets output."""
+    a = _Answer("action.invoke", data)
+    run_id = a.bytes16()
+    if not run_id:
+        raise IncompleteResponseError("action.invoke answer has no run id")
+    return run_id.decode("utf-8")
