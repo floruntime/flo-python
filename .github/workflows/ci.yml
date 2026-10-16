@@ -36,6 +36,8 @@ jobs:
       - name: Read the pinned flo commit
         run: |
           . ./.github/flo-ref.env
+          # A branch or tag would be checked out as readily, and move.
+          [[ $FLO_REF =~ ^[0-9a-f]{40}$ ]] || { echo "FLO_REF must be a full commit SHA"; exit 1; }
           echo "FLO_REF=$FLO_REF" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:

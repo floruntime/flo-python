@@ -1,7 +1,6 @@
 """Flo Processing Operations
 
-Stream processing operations: submit, status, list, stop, cancel,
-savepoint, restore, rescale, sync.
+Stream processing operations: submit, status, list, stop, cancel, sync.
 """
 
 from __future__ import annotations
@@ -17,9 +16,6 @@ from .types import (
     ProcessingCancelOptions,
     ProcessingListEntry,
     ProcessingListOptions,
-    ProcessingRescaleOptions,
-    ProcessingRestoreOptions,
-    ProcessingSavepointOptions,
     ProcessingStatusOptions,
     ProcessingStatusResult,
     ProcessingStopOptions,
@@ -126,58 +122,6 @@ class ProcessingOperations:
             b"",
         )
 
-    async def savepoint(
-        self, job_id: str, options: ProcessingSavepointOptions | None = None
-    ) -> str:
-        """Trigger a savepoint for a processing job. Returns the savepoint ID."""
-        opts = options or ProcessingSavepointOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        resp = await self._client._send_and_check(
-            OpCode.PROCESSING_SAVEPOINT,
-            namespace,
-            job_id.encode("utf-8"),
-            b"",
-        )
-
-        return resp.data.decode("utf-8")
-
-    async def restore(
-        self,
-        job_id: str,
-        savepoint_id: str,
-        options: ProcessingRestoreOptions | None = None,
-    ) -> None:
-        """Restore a processing job from a savepoint."""
-        opts = options or ProcessingRestoreOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        await self._client._send_and_check(
-            OpCode.PROCESSING_RESTORE,
-            namespace,
-            job_id.encode("utf-8"),
-            savepoint_id.encode("utf-8"),
-        )
-
-    async def rescale(
-        self,
-        job_id: str,
-        parallelism: int,
-        options: ProcessingRescaleOptions | None = None,
-    ) -> None:
-        """Change the parallelism of a processing job."""
-        opts = options or ProcessingRescaleOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = struct.pack("<I", parallelism)
-
-        await self._client._send_and_check(
-            OpCode.PROCESSING_RESCALE,
-            namespace,
-            job_id.encode("utf-8"),
-            value,
-        )
-
     # =========================================================================
     # Declarative Sync
     # =========================================================================
@@ -224,7 +168,7 @@ def _parse_processing_status(data: bytes) -> ProcessingStatusResult:
     """Parse binary wire format for processing job status.
 
     Wire format: [job_id_len:u16][job_id][name_len:u16][name][status:u8]
-                 [parallelism:u32][batch_size:u32][records_processed:u64][created_at:i64]
+                 [batch_size:u32][records_processed:u64][created_at:i64]
     """
     pos = 0
 
@@ -252,9 +196,6 @@ def _parse_processing_status(data: bytes) -> ProcessingStatusResult:
         else f"unknown({status_byte})"
     )
 
-    (parallelism,) = struct.unpack_from("<I", data, pos)
-    pos += 4
-
     (batch_size,) = struct.unpack_from("<I", data, pos)
     pos += 4
 
@@ -267,7 +208,6 @@ def _parse_processing_status(data: bytes) -> ProcessingStatusResult:
         job_id=job_id,
         name=name,
         status=status_str,
-        parallelism=parallelism,
         batch_size=batch_size,
         records_processed=records_processed,
         created_at=created_at,
@@ -278,7 +218,7 @@ def _parse_processing_list(data: bytes) -> list[ProcessingListEntry]:
     """Parse binary wire format for processing job list.
 
     Wire format: [count:u32]([name_len:u16][name][job_id_len:u16][job_id]
-                 [status_len:u16][status][parallelism:u32][created_at:i64])*
+                 [status_len:u16][status][created_at:i64])*
     """
     if len(data) < 4:
         return []
@@ -305,9 +245,6 @@ def _parse_processing_list(data: bytes) -> list[ProcessingListEntry]:
         job_id = read_str()
         status = read_str()
 
-        (parallelism,) = struct.unpack_from("<I", data, pos)
-        pos += 4
-
         (created_at,) = struct.unpack_from("<q", data, pos)
         pos += 8
 
@@ -316,7 +253,6 @@ def _parse_processing_list(data: bytes) -> list[ProcessingListEntry]:
                 name=name,
                 job_id=job_id,
                 status=status,
-                parallelism=parallelism,
                 created_at=created_at,
             )
         )
