@@ -32,8 +32,9 @@ _MAX_JSON_DOCUMENT = 252_819
 _MAX_SCAN_CURSOR = 64
 MAX_SCAN = 1024
 MAX_MGET = 256
-# The longest mget body that fits one request frame.
-MAX_MGET_BODY = 257_949
+# The most bytes of mget key elements (each [len:u16][key]) in one request:
+# the frame less the count and the longest routing key.
+MAX_MGET_KEYS_BYTES = 253_848
 MAX_HISTORY = 65
 # The longest TTL whose nanoseconds fit a u64.
 MAX_TTL_MS = 18_446_744_073_709
@@ -169,31 +170,29 @@ def encode_history_body(limit: int, routing_key: str | None) -> bytes:
     return _limit("history limit", limit, MAX_HISTORY) + _routing_key(routing_key)
 
 
-def encode_mget_body(keys: Sequence[bytes]) -> bytes:
-    """kv.mget's request: keys."""
+def encode_mget_body(keys: Sequence[bytes], routing_key: str | None = None) -> bytes:
+    """kv.mget's request: keys, routing_key."""
     if not 1 <= len(keys) <= MAX_MGET:
         raise ValidationError(f"mget takes 1..{MAX_MGET} keys, got {len(keys)}")
-    body = struct.pack("<H", len(keys)) + b"".join(
-        _bytes16("mget key", k, _MAX_ROUTING_KEY) for k in keys
-    )
-    if len(body) > MAX_MGET_BODY:
-        raise ValidationError(f"mget body is {len(body)} bytes, at most {MAX_MGET_BODY}")
-    return body
+    elements = b"".join(_bytes16("mget key", k, _MAX_ROUTING_KEY) for k in keys)
+    if len(elements) > MAX_MGET_KEYS_BYTES:
+        raise ValidationError(f"mget keys are {len(elements)} bytes, at most {MAX_MGET_KEYS_BYTES}")
+    return struct.pack("<H", len(keys)) + elements + _routing_key(routing_key)
 
 
 def split_mget_keys(keys: Sequence[bytes]) -> list[Sequence[bytes]]:
-    """The keys in runs whose mget bodies each fit one request frame; refuses a
-    bad key list before any round trip."""
+    """The keys in runs that each fit one request frame; refuses a bad key list
+    before any round trip."""
     if not 1 <= len(keys) <= MAX_MGET:
         raise ValidationError(f"mget takes 1..{MAX_MGET} keys, got {len(keys)}")
     runs: list[Sequence[bytes]] = []
-    start, size = 0, 2
+    start, size = 0, 0
     for i, k in enumerate(keys):
         if len(k) > _MAX_ROUTING_KEY:
             raise ValidationError(f"mget key is {len(k)} bytes, at most {_MAX_ROUTING_KEY}")
-        if size + 2 + len(k) > MAX_MGET_BODY:
+        if size + 2 + len(k) > MAX_MGET_KEYS_BYTES:
             runs.append(keys[start:i])
-            start, size = i, 2
+            start, size = i, 0
         size += 2 + len(k)
     runs.append(keys[start:])
     return runs

@@ -14,6 +14,7 @@ from flo import (
     KVExpireOptions,
     KVIncrOptions,
     KVJsonOptions,
+    KVMGetOptions,
     ScanOptions,
 )
 from flo import kv_body as kb
@@ -75,7 +76,8 @@ def test_request_bodies_match_the_servers_schemas() -> None:
     assert kb.encode_scan_body(2, b"c1") == H("0102000000026331")
     assert kb.encode_history_body(2, None) == H("010200000000")
     assert kb.encode_history_body(2, "rk") == H("0102000000010200726b")
-    assert kb.encode_mget_body([b"a", b"b"]) == H("0200010061010062")
+    assert kb.encode_mget_body([b"a", b"b"]) == H("020001006101006200")
+    assert kb.encode_mget_body([b"a", b"b"], "rk") == H("0200010061010062010200726b")
     assert kb.encode_incr_body(-5, None, 9) == H("01fbffffffffffffff00010900000000000000")
     assert kb.encode_expire_body(60000, None, None, None) == H("60ea000000000000000000")
     assert kb.encode_exists_body(None, None) == H("0000")
@@ -255,14 +257,17 @@ async def test_mget_splits_keys_so_each_request_fits_its_frame(
             _mget_answer([(True, 1, b"v")] * struct.unpack("<H", body[:2])[0], None)
         ),
     )
-    got = await client.kv.mget(list(keys))
+    got = await client.kv.mget(list(keys), KVMGetOptions(routing_key="rk"))
     assert [e.key for e in got] == [k.decode() for k in keys]
     bodies = [c[3] for c in calls]
-    assert len(bodies) == 2
-    assert all(len(b) <= kb.MAX_MGET_BODY for b in bodies)
-    # 2 + 128 * 2002 = 256258 fits; one more key doesn't.
-    assert bodies[0] == kb.encode_mget_body(keys[:128])
-    assert bodies[1] == kb.encode_mget_body(keys[128:])
+    # 126 * 2002 = 252252 bytes of key elements fit; one more key doesn't.
+    assert bodies == [
+        kb.encode_mget_body(keys[:126], "rk"),
+        kb.encode_mget_body(keys[126:], "rk"),
+    ]
+    assert all(b.endswith(H("010200726b")) for b in bodies)
+    with pytest.raises(ValidationError):
+        kb.encode_mget_body(keys[:127])
 
 
 async def test_mget_follows_next_within_a_split_run(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -270,14 +275,14 @@ async def test_mget_follows_next_within_a_split_run(monkeypatch: pytest.MonkeyPa
     client, calls = _client(
         monkeypatch,
         _ok(_mget_answer([(True, 1, b"")] * 100, 100)),
-        _ok(_mget_answer([(True, 1, b"")] * 28, None)),
-        _ok(_mget_answer([(True, 1, b"")] * 2, None)),
+        _ok(_mget_answer([(True, 1, b"")] * 26, None)),
+        _ok(_mget_answer([(True, 1, b"")] * 4, None)),
     )
     assert len(await client.kv.mget(list(keys))) == 130
     assert [c[3] for c in calls] == [
-        kb.encode_mget_body(keys[:128]),
-        kb.encode_mget_body(keys[100:128]),
-        kb.encode_mget_body(keys[128:]),
+        kb.encode_mget_body(keys[:126]),
+        kb.encode_mget_body(keys[100:126]),
+        kb.encode_mget_body(keys[126:]),
     ]
 
 
@@ -364,6 +369,7 @@ async def test_bounds_are_refused_before_a_round_trip(monkeypatch: pytest.Monkey
         client.kv.history("k", HistoryOptions(limit=0)),
         client.kv.mget([f"k{i}" for i in range(257)]),
         client.kv.mget(["k", "x" * 4097]),
+        client.kv.mget(["k"], KVMGetOptions(routing_key="r" * 4097)),
         client.kv.incr("n", KVIncrOptions(delta=1 << 63)),
         client.kv.delete("k", DeleteOptions(routing_key="r" * 4097)),
         client.kv.delete("k", DeleteOptions(cas_version=-1)),
