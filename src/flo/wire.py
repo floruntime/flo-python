@@ -786,7 +786,12 @@ def serialize_action_register_value(
 
     Format: [action_type:u8][timeout_ms:u32][max_retries:u32][owner_len:u16][owner]
     """
+    for name, value in (("timeout_ms", timeout_ms), ("max_retries", max_retries)):
+        if not 0 <= value < 2**32:
+            raise ValueError(f"{name} must be in [0, 2**32), not {value}")
     owner_bytes = (owner or "").encode("utf-8")
+    if len(owner_bytes) > 0xFFFF:
+        raise ValueError("owner is longer than 65535 bytes")
     return (
         struct.pack("<BIIH", action_type & 0xFF, timeout_ms, max_retries, len(owner_bytes))
         + owner_bytes

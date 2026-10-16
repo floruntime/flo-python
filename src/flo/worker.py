@@ -134,6 +134,16 @@ _MIN_TOUCH_INTERVAL_MS = 100
 # The longest lease a touch may ask for; the server refuses more.
 _MAX_TOUCH_EXTEND_MS = 3_600_000
 
+
+def _touch_pace(timeout_ms: int) -> tuple[float, int]:
+    """How often (in seconds) to touch a run of an action with timeout_ms,
+    and the lease each touch asks for: the timeout, at most an hour, touched
+    every third of that (at least _MIN_TOUCH_INTERVAL_MS apart) so two can
+    fail in a row."""
+    extend_ms = min(timeout_ms, _MAX_TOUCH_EXTEND_MS)
+    return max(extend_ms / 3, _MIN_TOUCH_INTERVAL_MS) / 1000, extend_ms
+
+
 # Touch refusals that mean the run moved on: touching again can't help.
 _TOUCH_FINAL = (StatusCode.CONFLICT, StatusCode.NOT_FOUND, StatusCode.BAD_REQUEST)
 
@@ -800,7 +810,7 @@ class ActionWorker:
     async def _keep_touching(
         self, task: TaskAssignment, timeout_ms: int, stop: asyncio.Event
     ) -> None:
-        """Touch a run every third of timeout_ms until stop is set.
+        """Touch a run at _touch_pace(timeout_ms) until stop is set.
 
         Each touch asks for this worker's timeout (at most an hour), so the
         lease covers it even if another worker's registration shortened the
@@ -809,8 +819,7 @@ class ActionWorker:
         refusal, an overloaded leader say, is tried again next interval, and
         a lost connection is reconnected for it.
         """
-        interval_s = max(timeout_ms / 3, _MIN_TOUCH_INTERVAL_MS) / 1000
-        extend_ms = min(timeout_ms, _MAX_TOUCH_EXTEND_MS)
+        interval_s, extend_ms = _touch_pace(timeout_ms)
         while True:
             try:
                 await asyncio.wait_for(stop.wait(), interval_s)
