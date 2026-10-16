@@ -780,50 +780,17 @@ def serialize_action_register_value(
     action_type: int,
     timeout_ms: int,
     max_retries: int,
-    description: str | None = None,
+    owner: str | None = None,
 ) -> bytes:
     """Serialize action register value.
 
-    Format: [action_type:u8][timeout_ms:u32][max_retries:u32]
-            [has_desc:u8][desc_len:u16]?[desc]?
-            [has_wasm_module:u8=0]...(reserved zero fields for wire compat)
+    Format: [action_type:u8][timeout_ms:u32][max_retries:u32][owner_len:u16][owner]
     """
-    result = bytearray()
-
-    # action_type
-    result.append(action_type & 0xFF)
-
-    # timeout_ms
-    result.extend(struct.pack("<I", timeout_ms))
-
-    # max_retries
-    result.extend(struct.pack("<I", max_retries))
-
-    # description (optional)
-    if description:
-        desc_bytes = description.encode("utf-8")
-        result.append(1)  # has_desc
-        result.extend(struct.pack("<H", len(desc_bytes)))
-        result.extend(desc_bytes)
-    else:
-        result.append(0)
-
-    # wasm_module (reserved, always zero)
-    result.append(0)
-
-    # wasm_entrypoint (reserved, always zero)
-    result.append(0)
-
-    # wasm_memory_limit (reserved, always zero)
-    result.append(0)
-
-    # trigger_stream (optional, not used)
-    result.append(0)
-
-    # trigger_group (optional, not used)
-    result.append(0)
-
-    return bytes(result)
+    owner_bytes = (owner or "").encode("utf-8")
+    return (
+        struct.pack("<BIIH", action_type & 0xFF, timeout_ms, max_retries, len(owner_bytes))
+        + owner_bytes
+    )
 
 
 def serialize_action_invoke_value(

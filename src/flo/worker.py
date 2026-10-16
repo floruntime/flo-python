@@ -22,6 +22,7 @@ Example::
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import secrets
@@ -31,11 +32,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .client import FloClient
-from .exceptions import NonRetryableError, is_connection_error
+from .exceptions import NonRetryableError, ServerError, is_connection_error
 from .retry import _sleep_unless_stopped, _worker_backoff, is_refused_unrun
 from .types import (
     _DEFAULT_WORKER_BLOCK_MS,
+    ActionRegisterOptions,
     ActionType,
+    StatusCode,
     StreamGroupAckOptions,
     StreamGroupNackOptions,
     StreamGroupReadOptions,
@@ -124,6 +127,15 @@ _Report = tuple[str, Callable[[FloClient], Awaitable[None]], bool]
 # How long a stopping worker keeps reconnecting to resend a lost result, so
 # stop() can't hang on a server that is gone.
 _STOP_RECONNECT_S = 2.0
+
+# auto_touch never touches more often than this, whatever the timeout.
+_MIN_TOUCH_INTERVAL_MS = 100
+
+# The longest lease a touch may ask for; the server refuses more.
+_MAX_TOUCH_EXTEND_MS = 3_600_000
+
+# Touch refusals that mean the run moved on: touching again can't help.
+_TOUCH_FINAL = (StatusCode.CONFLICT, StatusCode.NOT_FOUND, StatusCode.BAD_REQUEST)
 
 
 async def _send_result(
@@ -217,6 +229,9 @@ class ActionWorkerOptions:
     concurrency: int = 10
     action_timeout: float = 300.0  # 5 minutes
     block_ms: int = _DEFAULT_WORKER_BLOCK_MS
+    # Touch each run every third of its action's timeout while the handler
+    # runs, so a long handler isn't taken back and run again elsewhere.
+    auto_touch: bool = False
 
     def __post_init__(self) -> None:
         self.block_ms = _worker_block_ms(self.block_ms)
@@ -332,6 +347,7 @@ class ActionWorker:
         concurrency: int = 10,
         action_timeout: float = 300.0,
         block_ms: int = _DEFAULT_WORKER_BLOCK_MS,
+        auto_touch: bool = False,
     ):
         """Initialize a Flo worker from a connected client.
 
@@ -342,6 +358,9 @@ class ActionWorker:
             action_timeout: Timeout for action handlers in seconds.
             block_ms: Long-poll wait per await in milliseconds, at most 300000.
                 0 means the 30000 default.
+            auto_touch: Touch each run every third of its action's timeout
+                while its handler runs. Off by default: a handler that runs
+                past the timeout without touching is taken back and run again.
         """
         self._parent_client = parent_client
         self.config = ActionWorkerOptions(
@@ -349,6 +368,7 @@ class ActionWorker:
             concurrency=concurrency,
             action_timeout=action_timeout,
             block_ms=block_ms,
+            auto_touch=auto_touch,
         )
 
         self._client: FloClient | None = None
@@ -358,6 +378,7 @@ class ActionWorker:
         self._result_reconnect_lock = asyncio.Lock()
         self._result_generation = 0
         self._handlers: dict[str, ActionHandler] = {}
+        self._action_options: dict[str, ActionRegisterOptions] = {}
         self._running = False
         self._stop_event = asyncio.Event()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -373,11 +394,14 @@ class ActionWorker:
             hostname = "unknown"
         return f"{hostname}-{secrets.token_hex(4)}"
 
-    def action(self, name: str) -> Callable[[ActionHandler], ActionHandler]:
-        """Decorator to register an action handler.
+    def action(
+        self, name: str, options: ActionRegisterOptions | None = None
+    ) -> Callable[[ActionHandler], ActionHandler]:
+        """Decorator to register an action handler (see register_action).
 
         Args:
             name: The action name to register.
+            options: The action's timeout, attempts and owner.
 
         Returns:
             Decorator function.
@@ -389,17 +413,30 @@ class ActionWorker:
         """
 
         def decorator(handler: ActionHandler) -> ActionHandler:
-            self.register_action(name, handler)
+            self.register_action(name, handler, options)
             return handler
 
         return decorator
 
-    def register_action(self, name: str, handler: ActionHandler) -> None:
+    def register_action(
+        self,
+        name: str,
+        handler: ActionHandler,
+        options: ActionRegisterOptions | None = None,
+    ) -> None:
         """Register an action handler.
+
+        The worker registers the action with the server when it starts, with
+        exactly these options (the server's defaults when none: a 30 s
+        timeout, 3 attempts). Registering replaces the action's settings, so
+        workers registering one action with different options leave it with
+        whichever registered last. The options' namespace is ignored: the
+        action goes in the worker's.
 
         Args:
             name: The action name.
             handler: Async function that handles the action.
+            options: The action's timeout, attempts and owner.
 
         Raises:
             ValueError: If action is already registered.
@@ -407,6 +444,9 @@ class ActionWorker:
         if name in self._handlers:
             raise ValueError(f"Action '{name}' is already registered")
         self._handlers[name] = handler
+        self._action_options[name] = dataclasses.replace(
+            options or ActionRegisterOptions(), namespace=None
+        )
         logger.info(f"Registered action: {name}")
 
     async def start(self) -> None:
@@ -453,7 +493,9 @@ class ActionWorker:
             # Register actions with the server
             action_names = list(self._handlers.keys())
             for action_name in action_names:
-                await self._client.action.register(action_name, ActionType.USER)
+                await self._client.action.register(
+                    action_name, ActionType.USER, self._action_options[action_name]
+                )
                 logger.debug(f"Registered action with server: {action_name}")
 
             # Register worker
@@ -697,12 +739,26 @@ class ActionWorker:
         # Not wait_for: a TimeoutError the handler raises itself would look
         # the same as the deadline passing. Only the deadline is final.
         run = asyncio.ensure_future(handler(ctx))
+        timeout_ms = self._action_options[task.task_type].timeout_ms
+        stop_touching = asyncio.Event()
+        touching = (
+            asyncio.ensure_future(self._keep_touching(task, timeout_ms, stop_touching))
+            if self.config.auto_touch and timeout_ms > 0
+            else None
+        )
         try:
             await asyncio.wait({run}, timeout=self.config.action_timeout)
         except asyncio.CancelledError:
             run.cancel()
             logger.warning(f"Action cancelled: {task.task_type}")
             return fail("Action cancelled", cancelled=True)
+        finally:
+            if touching is not None:
+                # Let a touch in flight finish: cancelling it mid-request
+                # would close the result connection the outcome goes on.
+                stop_touching.set()
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(touching)
         if not run.done():
             run.cancel()
             with contextlib.suppress(BaseException):
@@ -726,15 +782,54 @@ class ActionWorker:
         return complete(result if isinstance(result, bytes) else b"")
 
     async def _touch_task(self, action_name: str, task_id: str, extend_ms: int) -> None:
-        """Extend lease on a task (internal method)."""
-        if self._client is None:
+        """Extend lease on a task (internal method).
+
+        On the result connection: the poll connection may be held by a
+        blocking await for up to block_ms, longer than a lease can wait.
+        """
+        client = self._result_client or self._client
+        if client is None:
             raise RuntimeError("Worker not connected")
-        await self._client.worker.touch(
+        await client.worker.touch(
             self.config.worker_id,
             action_name,
             task_id,
             WorkerTouchOptions(extend_ms=extend_ms),
         )
+
+    async def _keep_touching(
+        self, task: TaskAssignment, timeout_ms: int, stop: asyncio.Event
+    ) -> None:
+        """Touch a run every third of timeout_ms until stop is set.
+
+        Each touch asks for this worker's timeout (at most an hour), so the
+        lease covers it even if another worker's registration shortened the
+        action's. Conflict, not_found or bad_request means the run moved on
+        (finished, cancelled, taken back) and touching stops; any other
+        refusal, an overloaded leader say, is tried again next interval, and
+        a lost connection is reconnected for it.
+        """
+        interval_s = max(timeout_ms / 3, _MIN_TOUCH_INTERVAL_MS) / 1000
+        extend_ms = min(timeout_ms, _MAX_TOUCH_EXTEND_MS)
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), interval_s)
+                return
+            except asyncio.TimeoutError:
+                pass
+            seen = self._result_generation
+            try:
+                await self._touch_task(task.task_type, task.task_id, extend_ms)
+            except ServerError as e:
+                if e.status_code in _TOUCH_FINAL:
+                    logger.warning(f"Touch for task {task.task_id} was refused, stopping: {e}")
+                    return
+                logger.warning(f"Touch for task {task.task_id} was refused: {e}; trying again")
+            except Exception as e:
+                logger.warning(f"Touch for task {task.task_id} lost: {e!r}")
+                if is_connection_error(e) or isinstance(e, asyncio.TimeoutError):
+                    with contextlib.suppress(Exception):
+                        await self._reconnect_result_client(seen)
 
     def stop(self) -> None:
         """Signal the worker to stop.
