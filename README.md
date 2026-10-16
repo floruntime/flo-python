@@ -357,9 +357,11 @@ result = await client.action.invoke(
 
 ```python
 status = await client.action.status(result.run_id)
-print(f"Status: {status.status}")
-if status.result:
-    print(f"Result: {status.result}")
+print(f"Status: {status.status.name}, attempt {status.attempt}")
+if status.output is not None:
+    print(f"Output: {status.output!r}")
+if status.error_message is not None:
+    print(f"Error: {status.error_message}")
 ```
 
 ### List and Delete Actions

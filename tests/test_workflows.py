@@ -19,7 +19,8 @@ from pathlib import Path
 import pytest
 
 from flo import FloClient
-from flo.exceptions import FloError
+from flo.exceptions import FloError, NotFoundError
+from flo.types import RunStatus
 from flo.worker import ActionWorker
 
 # ---------------------------------------------------------------------------
@@ -380,6 +381,31 @@ class TestGetDefinition:
     async def test_get_definition_not_found(self, client: FloClient, worker: ActionWorker):
         result = await client.workflow.get_definition("nonexistent-workflow-xyz")
         assert result is None
+
+
+class TestActionStatus:
+    """An invoked action's run, read back through action.status."""
+
+    async def test_a_completed_run_carries_its_output(
+        self, client: FloClient, worker: ActionWorker
+    ):
+        order = json.dumps({"orderId": "ORD-7"}).encode()
+        invoked = await client.action.invoke("ship-order", order)
+        deadline = asyncio.get_event_loop().time() + 15
+        status = await client.action.status(invoked.run_id)
+        while status.status != RunStatus.COMPLETED:
+            assert asyncio.get_event_loop().time() < deadline, f"run still {status.status.name}"
+            await asyncio.sleep(0.05)
+            status = await client.action.status(invoked.run_id)
+        assert status.run_id == invoked.run_id
+        assert json.loads(status.output or b"") == {"shipped": True, "trackingId": "TRK-ORD-7"}
+        assert status.attempt == 1
+        assert status.completed_at_ms is not None
+        assert status.error_message is None
+
+    async def test_an_unknown_run_is_not_found(self, client: FloClient, worker: ActionWorker):
+        with pytest.raises(NotFoundError):
+            await client.action.status("act-0-0")
 
 
 class TestHappyPath:
