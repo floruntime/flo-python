@@ -1,4 +1,4 @@
-"""KV ops, and action.status, as table ops.
+"""KV ops, action.status and worker.list, as table ops.
 
 The request is ``[namespace][key][body]``, the body coded by the op's
 schema, field by field in order. An optional field is a presence byte then
@@ -9,6 +9,7 @@ response fields in order, and is decoded whole.
 
 import struct
 from collections.abc import Sequence
+from typing import TypeVar
 
 from .exceptions import BlockTooLongError, IncompleteResponseError, ValidationError
 from .types import (
@@ -25,6 +26,9 @@ from .types import (
     RunStatus,
     VersionEntry,
     WaitFor,
+    WorkerInfo,
+    WorkerStatus,
+    WorkerType,
 )
 
 # The longest routing key; its length prefix is a u16.
@@ -38,6 +42,8 @@ MAX_MGET = 256
 # the frame less the count and the longest routing key.
 MAX_MGET_KEYS_BYTES = 253_848
 MAX_HISTORY = 65
+MAX_WORKER_LIST = 1024
+_MAX_WORKER_ID = 4096
 # The longest TTL whose nanoseconds fit a u64.
 MAX_TTL_MS = 18_446_744_073_709
 _U64_MAX = (1 << 64) - 1
@@ -62,6 +68,7 @@ _TABLE_OPS = frozenset(
         OpCode.KV_EXPIRE,
         OpCode.KV_EXISTS,
         OpCode.ACTION_STATUS,
+        OpCode.WORKER_LIST,
     }
 )
 
@@ -244,6 +251,13 @@ def encode_json_set_body(path: str | None, document: bytes, routing_key: str | N
 def encode_json_del_body(path: str | None, routing_key: str | None) -> bytes:
     """kv.json_del's request: path, routing_key."""
     return _path(path) + _routing_key(routing_key)
+
+
+def encode_worker_list_body(limit: int, cursor: bytes | None) -> bytes:
+    """worker.list's request: limit, cursor (empty starts)."""
+    return _limit("limit", limit, MAX_WORKER_LIST) + _bytes16(
+        "cursor", cursor or b"", _MAX_WORKER_ID
+    )
 
 
 def encode_txn_body(txn: int) -> bytes:
@@ -448,7 +462,7 @@ def decode_txn_commit_answer(data: bytes) -> tuple[int, int]:
 
 def decode_action_status_answer(run_id: str, data: bytes) -> ActionRunStatus:
     """action.status's answer: status, created_at, started_at?, completed_at?,
-    attempt, output?, error_message?, with u16 lengths."""
+    attempt, output?, error_message?, worker_id?, with u16 lengths."""
     a = _Answer("action.status", data)
     code = a.u8()
     try:
@@ -463,6 +477,7 @@ def decode_action_status_answer(run_id: str, data: bytes) -> ActionRunStatus:
     attempt = a.u32()
     output = a.bytes16() if a.present() else None
     error = a.bytes16() if a.present() else None
+    worker_id = a.bytes16() if a.present() else None
     a.done()
     return ActionRunStatus(
         run_id=run_id,
@@ -473,6 +488,7 @@ def decode_action_status_answer(run_id: str, data: bytes) -> ActionRunStatus:
         completed_at_ms=completed_at_ms,
         output=output,
         error_message=error.decode("utf-8", errors="replace") if error is not None else None,
+        worker_id=worker_id.decode("utf-8", errors="replace") if worker_id is not None else None,
     )
 
 
@@ -487,3 +503,52 @@ def decode_action_invoke_answer(data: bytes) -> str:
         raise IncompleteResponseError("action.invoke answer carries an output")
     a.done()
     return run_id.decode("utf-8")
+
+
+_E = TypeVar("_E", WorkerType, WorkerStatus)
+
+
+def _enum8(a: _Answer, op: str, kind: type[_E]) -> _E:
+    code = a.u8()
+    try:
+        return kind(code)
+    except ValueError:
+        raise IncompleteResponseError(
+            f"{op} answer has an unknown {kind.__name__} {code}"
+        ) from None
+
+
+def decode_worker_list_answer(data: bytes) -> tuple[list[WorkerInfo], bytes | None]:
+    """worker.list's answer: workers in id order, then the next page's cursor
+    (None on the last page)."""
+    op = "worker.list"
+    a = _Answer(op, data)
+    count = a.u16()
+    if count > MAX_WORKER_LIST:
+        raise IncompleteResponseError(f"{op} answer lists {count} workers")
+    workers = []
+    for _ in range(count):
+        worker_id = a.bytes16().decode("utf-8", errors="replace")
+        worker_type = _enum8(a, op, WorkerType)
+        status = _enum8(a, op, WorkerStatus)
+        current_load, max_concurrency = a.u32(), a.u32()
+        tasks_completed, tasks_failed = a.u64(), a.u64()
+        registered_at_ms, last_heartbeat_ms = a.i64(), a.i64()
+        machine_id = a.bytes8().decode("utf-8", errors="replace") if a.present() else None
+        workers.append(
+            WorkerInfo(
+                worker_id=worker_id,
+                worker_type=worker_type,
+                status=status,
+                current_load=current_load,
+                max_concurrency=max_concurrency,
+                tasks_completed=tasks_completed,
+                tasks_failed=tasks_failed,
+                registered_at_ms=registered_at_ms,
+                last_heartbeat_ms=last_heartbeat_ms,
+                machine_id=machine_id,
+            )
+        )
+    cursor = a.bytes16() if a.present() else None
+    a.done()
+    return workers, cursor

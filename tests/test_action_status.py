@@ -21,6 +21,7 @@ COMPLETED = (
     + struct.pack("<H", 2)
     + b"ok"
     + b"\x00"
+    + b"\x00"
 )
 
 
@@ -33,7 +34,14 @@ def test_a_completed_runs_status_carries_its_times_attempt_and_output() -> None:
         110,
         120,
     )
-    assert (s.attempt, s.output, s.error_message) == (2, b"ok", None)
+    assert (s.attempt, s.output, s.error_message, s.worker_id) == (2, b"ok", None, None)
+
+
+def test_a_status_names_the_worker_that_holds_the_run() -> None:
+    s = decode_action_status_answer(
+        "run-1", COMPLETED[:-1] + b"\x01" + struct.pack("<H", 4) + b"w-17"
+    )
+    assert s.worker_id == "w-17"
 
 
 def test_a_failed_runs_status_carries_its_error_and_no_output() -> None:
@@ -46,6 +54,7 @@ def test_a_failed_runs_status_carries_its_error_and_no_output() -> None:
         + b"\x01"
         + struct.pack("<H", 4)
         + b"boom"
+        + b"\x00"
     )
     s = decode_action_status_answer("run-1", data)
     assert (s.status, s.started_at_ms, s.output, s.error_message) == (
