@@ -148,7 +148,9 @@ from .types import (
     WorkerListOptions,
     WorkerListResult,
     WorkerRegisterOptions,
+    WorkerStatus,
     WorkerTouchOptions,
+    WorkerType,
     WorkflowCancelOptions,
     WorkflowCreateOptions,
     WorkflowDisableOptions,
@@ -301,6 +303,8 @@ __all__ = [
     "WorkerAwaitResult",
     "WorkerInfo",
     "WorkerListResult",
+    "WorkerStatus",
+    "WorkerType",
     # Worker options
     "WorkerRegisterOptions",
     "WorkerAwaitOptions",

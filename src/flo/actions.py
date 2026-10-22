@@ -9,7 +9,12 @@ For a higher-level API, see `Worker` in worker.py.
 
 from typing import TYPE_CHECKING
 
-from .kv_body import decode_action_invoke_answer, decode_action_status_answer
+from .kv_body import (
+    decode_action_invoke_answer,
+    decode_action_status_answer,
+    decode_worker_list_answer,
+    encode_worker_list_body,
+)
 from .types import (
     ActionDeleteOptions,
     ActionInvokeOptions,
@@ -40,7 +45,6 @@ from .wire import (
     serialize_worker_await_value,
     serialize_worker_complete_value,
     serialize_worker_fail_value,
-    serialize_worker_list_value,
     serialize_worker_register_value,
     serialize_worker_touch_value,
 )
@@ -391,25 +395,25 @@ class WorkerOperations:
         self,
         options: WorkerListOptions | None = None,
     ) -> WorkerListResult:
-        """List registered workers.
+        """List a page of the namespace's workers, in id order.
 
         Args:
-            options: Optional list options.
+            options: The page's limit and cursor (the last page's ``cursor``;
+                None starts).
 
         Returns:
-            WorkerListResult with list of workers.
+            WorkerListResult with the page's workers and the next page's
+            cursor, None on the last page.
         """
         opts = options or WorkerListOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        value = serialize_worker_list_value(opts.limit)
-
-        await self._client._send_and_check(
+        response = await self._client._send_and_check(
             OpCode.WORKER_LIST,
             namespace,
             b"",
-            value,
+            encode_worker_list_body(opts.limit, opts.cursor),
         )
 
-        # Parse list response - format TBD based on server implementation
-        return WorkerListResult(workers=[])
+        workers, cursor = decode_worker_list_answer(response.data)
+        return WorkerListResult(workers=workers, cursor=cursor)

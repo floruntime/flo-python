@@ -966,14 +966,6 @@ def serialize_worker_fail_value(
     return bytes(result)
 
 
-def serialize_worker_list_value(limit: int = 100) -> bytes:
-    """Serialize worker list value.
-
-    Format: [limit:u32]
-    """
-    return struct.pack("<I", limit)
-
-
 def parse_task_assignment(data: bytes) -> "types.TaskAssignment":
     """Parse task assignment from server response.
 

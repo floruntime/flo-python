@@ -1,4 +1,5 @@
-"""List requests carry paging in the value as [limit:u32][cursor], never as options."""
+"""List requests that aren't table ops carry paging in the value as [limit:u32][cursor],
+never as options."""
 
 import struct
 from typing import Any
@@ -9,7 +10,6 @@ from flo import (
     ActionListOptions,
     FloClient,
     ProcessingListOptions,
-    WorkerListOptions,
     WorkflowListDefinitionsOptions,
 )
 from flo.types import OpCode, OptionTag, StatusCode
@@ -64,9 +64,3 @@ async def test_action_list(sent: tuple[FloClient, list[Call]]) -> None:
     client, calls = sent
     await client.action.list(ActionListOptions(limit=5))
     assert_paging(calls[0], OpCode.ACTION_LIST, 5, b"")
-
-
-async def test_worker_list(sent: tuple[FloClient, list[Call]]) -> None:
-    client, calls = sent
-    await client.worker.list(WorkerListOptions(limit=5))
-    assert_paging(calls[0], OpCode.WORKER_LIST, 5, b"")

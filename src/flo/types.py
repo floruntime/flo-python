@@ -18,7 +18,7 @@ VERSION: int = 0x02
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0x3AC05A0A877BDA48
+TABLE_HASH: int = 0x2FBA7DD9AE941830
 
 
 class Reason(IntEnum):
@@ -68,6 +68,11 @@ class Reason(IntEnum):
     # An action complete or fail for a run that has moved on (another worker
     # holds it, or it finished). It was dropped; resending it is refused too.
     STALE_REPORT = 26
+    # An await from a worker that missed its heartbeats: a heartbeat (or, once
+    # it's removed, registering again) lets it take work again.
+    WORKER_UNHEALTHY = 27
+    # An await from a draining worker: it takes no new work.
+    WORKER_DRAINING = 28
 
 
 class Ran(IntEnum):
@@ -880,6 +885,9 @@ class ActionRunStatus:
     completed_at_ms: int | None = None
     output: bytes | None = None
     error_message: str | None = None
+    # The worker holding the run, or that last held it; None until one takes
+    # it. Only the leader learns of a take at once.
+    worker_id: str | None = None
 
 
 @dataclass
@@ -981,19 +989,44 @@ class WorkerAwaitResult:
     task: TaskAssignment | None = None  # None if no task available
 
 
+class WorkerType(IntEnum):
+    """What a worker runs."""
+
+    ACTION = 0
+    STREAM = 1
+
+
+class WorkerStatus(IntEnum):
+    """A registered worker's status."""
+
+    ACTIVE = 0
+    IDLE = 1
+    DRAINING = 2
+    UNHEALTHY = 3
+
+
 @dataclass
 class WorkerInfo:
-    """Information about a registered worker."""
+    """A registered worker, as worker.list reports it. Times are ms since the epoch."""
 
     worker_id: str
-    task_types: list[str]
+    worker_type: WorkerType
+    status: WorkerStatus
+    current_load: int
+    max_concurrency: int
+    tasks_completed: int
+    tasks_failed: int
+    registered_at_ms: int
+    last_heartbeat_ms: int
+    machine_id: str | None = None
 
 
 @dataclass
 class WorkerListResult:
-    """Result of listing workers."""
+    """A page of workers, in id order. ``cursor`` gives the next page; None on the last."""
 
     workers: list[WorkerInfo]
+    cursor: bytes | None = None
 
 
 # =============================================================================
@@ -1045,10 +1078,12 @@ class WorkerFailOptions:
 
 @dataclass
 class WorkerListOptions:
-    """Options for listing workers."""
+    """Options for listing workers: at most ``limit`` (1..1024) after ``cursor``,
+    the last page's cursor (None starts)."""
 
     namespace: str | None = None
     limit: int = 100
+    cursor: bytes | None = None
 
 
 # =============================================================================

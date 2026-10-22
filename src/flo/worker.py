@@ -32,12 +32,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .client import FloClient
-from .exceptions import NonRetryableError, ServerError, is_connection_error
+from .exceptions import NonRetryableError, NotFoundError, ServerError, is_connection_error
 from .retry import _sleep_unless_stopped, _worker_backoff, is_refused_unrun
 from .types import (
     _DEFAULT_WORKER_BLOCK_MS,
     ActionRegisterOptions,
     ActionType,
+    Reason,
     StatusCode,
     StreamGroupAckOptions,
     StreamGroupNackOptions,
@@ -46,6 +47,7 @@ from .types import (
     StreamRecord,
     TaskAssignment,
     WorkerAwaitOptions,
+    WorkerRegisterOptions,
     WorkerTouchOptions,
 )
 from .wire import _validate_block_ms
@@ -133,6 +135,10 @@ _MIN_TOUCH_INTERVAL_MS = 100
 
 # The longest lease a touch may ask for; the server refuses more.
 _MAX_TOUCH_EXTEND_MS = 3_600_000
+
+# How often an action worker heartbeats. The server refuses work to a worker
+# silent past its heartbeat timeout (90 s by default) and later removes it.
+_HEARTBEAT_INTERVAL_S = 30.0
 
 
 def _touch_pace(timeout_ms: int) -> tuple[float, int]:
@@ -394,6 +400,11 @@ class ActionWorker:
         self._tasks: set[asyncio.Task[None]] = set()
         self._semaphore: asyncio.Semaphore | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._action_names: list[str] = []
+        # The load heartbeats report. Not the semaphore, which also counts the
+        # slot an outstanding await holds, nor _tasks, which also counts
+        # results still being sent.
+        self._running_handlers = 0
 
     @staticmethod
     def _generate_worker_id() -> str:
@@ -502,23 +513,14 @@ class ActionWorker:
         try:
             # Register actions with the server
             action_names = list(self._handlers.keys())
+            self._action_names = action_names
             for action_name in action_names:
                 await self._client.action.register(
                     action_name, ActionType.USER, self._action_options[action_name]
                 )
                 logger.debug(f"Registered action with server: {action_name}")
 
-            # Register worker
-            from .types import WorkerRegisterOptions
-
-            await self._client.worker.register(
-                self.config.worker_id,
-                action_names,
-                WorkerRegisterOptions(
-                    concurrency=self.config.concurrency,
-                    machine_id=socket.gethostname(),
-                ),
-            )
+            await self._register(self._client)
             logger.info(f"Worker registered with {len(action_names)} actions")
 
             # Initialize concurrency control
@@ -553,20 +555,51 @@ class ActionWorker:
             self._running = False
             logger.info("Worker stopped")
 
+    async def _register(self, client: FloClient) -> None:
+        """Register this worker, with the same options every time."""
+        await client.worker.register(
+            self.config.worker_id,
+            self._action_names,
+            WorkerRegisterOptions(
+                concurrency=self.config.concurrency,
+                machine_id=socket.gethostname(),
+            ),
+        )
+
+    async def _heartbeat(self) -> None:
+        """Send one heartbeat, registering again if the server removed this
+        worker: unregistered, it would go on taking work the server can't
+        see it holding."""
+        # On the result connection: on the poll connection it would wait
+        # behind a blocking await, up to block_ms, past the server's timeout.
+        client = self._result_client or self._client
+        assert client is not None
+        load = self._running_handlers
+        seen = self._result_generation
+        try:
+            await client.worker.heartbeat(self.config.worker_id, current_load=load)
+        except NotFoundError:
+            logger.warning("Worker was removed by the server; registering again")
+            await self._register(client)
+            return
+        except Exception as e:
+            # Nothing else reconnects this connection for an idle worker, which
+            # would then miss every heartbeat and be refused work for good.
+            lost = is_connection_error(e) or isinstance(e, asyncio.TimeoutError)
+            if self._result_client is not None and lost:
+                with contextlib.suppress(Exception):
+                    await self._reconnect_result_client(seen)
+            raise
+        logger.debug(f"Heartbeat sent (load={load})")
+
     async def _heartbeat_loop(self) -> None:
         """Send periodic heartbeats to keep the worker registration alive."""
-        assert self._client is not None
         while self._running and not self._stop_event.is_set():
             try:
-                await asyncio.sleep(30)
+                await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
                 if not self._running:
                     break
-                current_load = len(self._tasks)
-                await self._client.worker.heartbeat(
-                    self.config.worker_id,
-                    current_load=current_load,
-                )
-                logger.debug(f"Heartbeat sent (load={current_load})")
+                await self._heartbeat()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -619,7 +652,24 @@ class ActionWorker:
                 break
             except Exception as e:
                 self._semaphore.release()
-                if is_connection_error(e):
+                reason = e.reason if isinstance(e, ServerError) else None
+                if reason == Reason.WORKER_DRAINING:
+                    # The server drained this worker: take no more work, and
+                    # let the running handlers finish.
+                    logger.info("Worker is draining; no longer taking work")
+                    break
+                if reason == Reason.WORKER_UNHEALTHY:
+                    # It missed its heartbeats: one now lets it take work
+                    # again; the backoff keeps a heartbeat that fails from
+                    # turning this into a hot loop.
+                    try:
+                        await self._heartbeat()
+                    except Exception as hb_err:
+                        logger.warning(f"Heartbeat failed: {hb_err}")
+                    d = failed.next()
+                    logger.warning(f"Await refused, worker unhealthy; retrying in {d:.3f}s")
+                    await _sleep_unless_stopped(self._stop_event, d)
+                elif is_connection_error(e):
                     # stop() interrupts the poll connection: that is not a
                     # drop to recover from.
                     if self._stop_event.is_set():
@@ -641,16 +691,7 @@ class ActionWorker:
                                 logger.warning(f"Failed to reconnect result client: {rc_err}")
                         # Re-register worker after reconnect
                         try:
-                            from .types import WorkerRegisterOptions
-
-                            await self._client.worker.register(
-                                self.config.worker_id,
-                                action_names,
-                                WorkerRegisterOptions(
-                                    concurrency=self.config.concurrency,
-                                    machine_id=socket.gethostname(),
-                                ),
-                            )
+                            await self._register(self._client)
                         except Exception as reg_err:
                             logger.warning(f"Failed to re-register worker: {reg_err}")
                         logger.info("Reconnected, resuming work")
@@ -684,7 +725,11 @@ class ActionWorker:
         rc = self._result_client
         assert rc is not None
         try:
-            op, send, cancelled = await self._run_handler(task)
+            self._running_handlers += 1
+            try:
+                op, send, cancelled = await self._run_handler(task)
+            finally:
+                self._running_handlers -= 1
             # Reporting stays outside the handler's error handling: a complete
             # that can't be delivered must not turn into a fail.
             sent = await _send_result(

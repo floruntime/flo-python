@@ -461,6 +461,8 @@ A run whose handler goes past the action's `timeout_ms` without touching it is t
 
 Delivery is at-least-once: a result lost to a dropped connection is resent, and one that never arrives lets the lease run out, so a handler may see the same task or record again. `worker.stop()` waits for running handlers, and their results are still sent.
 
+An action worker heartbeats every 30 s, reporting the handlers it is running. One the server removed after missed heartbeats registers again, with the same options, when its next heartbeat is answered not found. One the server has drained stops taking work, and `start()` returns once its running handlers finish.
+
 ### StreamWorker Example
 
 ```python
