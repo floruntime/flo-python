@@ -25,7 +25,7 @@ from flo import (
 )
 from flo import worker as worker_mod
 from flo.types import WorkerInfo, WorkerType
-from flo.worker import ActionContext, ActionWorker
+from flo.worker import ActionContext, ActionWorker, StreamContext
 
 from .conftest import IN_CI
 
@@ -200,3 +200,141 @@ async def test_an_idle_worker_whose_result_connection_drops_keeps_heartbeating_a
         w.stop()
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(run, timeout=10)
+
+
+async def test_a_server_drain_lets_the_running_action_complete_once_and_ends_start(
+    client: FloClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worker_mod, "_HEARTBEAT_INTERVAL_S", 0.2)
+    action = f"py-drain-{secrets.token_hex(4)}"
+    wid = f"{action}-worker"
+    w = client.new_action_worker(worker_id=wid, concurrency=2, block_ms=1000)
+    running = asyncio.Event()
+    runs = 0
+
+    async def slow(ctx: ActionContext) -> bytes:
+        nonlocal runs
+        runs += 1
+        running.set()
+        await asyncio.sleep(1.0)
+        return b"done"
+
+    w.register_action(action, slow)
+    run = asyncio.create_task(w.start())
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 15
+        while await _find(client, wid) is None:
+            assert loop.time() < deadline, "the worker never registered"
+            await asyncio.sleep(0.05)
+        invoked = await client.action.invoke(action, b"")
+        await asyncio.wait_for(running.wait(), 15)
+        await client.worker.drain(wid)
+        # start() returns by itself once the run has reported.
+        await asyncio.wait_for(run, 10)
+    finally:
+        if not run.done():
+            w.stop()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(run, 10)
+    status = await _completed(client, invoked.run_id)
+    assert (status.status, status.output, status.attempt, runs) == (
+        RunStatus.COMPLETED,
+        b"done",
+        1,
+        1,
+    )
+    # It deregistered once drained.
+    assert await _find(client, wid) is None
+
+
+async def test_a_stream_worker_shows_in_the_worker_list_while_it_runs(client: FloClient) -> None:
+    stream = f"py-sw-{secrets.token_hex(4)}"
+    wid = f"{stream}-worker"
+
+    async def ignore(ctx: StreamContext) -> None:
+        pass
+
+    w = client.new_stream_worker(
+        stream=stream, group="g", handler=ignore, worker_id=wid, block_ms=1000
+    )
+    run = asyncio.create_task(w.start())
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 15
+        listed = None
+        while listed is None:
+            assert loop.time() < deadline, "the stream worker never registered"
+            listed = await _find(client, wid)
+            await asyncio.sleep(0.05)
+        assert (listed.worker_type, listed.status) == (WorkerType.STREAM, WorkerStatus.ACTIVE)
+    finally:
+        w.drain()
+        await asyncio.wait_for(run, 10)
+    assert await _find(client, wid) is None
+
+
+async def test_a_drain_with_a_handler_running_ends_soon_after_it_when_the_server_dies(
+    tmp_path: "os.PathLike[str]",
+) -> None:
+    binary = os.environ.get("FLO_BINARY")
+    if not binary:
+        if IN_CI:
+            pytest.fail("FLO_BINARY is not set")
+        pytest.skip("FLO_BINARY is not set")
+    # A server of its own, to kill: it listens on port, port+1 and port+2.
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = await asyncio.create_subprocess_exec(
+        binary,
+        "server",
+        "start",
+        "--port",
+        str(port),
+        "--data-dir",
+        str(tmp_path),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        env={**os.environ, "HOME": str(tmp_path)},
+    )
+    try:
+        endpoint = f"127.0.0.1:{port}"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 15
+        while True:
+            try:
+                client = FloClient(endpoint, namespace="default")
+                await client.connect()
+                break
+            except Exception:
+                assert loop.time() < deadline, "the server never came up"
+                await asyncio.sleep(0.1)
+        action = f"py-dies-{secrets.token_hex(4)}"
+        w = client.new_action_worker(worker_id=f"{action}-worker", concurrency=2, block_ms=1000)
+        running, finished = asyncio.Event(), asyncio.Event()
+
+        async def slow(ctx: ActionContext) -> bytes:
+            running.set()
+            await asyncio.sleep(1.0)
+            finished.set()
+            return b"done"
+
+        w.register_action(action, slow)
+        run = asyncio.create_task(w.start())
+        await asyncio.sleep(0.3)
+        await client.action.invoke(action, b"")
+        await asyncio.wait_for(running.wait(), 15)
+        server.kill()
+        await server.wait()
+        t0 = loop.time()
+        w.drain()
+        # The handler, then its result's bounded resends.
+        await asyncio.wait_for(run, 15)
+        assert loop.time() - t0 < 6
+        assert finished.is_set()
+        await client.close()
+    finally:
+        if server.returncode is None:
+            server.kill()
+            await server.wait()

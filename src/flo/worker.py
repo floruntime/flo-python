@@ -48,7 +48,9 @@ from .types import (
     TaskAssignment,
     WorkerAwaitOptions,
     WorkerRegisterOptions,
+    WorkerStatus,
     WorkerTouchOptions,
+    WorkerType,
 )
 from .wire import _validate_block_ms
 
@@ -126,8 +128,8 @@ _RESULT_SENDS = 3
 # handler was cancelled.
 _Report = tuple[str, Callable[[FloClient], Awaitable[None]], bool]
 
-# How long a stopping worker keeps reconnecting to resend a lost result, so
-# stop() can't hang on a server that is gone.
+# How long a stopping or draining worker keeps reconnecting to resend a lost
+# result, so neither can hang on a server that is gone.
 _STOP_RECONNECT_S = 2.0
 
 # auto_touch never touches more often than this, whatever the timeout.
@@ -136,9 +138,257 @@ _MIN_TOUCH_INTERVAL_MS = 100
 # The longest lease a touch may ask for; the server refuses more.
 _MAX_TOUCH_EXTEND_MS = 3_600_000
 
-# How often an action worker heartbeats. The server refuses work to a worker
-# silent past its heartbeat timeout (90 s by default) and later removes it.
+# How often a worker heartbeats. The server refuses work to a worker silent
+# past its heartbeat timeout (90 s by default) and later removes it.
 _HEARTBEAT_INTERVAL_S = 30.0
+
+# How often a draining worker tries again to tell the server, and how long a
+# reconnect for that notice, or for deregistering, may take: neither may hold
+# up the end of a run.
+_DRAIN_NOTICE_INTERVAL_S = 1.0
+
+
+async def _cancel(task: "asyncio.Future[Any]") -> None:
+    """Cancel `task` and wait for it to end. The cancel is sent again until
+    it lands: before Python 3.12, asyncio.wait_for swallows a cancel that
+    arrives as its inner call finishes, as a refused dial does at once, and
+    the task would carry on (a reconnect, for up to 5 minutes)."""
+    while not task.done():
+        task.cancel()
+        await asyncio.wait({task}, timeout=0.05)
+    if not task.cancelled():
+        task.exception()  # retrieved: it finished or failed as it was cancelled
+
+
+def _lost(e: BaseException) -> bool:
+    """Whether a request failed for want of a connection, not by refusal."""
+    return is_connection_error(e) or isinstance(e, asyncio.TimeoutError)
+
+
+async def _unless_set(event: asyncio.Event, work: Awaitable[None]) -> bool:
+    """Run `work` unless `event` is set first, which cancels it. True if it
+    finished; its error is raised."""
+    task = asyncio.ensure_future(work)
+    waiter = asyncio.ensure_future(event.wait())
+    try:
+        await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        waiter.cancel()
+    if not task.done():
+        await _cancel(task)
+        return False
+    task.result()
+    return True
+
+
+async def _acquire_unless_set(sem: asyncio.Semaphore, event: asyncio.Event) -> bool:
+    """Take a slot of `sem` unless `event` is set first. True if taken."""
+    if event.is_set():
+        return False
+    acquire = asyncio.ensure_future(sem.acquire())
+    waiter = asyncio.ensure_future(event.wait())
+    try:
+        await asyncio.wait({acquire, waiter}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        waiter.cancel()
+    if acquire.done() and not acquire.cancelled():
+        if event.is_set():
+            sem.release()
+            return False
+        return True
+    acquire.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await acquire
+    # It may have taken the slot as it was cancelled.
+    if acquire.done() and not acquire.cancelled():
+        sem.release()
+    return False
+
+
+class _RegisteredWorker:
+    """What both workers share: a place in the server's worker registry,
+    kept by heartbeats, and the end of a run by drain or stop.
+
+    A drain (drain(), a DRAINING heartbeat, or an await refused as draining)
+    stops new work while running handlers finish, heartbeats going on. The
+    server is told at once, and again after any re-registration, which marks
+    a worker active. stop() ends polling too, without telling the server.
+    Both are cleared when start() returns, not when it begins, so one that
+    lands before or during startup still ends that run.
+    """
+
+    _client: FloClient | None
+    _tasks: set[asyncio.Task[None]]
+
+    def _init_run_state(self) -> None:
+        self._stop_event = asyncio.Event()
+        self._drain_event = asyncio.Event()
+        # Set by stop() or a drain: the poll loop leaves, and its pauses and
+        # reconnects end.
+        self._leave_event = asyncio.Event()
+        self._notice_due = False
+        self._heartbeat_task: asyncio.Task[None] | None = None
+
+    @property
+    def _worker_id(self) -> str:
+        raise NotImplementedError
+
+    def _control(self) -> FloClient | None:
+        """The connection heartbeats, drain notices and the deregister ride:
+        not the poll connection, held up to block_ms by a blocking read."""
+        raise NotImplementedError
+
+    def _control_generation(self) -> int:
+        raise NotImplementedError
+
+    async def _reconnect_control(self, failed_generation: int | None = None) -> None:
+        raise NotImplementedError
+
+    async def _register(self, client: FloClient) -> None:
+        raise NotImplementedError
+
+    def _load(self) -> int:
+        """The handlers running: the load heartbeats report."""
+        raise NotImplementedError
+
+    def drain(self) -> None:
+        """Stop taking work and let the running handlers finish; start()
+        then returns. The server is told, so it assigns this worker nothing
+        more, and heartbeats go on meanwhile. A drain before start() ends that
+        run once it has registered."""
+        logger.info("Draining worker...")
+        self._begin_drain()
+
+    def _begin_drain(self) -> None:
+        if not self._drain_event.is_set():
+            self._notice_due = True
+        self._drain_event.set()
+        self._leave_event.set()
+        # Unblock a long poll, as stop() does.
+        if self._client is not None:
+            self._client.interrupt()
+
+    def _signal_stop(self) -> None:
+        self._stop_event.set()
+        self._leave_event.set()
+        # Only the poll connection is interrupted: the other still has to
+        # carry the results of the handlers that are finishing.
+        if self._client is not None:
+            self._client.interrupt()
+
+    def _end_run(self) -> None:
+        self._stop_event.clear()
+        self._drain_event.clear()
+        self._leave_event.clear()
+        self._notice_due = False
+
+    async def _heartbeat(self) -> None:
+        """Send one heartbeat, registering again if the server removed this
+        worker: unregistered, it would go on taking work the server can't
+        see it holding. A DRAINING answer drains it."""
+        client = self._control()
+        assert client is not None
+        load = self._load()
+        seen = self._control_generation()
+        try:
+            status = await client.worker.heartbeat(self._worker_id, current_load=load)
+        except NotFoundError:
+            logger.warning("Worker was removed by the server; registering again")
+            await self._register(client)
+            if self._drain_event.is_set():
+                self._notice_due = True
+            return
+        except Exception as e:
+            # Nothing else reconnects this connection for an idle worker, which
+            # would then miss every heartbeat and be refused work for good.
+            if _lost(e):
+                with contextlib.suppress(Exception):
+                    await self._reconnect_control(seen)
+            raise
+        if status == WorkerStatus.DRAINING and not self._drain_event.is_set():
+            logger.info("The server drained this worker; finishing its running work")
+            self._begin_drain()
+        logger.debug(f"Heartbeat sent (load={load})")
+
+    async def _heartbeat_loop(self) -> None:
+        """Heartbeat until cancelled at the end of the run, after the last
+        handler, so a draining or stopping worker's handlers still count as
+        alive."""
+        while True:
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
+            try:
+                await self._heartbeat()
+            except Exception as e:
+                logger.warning(f"Heartbeat failed: {e}")
+
+    def _start_heartbeats(self) -> None:
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def _stop_heartbeats(self) -> None:
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._heartbeat_task
+            self._heartbeat_task = None
+
+    async def _finish_drain(self) -> None:
+        """Wait for the running handlers, keeping the server told of the
+        drain. A notice that can't be sent is tried again every
+        _DRAIN_NOTICE_INTERVAL_S while handlers run; an idle worker tries
+        once. A stop ends the wait; start() still waits for the handlers."""
+        while True:
+            if self._notice_due:
+                await self._send_drain_notice()
+            pending = set(self._tasks)
+            if not pending or self._stop_event.is_set():
+                return
+            stopped = asyncio.ensure_future(self._stop_event.wait())
+            try:
+                await asyncio.wait(
+                    pending | {stopped},
+                    timeout=_DRAIN_NOTICE_INTERVAL_S,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                stopped.cancel()
+
+    async def _send_drain_notice(self) -> None:
+        client = self._control()
+        assert client is not None
+        seen = self._control_generation()
+        try:
+            await client.worker.drain(self._worker_id)
+            self._notice_due = False
+        except Exception as e:
+            if not _lost(e):
+                logger.warning(f"Drain notice refused: {e}")
+                self._notice_due = False
+                return
+            logger.warning(f"Drain notice lost: {e}; trying again")
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._reconnect_control(seen), _DRAIN_NOTICE_INTERVAL_S)
+
+    async def _on_control_once(
+        self, what: str, send: Callable[[FloClient], Awaitable[None]]
+    ) -> None:
+        """Send a closing request (deregister, group leave), reconnecting the
+        control connection once if it is down; never raises."""
+        client = self._control()
+        if client is None:
+            return
+        seen = self._control_generation()
+        try:
+            await send(client)
+            return
+        except Exception as e:
+            if not _lost(e):
+                logger.warning(f"{what} refused: {e}")
+                return
+        try:
+            await asyncio.wait_for(self._reconnect_control(seen), _DRAIN_NOTICE_INTERVAL_S)
+            await send(client)
+        except Exception as e:
+            logger.warning(f"{what} failed: {e}")
 
 
 def _touch_pace(timeout_ms: int) -> tuple[float, int]:
@@ -165,8 +415,9 @@ async def _send_result(
     the connection drops or the request times out.
 
     A refusal is not resent: the server read the request and said no. Once
-    the worker is stopping, reconnects get _STOP_RECONNECT_S in all. Nothing
-    here raises; a result that can't be sent is logged and dropped.
+    the worker is leaving (stopping or draining, so neither waits on a server
+    that is gone), reconnects get _STOP_RECONNECT_S in all. Nothing here
+    raises; a result that can't be sent is logged and dropped.
     """
     loop = asyncio.get_running_loop()
     stop_deadline: float | None = None
@@ -188,9 +439,7 @@ async def _send_result(
                 await asyncio.wait({task}, timeout=max(stop_deadline - loop.time(), 0.0))
         finally:
             if not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+                await _cancel(task)
         if task.cancelled():
             return False
         task.result()
@@ -338,7 +587,7 @@ class ActionContext:
         return ActionResult(outcome=outcome, data=data)
 
 
-class ActionWorker:
+class ActionWorker(_RegisteredWorker):
     """High-level Flo worker for executing actions.
 
     Created from a FloClient via ``client.new_action_worker()``.
@@ -396,10 +645,9 @@ class ActionWorker:
         self._handlers: dict[str, ActionHandler] = {}
         self._action_options: dict[str, ActionRegisterOptions] = {}
         self._running = False
-        self._stop_event = asyncio.Event()
-        self._tasks: set[asyncio.Task[None]] = set()
+        self._init_run_state()
+        self._tasks = set()
         self._semaphore: asyncio.Semaphore | None = None
-        self._heartbeat_task: asyncio.Task[None] | None = None
         self._action_names: list[str] = []
         # The load heartbeats report. Not the semaphore, which also counts the
         # slot an outstanding await holds, nor _tasks, which also counts
@@ -471,9 +719,10 @@ class ActionWorker:
         logger.info(f"Registered action: {name}")
 
     async def start(self) -> None:
-        """Start the worker and begin processing actions.
-
-        This method blocks until stop() is called or an error occurs.
+        """Start the worker and process actions until stop(), or a drain
+        once its running handlers finish. Either one before or during
+        startup ends this run. Running handlers finish and send their results
+        before start() returns. It may be called again afterwards.
 
         Raises:
             ValueError: If no handlers are registered.
@@ -487,73 +736,92 @@ class ActionWorker:
             f"namespace={self._parent_client.namespace}, concurrency={self.config.concurrency})"
         )
 
-        # Create a dedicated connection using the parent client's endpoint and namespace.
-        worker_timeout_ms = int(self._parent_client._timeout * 1000)
-        self._client = FloClient(
-            self._parent_client._endpoint,
-            namespace=self._parent_client.namespace,
-            debug=self._parent_client._debug,
-            timeout_ms=worker_timeout_ms,
-            retry=self._parent_client._retry,
-        )
-        await self._client.connect()
-
-        # Create a second connection for sending Complete/Fail results.
-        # The polling connection holds its lock during blocking Await calls
-        # (up to block_ms), so a separate connection prevents contention.
-        self._result_client = FloClient(
-            self._parent_client._endpoint,
-            namespace=self._parent_client.namespace,
-            debug=self._parent_client._debug,
-            timeout_ms=worker_timeout_ms,
-            retry=self._parent_client._retry,
-        )
-        await self._result_client.connect()
-
+        self._running = True
+        registered = False
         try:
-            # Register actions with the server
+            # A dedicated connection, with the parent client's endpoint and
+            # namespace, for polling.
+            worker_timeout_ms = int(self._parent_client._timeout * 1000)
+            self._client = FloClient(
+                self._parent_client._endpoint,
+                namespace=self._parent_client.namespace,
+                debug=self._parent_client._debug,
+                timeout_ms=worker_timeout_ms,
+                retry=self._parent_client._retry,
+            )
+            await self._client.connect()
+
+            # A second connection for results, heartbeats and drain notices.
+            # The polling connection holds its lock during blocking Await
+            # calls (up to block_ms), so a separate connection prevents
+            # contention.
+            self._result_client = FloClient(
+                self._parent_client._endpoint,
+                namespace=self._parent_client.namespace,
+                debug=self._parent_client._debug,
+                timeout_ms=worker_timeout_ms,
+                retry=self._parent_client._retry,
+            )
+            await self._result_client.connect()
+            if self._stop_event.is_set():
+                return
+
+            # On the result connection: a stop or drain during startup cuts
+            # the poll one.
             action_names = list(self._handlers.keys())
             self._action_names = action_names
             for action_name in action_names:
-                await self._client.action.register(
+                await self._result_client.action.register(
                     action_name, ActionType.USER, self._action_options[action_name]
                 )
                 logger.debug(f"Registered action with server: {action_name}")
 
-            await self._register(self._client)
+            # Deregistered at the end even if this answer is lost: the
+            # registration may still have taken.
+            registered = True
+            await self._register(self._result_client)
             logger.info(f"Worker registered with {len(action_names)} actions")
 
-            # Initialize concurrency control
             self._semaphore = asyncio.Semaphore(self.config.concurrency)
-            self._running = True
-            self._stop_event.clear()
-
-            # Start heartbeat loop
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-
-            # Main polling loop
+            self._start_heartbeats()
             await self._poll_loop(action_names)
+            if self._drain_event.is_set():
+                await self._finish_drain()
 
         finally:
-            # Cancel heartbeat
-            if self._heartbeat_task is not None:
-                self._heartbeat_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._heartbeat_task
-                self._heartbeat_task = None
-
-            # Wait for running tasks
             if self._tasks:
                 logger.info(f"Waiting for {len(self._tasks)} tasks to complete...")
                 await asyncio.gather(*self._tasks, return_exceptions=True)
+            await self._stop_heartbeats()
+            if registered:
+                wid = self.config.worker_id
+                await self._on_control_once("Deregister", lambda c: c.worker.deregister(wid))
 
             if self._result_client:
                 await self._result_client.close()
                 self._result_client = None
-            await self._client.close()
-            self._client = None
+            if self._client:
+                await self._client.close()
+                self._client = None
             self._running = False
+            self._end_run()
             logger.info("Worker stopped")
+
+    @property
+    def _worker_id(self) -> str:
+        return self.config.worker_id
+
+    def _control(self) -> FloClient | None:
+        return self._result_client
+
+    def _control_generation(self) -> int:
+        return self._result_generation
+
+    async def _reconnect_control(self, failed_generation: int | None = None) -> None:
+        await self._reconnect_result_client(failed_generation)
+
+    def _load(self) -> int:
+        return self._running_handlers
 
     async def _register(self, client: FloClient) -> None:
         """Register this worker, with the same options every time."""
@@ -566,45 +834,6 @@ class ActionWorker:
             ),
         )
 
-    async def _heartbeat(self) -> None:
-        """Send one heartbeat, registering again if the server removed this
-        worker: unregistered, it would go on taking work the server can't
-        see it holding."""
-        # On the result connection: on the poll connection it would wait
-        # behind a blocking await, up to block_ms, past the server's timeout.
-        client = self._result_client or self._client
-        assert client is not None
-        load = self._running_handlers
-        seen = self._result_generation
-        try:
-            await client.worker.heartbeat(self.config.worker_id, current_load=load)
-        except NotFoundError:
-            logger.warning("Worker was removed by the server; registering again")
-            await self._register(client)
-            return
-        except Exception as e:
-            # Nothing else reconnects this connection for an idle worker, which
-            # would then miss every heartbeat and be refused work for good.
-            lost = is_connection_error(e) or isinstance(e, asyncio.TimeoutError)
-            if self._result_client is not None and lost:
-                with contextlib.suppress(Exception):
-                    await self._reconnect_result_client(seen)
-            raise
-        logger.debug(f"Heartbeat sent (load={load})")
-
-    async def _heartbeat_loop(self) -> None:
-        """Send periodic heartbeats to keep the worker registration alive."""
-        while self._running and not self._stop_event.is_set():
-            try:
-                await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
-                if not self._running:
-                    break
-                await self._heartbeat()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning(f"Heartbeat failed: {e}")
-
     async def _poll_loop(self, action_names: list[str]) -> None:
         """Main polling loop for tasks."""
         assert self._client is not None
@@ -614,16 +843,13 @@ class ActionWorker:
         # tight loop. A poll that gets an answer resets it.
         reconnect_pause = 0.0
         loop = asyncio.get_running_loop()
-        backoff = _EmptyPollBackoff(self.config.block_ms, self._stop_event)
+        leave = self._leave_event
+        backoff = _EmptyPollBackoff(self.config.block_ms, leave)
         failed = _worker_backoff()
-        while self._running and not self._stop_event.is_set():
+        while not leave.is_set():
             try:
-                # Wait for semaphore slot
-                await self._semaphore.acquire()
-
-                # Check if we should stop
-                if self._stop_event.is_set():
-                    self._semaphore.release()
+                # Wait for a slot; a stop or drain ends the wait.
+                if not await _acquire_unless_set(self._semaphore, leave):
                     break
 
                 # Await task from server
@@ -657,6 +883,7 @@ class ActionWorker:
                     # The server drained this worker: take no more work, and
                     # let the running handlers finish.
                     logger.info("Worker is draining; no longer taking work")
+                    self._begin_drain()
                     break
                 if reason == Reason.WORKER_UNHEALTHY:
                     # It missed its heartbeats: one now lets it take work
@@ -668,21 +895,22 @@ class ActionWorker:
                         logger.warning(f"Heartbeat failed: {hb_err}")
                     d = failed.next()
                     logger.warning(f"Await refused, worker unhealthy; retrying in {d:.3f}s")
-                    await _sleep_unless_stopped(self._stop_event, d)
+                    await _sleep_unless_stopped(leave, d)
                 elif is_connection_error(e):
-                    # stop() interrupts the poll connection: that is not a
-                    # drop to recover from.
-                    if self._stop_event.is_set():
+                    # A stop or drain interrupts the poll connection: that is
+                    # not a drop to recover from.
+                    if leave.is_set():
                         break
                     if reconnect_pause:
-                        with contextlib.suppress(asyncio.TimeoutError):
-                            await asyncio.wait_for(self._stop_event.wait(), reconnect_pause)
-                        if self._stop_event.is_set():
+                        await _sleep_unless_stopped(leave, reconnect_pause)
+                        if leave.is_set():
                             break
                     reconnect_pause = min(max(reconnect_pause * 2, 1.0), 30.0)
                     logger.warning("Connection lost, reconnecting...")
                     try:
-                        await self._client.reconnect()
+                        # Up to 5 min of tries, which a stop or drain ends.
+                        if not await _unless_set(leave, self._client.reconnect()):
+                            break
                         # Also reconnect result client
                         if self._result_client is not None:
                             try:
@@ -700,7 +928,7 @@ class ActionWorker:
                 else:
                     d = failed.next()
                     logger.error(f"Await error: {e}, retrying in {d:.3f}s...")
-                    await _sleep_unless_stopped(self._stop_event, d)
+                    await _sleep_unless_stopped(leave, d)
 
     async def _reconnect_result_client(
         self, failed_generation: int | None = None, *, only_if_down: bool = False
@@ -737,7 +965,7 @@ class ActionWorker:
                 lambda: send(rc),
                 lambda: self._result_generation,
                 self._reconnect_result_client,
-                self._stop_event,
+                self._leave_event,
             )
             if sent and op == "complete":
                 logger.info(f"Action completed: {task.task_type} (task={task.task_id})")
@@ -888,16 +1116,13 @@ class ActionWorker:
     def stop(self) -> None:
         """Signal the worker to stop.
 
-        Ends the polling loop, interrupting a blocking Await. Running
-        handlers finish and their results are sent before start() returns.
+        Ends the polling loop, interrupting a blocking Await or a reconnect,
+        and a drain's wait. Running handlers finish and their results are
+        sent before start() returns. A stop before start() ends that run at
+        once.
         """
         logger.info("Stopping worker...")
-        self._running = False
-        self._stop_event.set()
-        # Only the poll connection is interrupted: the result connection
-        # still has to carry the results of the handlers that are finishing.
-        if self._client:
-            self._client.interrupt()
+        self._signal_stop()
 
     async def close(self) -> None:
         """Stop and close the worker."""
@@ -1001,7 +1226,7 @@ class StreamContext:
         return self.record.headers if self.record.headers else {}
 
 
-class StreamWorker:
+class StreamWorker(_RegisteredWorker):
     """High-level Flo worker for processing stream records via consumer groups.
 
     Polls a consumer group with ``group_read()``, dispatches records to the
@@ -1065,9 +1290,10 @@ class StreamWorker:
         self._ack_reconnect_lock = asyncio.Lock()
         self._ack_generation = 0
         self._running = False
-        self._stop_event = asyncio.Event()
-        self._tasks: set[asyncio.Task[None]] = set()
+        self._init_run_state()
+        self._tasks = set()
         self._semaphore: asyncio.Semaphore | None = None
+        self._running_handlers = 0
 
     @staticmethod
     def _generate_consumer_id() -> str:
@@ -1079,10 +1305,11 @@ class StreamWorker:
         return f"{hostname}-{secrets.token_hex(4)}"
 
     async def start(self) -> None:
-        """Start the stream worker and begin processing records.
-
-        Joins the consumer group, then polls for records. Blocks until
-        ``stop()`` is called.
+        """Start the stream worker and process records until stop(), or a
+        drain once its running handlers finish and ack. Either one before or
+        during startup ends this run. It registers in the worker registry and
+        heartbeats while it runs, then leaves the group and deregisters. It may
+        be called again afterwards.
         """
         logger.info(
             f"Starting stream worker (stream={self.config.stream}, "
@@ -1090,66 +1317,76 @@ class StreamWorker:
             f"concurrency={self.config.concurrency})"
         )
 
-        worker_timeout_ms = int(self._parent_client._timeout * 1000)
-        self._client = FloClient(
-            self._parent_client._endpoint,
-            namespace=self._parent_client.namespace,
-            debug=self._parent_client._debug,
-            timeout_ms=worker_timeout_ms,
-            retry=self._parent_client._retry,
-        )
-        await self._client.connect()
-
-        # Acks and nacks get their own connection: the polling one is held by
-        # a group_read for up to block_ms, and an ack queued behind it can
-        # arrive after the group's ack timeout and see the record redelivered.
-        self._ack_client = FloClient(
-            self._parent_client._endpoint,
-            namespace=self._parent_client.namespace,
-            debug=self._parent_client._debug,
-            timeout_ms=worker_timeout_ms,
-            retry=self._parent_client._retry,
-        )
+        self._running = True
+        registered = False
+        joined = False
         try:
+            worker_timeout_ms = int(self._parent_client._timeout * 1000)
+            self._client = FloClient(
+                self._parent_client._endpoint,
+                namespace=self._parent_client.namespace,
+                debug=self._parent_client._debug,
+                timeout_ms=worker_timeout_ms,
+                retry=self._parent_client._retry,
+            )
+            await self._client.connect()
+
+            # Acks, nacks, heartbeats and drain notices get their own
+            # connection: the polling one is held by a group_read for up to
+            # block_ms, and an ack queued behind it can arrive after the
+            # group's ack timeout and see the record redelivered.
+            self._ack_client = FloClient(
+                self._parent_client._endpoint,
+                namespace=self._parent_client.namespace,
+                debug=self._parent_client._debug,
+                timeout_ms=worker_timeout_ms,
+                retry=self._parent_client._retry,
+            )
             await self._ack_client.connect()
-        except BaseException:
-            await self._client.close()
-            raise
+            if self._stop_event.is_set():
+                return
 
-        try:
-            # Semaphore and running state must be set up before the join: a
-            # connection error during the join triggers _handle_reconnect ->
-            # _drain_pending, which acquires the semaphore.
+            # Semaphore must be set up before the join: a connection error
+            # during the join triggers _handle_reconnect -> _drain_pending,
+            # which acquires the semaphore.
             self._semaphore = asyncio.Semaphore(self.config.concurrency)
-            self._running = True
-            self._stop_event.clear()
+
+            # Deregistered at the end even if this answer is lost: the
+            # registration may still have taken.
+            registered = True
+            await self._register(self._ack_client)
+            self._start_heartbeats()
 
             # Join consumer group. A connection error here (a stalled or dropped
             # connection at startup) is retried via reconnect rather than
             # killing the worker — mirroring the poll loop and ack retry.
+            joined = True
             await self._join_group()
             logger.info(f"Joined consumer group {self.config.group} on stream {self.config.stream}")
 
             await self._poll_loop()
+            if self._drain_event.is_set():
+                await self._finish_drain()
 
         finally:
             # Wait for in-flight tasks
             if self._tasks:
                 logger.info(f"Waiting for {len(self._tasks)} tasks to complete...")
                 await asyncio.gather(*self._tasks, return_exceptions=True)
+            await self._stop_heartbeats()
 
-            # Leave consumer group
+            # On the ack connection: a stop or drain cut the poll one.
+            if joined:
+                cfg = self.config
+                await self._on_control_once(
+                    "Leaving the consumer group",
+                    lambda c: c.stream.group_leave(cfg.stream, cfg.group, cfg.consumer),
+                )
+            if registered:
+                wid = self.config.worker_id
+                await self._on_control_once("Deregister", lambda c: c.worker.deregister(wid))
+
             if self._client:
-                try:
-                    await self._client.stream.group_leave(
-                        self.config.stream,
-                        self.config.group,
-                        self.config.consumer,
-                    )
-                    logger.info(f"Left consumer group {self.config.group}")
-                except Exception as e:
-                    logger.warning(f"Failed to leave consumer group: {e}")
-
                 await self._client.close()
                 self._client = None
             if self._ack_client:
@@ -1157,23 +1394,51 @@ class StreamWorker:
                 self._ack_client = None
 
             self._running = False
+            self._end_run()
             logger.info("Stream worker stopped")
+
+    @property
+    def _worker_id(self) -> str:
+        return self.config.worker_id
+
+    def _control(self) -> FloClient | None:
+        return self._ack_client
+
+    def _control_generation(self) -> int:
+        return self._ack_generation
+
+    async def _reconnect_control(self, failed_generation: int | None = None) -> None:
+        await self._reconnect_ack_client(failed_generation)
+
+    def _load(self) -> int:
+        return self._running_handlers
+
+    async def _register(self, client: FloClient) -> None:
+        """Register this worker, with the same options every time: one
+        process, its stream and group."""
+        await client.worker.register(
+            self.config.worker_id,
+            [f"{self.config.stream}/{self.config.group}"],
+            WorkerRegisterOptions(
+                worker_type=WorkerType.STREAM,
+                concurrency=self.config.concurrency,
+                machine_id=socket.gethostname(),
+            ),
+        )
 
     async def _poll_loop(self) -> None:
         """Main polling loop for stream records."""
         assert self._client is not None
         assert self._semaphore is not None
         loop = asyncio.get_running_loop()
-        backoff = _EmptyPollBackoff(self.config.block_ms, self._stop_event)
+        leave = self._leave_event
+        backoff = _EmptyPollBackoff(self.config.block_ms, leave)
         failed = _worker_backoff()
 
-        while self._running and not self._stop_event.is_set():
+        while not leave.is_set():
             try:
-                # Wait for a concurrency slot
-                await self._semaphore.acquire()
-
-                if self._stop_event.is_set():
-                    self._semaphore.release()
+                # Wait for a slot; a stop or drain ends the wait.
+                if not await _acquire_unless_set(self._semaphore, leave):
                     break
 
                 started = loop.time()
@@ -1198,35 +1463,59 @@ class StreamWorker:
                 # acquire its own slot via _process_record.
                 self._semaphore.release()
 
-                for record in result.records:
-                    await self._semaphore.acquire()
-                    if self._stop_event.is_set():
-                        self._semaphore.release()
-                        return
-                    task = asyncio.create_task(self._process_record(record))
-                    self._tasks.add(task)
-                    task.add_done_callback(self._tasks.discard)
+                # A drain handles the whole batch, already delivered here; a
+                # stop hands back what it hasn't started.
+                await self._dispatch(result.records)
+                if self._stop_event.is_set():
+                    return
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self._semaphore.release()
-                if self._stop_event.is_set():
-                    # stop() interrupted the read. Reconnecting would also
-                    # reconnect the ack connection under the draining handlers.
+                if leave.is_set():
+                    # A stop or drain interrupted the read. Reconnecting would
+                    # also reconnect the ack connection under the handlers.
                     break
                 if is_connection_error(e):
                     logger.warning("Stream worker lost connection, reconnecting...")
                     try:
-                        await self._handle_reconnect()
+                        if not await self._handle_reconnect():
+                            break
                         logger.info("Stream worker reconnected, resuming")
                     except Exception as recon_err:
                         logger.error(f"Stream worker reconnect failed: {recon_err}, retrying...")
-                        await asyncio.sleep(1)
+                        await _sleep_unless_stopped(leave, 1)
                 else:
                     d = failed.next()
                     logger.error(f"Stream read error: {e}, retrying in {d:.3f}s...")
-                    await _sleep_unless_stopped(self._stop_event, d)
+                    await _sleep_unless_stopped(leave, d)
+
+    async def _dispatch(self, records: list[StreamRecord]) -> None:
+        """Hand each record to a handler as a slot frees. On stop, the
+        records not yet started are nacked, so the group hands them out again
+        now rather than after its ack timeout."""
+        assert self._semaphore is not None
+        started = 0
+        for record in records:
+            # A stop ends the wait; a drain handles the whole batch.
+            if not await _acquire_unless_set(self._semaphore, self._stop_event):
+                break
+            task = asyncio.create_task(self._process_record(record))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+            started += 1
+        rest = [r.id for r in records[started:]]
+        if not rest:
+            return
+        cfg = self.config
+        await self._on_ack_connection(
+            f"nack of {len(rest)}",
+            rest[0],
+            lambda c: c.stream.group_nack(
+                cfg.stream, cfg.group, rest, StreamGroupNackOptions(consumer=cfg.consumer)
+            ),
+        )
 
     async def _join_group(self) -> None:
         """Join the consumer group, retrying on connection errors.
@@ -1239,8 +1528,9 @@ class StreamWorker:
         """
         assert self._client is not None
         failed = _worker_backoff()
+        leave = self._leave_event
         while True:
-            if self._stop_event.is_set():
+            if leave.is_set():
                 return
             try:
                 await self._client.stream.group_join(
@@ -1253,30 +1543,39 @@ class StreamWorker:
                 if is_refused_unrun(e):
                     d = failed.next()
                     logger.warning(f"Group join refused: {e}, retrying in {d:.3f}s...")
-                    await _sleep_unless_stopped(self._stop_event, d)
+                    await _sleep_unless_stopped(leave, d)
                     continue
                 if not is_connection_error(e):
                     raise
                 logger.warning(f"Connection lost during group join: {e}, reconnecting...")
                 with contextlib.suppress(Exception):
-                    await self._handle_reconnect()
-                await asyncio.sleep(1)
+                    if not await self._handle_reconnect():
+                        return
+                await _sleep_unless_stopped(leave, 1)
 
-    async def _handle_reconnect(self) -> None:
+    async def _handle_reconnect(self) -> bool:
         """Reconnect, re-join the consumer group, and drain pending entries.
+        False if a stop or drain ended the reconnect.
 
         After re-joining, this consumer's pending (delivered-but-unacked)
         entries are re-processed via a group_claim cursor loop before normal
         reads resume — group_read only returns records past last_delivered_id,
         so without this an in-flight record at crash time is never re-surfaced.
         See ``redeliver_pending_on_reconnect``.
+
+        Only the reconnects end on a stop or drain: the join and the pending
+        drain check for one themselves, and cutting them short would leave
+        claimed records unhandled, or a nack cut off mid-request.
         """
         assert self._client is not None
-        await self._client.reconnect()
+        leave = self._leave_event
+        if not await _unless_set(leave, self._client.reconnect()):
+            return False
         # The ack connection went down with the poll connection (e.g. a server
         # restart) but may not notice until an ack fails on it.
         try:
-            await self._reconnect_ack_client()
+            if not await _unless_set(leave, self._reconnect_ack_client()):
+                return False
         except Exception as e:
             logger.warning(f"Failed to reconnect ack client: {e}")
         await self._client.stream.group_join(
@@ -1286,6 +1585,7 @@ class StreamWorker:
         )
         if self.config.redeliver_pending_on_reconnect:
             await self._drain_pending()
+        return True
 
     async def _drain_pending(self) -> None:
         """Re-process this consumer's pending entries via a group_claim loop.
@@ -1304,7 +1604,7 @@ class StreamWorker:
         cursor = StreamID()  # MIN — scan from the start of the PEL
         pages = 0
         while True:
-            if self._stop_event.is_set():
+            if self._leave_event.is_set():
                 return
             try:
                 result = await self._client.stream.group_claim(
@@ -1320,14 +1620,10 @@ class StreamWorker:
                 logger.warning(f"Pending drain claim failed: {e}")
                 return
 
-            for record in result.records:
-                await self._semaphore.acquire()  # same gate as live reads
-                if self._stop_event.is_set():
-                    self._semaphore.release()
-                    return
-                task = asyncio.create_task(self._process_record(record))
-                self._tasks.add(task)
-                task.add_done_callback(self._tasks.discard)
+            # Same gate as live reads.
+            await self._dispatch(result.records)
+            if self._stop_event.is_set():
+                return
 
             pages += 1
             if result.done or not result.records or pages >= max_pages:
@@ -1359,7 +1655,7 @@ class StreamWorker:
             lambda: send(ack_client),
             lambda: self._ack_generation,
             self._reconnect_ack_client,
-            self._stop_event,
+            self._leave_event,
         )
 
     async def _process_record(self, record: StreamRecord) -> None:
@@ -1373,6 +1669,7 @@ class StreamWorker:
                 group=self.config.group,
                 consumer=self.config.consumer,
             )
+            self._running_handlers += 1
             try:
                 await asyncio.wait_for(self._handler(ctx), timeout=self.config.message_timeout)
                 handled = True
@@ -1381,6 +1678,8 @@ class StreamWorker:
                     f"Record processing failed (stream={self.config.stream}, id={record.id}): {e}"
                 )
                 handled = False
+            finally:
+                self._running_handlers -= 1
 
             # Outside the handler's error handling: an ack that can't be
             # delivered must not turn into a nack.
@@ -1412,12 +1711,15 @@ class StreamWorker:
             self._semaphore.release()
 
     def stop(self) -> None:
-        """Signal the stream worker to stop."""
+        """Signal the stream worker to stop.
+
+        Ends polling, interrupting a blocking read or a reconnect, and a
+        drain's wait; records of the last batch not yet started are nacked.
+        Running handlers finish and ack before start() returns. A stop before
+        start() ends that run at once.
+        """
         logger.info("Stopping stream worker...")
-        self._running = False
-        self._stop_event.set()
-        if self._client:
-            self._client.interrupt()
+        self._signal_stop()
 
     async def close(self) -> None:
         """Stop and close the stream worker."""

@@ -461,7 +461,9 @@ A run whose handler goes past the action's `timeout_ms` without touching it is t
 
 Delivery is at-least-once: a result lost to a dropped connection is resent, and one that never arrives lets the lease run out, so a handler may see the same task or record again. `worker.stop()` waits for running handlers, and their results are still sent.
 
-An action worker heartbeats every 30 s, reporting the handlers it is running. One the server removed after missed heartbeats registers again, with the same options, when its next heartbeat is answered not found. One the server has drained stops taking work, and `start()` returns once its running handlers finish.
+Both workers register in the worker registry and heartbeat every 30 s, reporting the handlers they are running. One the server removed after missed heartbeats registers again, with the same options, when its next heartbeat is answered not found.
+
+`worker.drain()` stops taking work and lets the running handlers finish, heartbeats going on; the server is told, so it assigns the worker nothing more, and `start()` returns once the last handler has reported. A drain started on the server does the same. `worker.stop()` ends polling at once, also mid-reconnect or mid-drain; running handlers still finish, and a stream worker hands back the records of its last batch it hasn't started. Either one before or during `start()` ends that run, and a worker can be started again afterwards.
 
 ### StreamWorker Example
 
