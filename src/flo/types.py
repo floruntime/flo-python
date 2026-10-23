@@ -1256,6 +1256,7 @@ class ProcessingStatusResult:
     batch_size: int
     records_processed: int
     created_at: int
+    failure_reason: str | None = None  # Why the job failed; None unless status is "failed"
 
 
 @dataclass

@@ -2,6 +2,9 @@
 
 import struct
 
+import pytest
+
+from flo.exceptions import IncompleteResponseError
 from flo.processing import _parse_processing_list, _parse_processing_status
 from flo.types import ProcessingListEntry, ProcessingStatusResult
 
@@ -10,16 +13,51 @@ def _s(v: str) -> bytes:
     return struct.pack("<H", len(v)) + v.encode()
 
 
+def _status(status: int, reason: bytes) -> bytes:
+    return _s("job-1") + _s("pipe") + bytes([status]) + struct.pack("<IQq", 50, 1234, 99) + reason
+
+
 def test_status() -> None:
-    data = _s("job-1") + _s("pipe") + b"\x01" + struct.pack("<IQq", 50, 1234, 99)
-    assert _parse_processing_status(data) == ProcessingStatusResult(
+    assert _parse_processing_status(_status(0, _s(""))) == ProcessingStatusResult(
         job_id="job-1",
         name="pipe",
-        status="stopped",
+        status="running",
         batch_size=50,
         records_processed=1234,
         created_at=99,
+        failure_reason=None,
     )
+
+
+def test_status_failed_carries_reason() -> None:
+    result = _parse_processing_status(_status(3, _s("sink kv: key too large")))
+    assert result.status == "failed"
+    assert result.failure_reason == "sink kv: key too large"
+
+
+def test_status_completed() -> None:
+    assert _parse_processing_status(_status(4, _s(""))).status == "completed"
+
+
+def test_status_refuses_reason_past_end() -> None:
+    # Its own bounds check refuses it, not the trailing-bytes check.
+    with pytest.raises(IncompleteResponseError, match="truncated"):
+        _parse_processing_status(_status(3, struct.pack("<H", 10) + b"boo"))
+
+
+def test_status_refuses_a_field_that_isnt_utf8() -> None:
+    with pytest.raises(IncompleteResponseError, match="UTF-8"):
+        _parse_processing_status(_status(3, struct.pack("<H", 2) + b"\xff\xfe"))
+
+
+def test_status_refuses_trailing_bytes() -> None:
+    with pytest.raises(IncompleteResponseError):
+        _parse_processing_status(_status(0, _s("") + b"\x00"))
+
+
+def test_status_refuses_unknown_status() -> None:
+    with pytest.raises(IncompleteResponseError):
+        _parse_processing_status(_status(5, _s("")))
 
 
 def test_list() -> None:
