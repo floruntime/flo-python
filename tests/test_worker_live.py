@@ -32,6 +32,65 @@ from .conftest import IN_CI
 FLO_EXPIRY_ENDPOINT = os.environ.get("FLO_EXPIRY_ENDPOINT")
 
 
+def _three_free_ports() -> int:
+    """A port whose next two are free too: the server listens on all three."""
+    while True:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        try:
+            with socket.socket() as a, socket.socket() as b:
+                a.bind(("127.0.0.1", port + 1))
+                b.bind(("127.0.0.1", port + 2))
+            return port
+        except OSError:
+            continue
+
+
+async def _own_server(
+    binary: str, tmp_path: "os.PathLike[str]"
+) -> tuple[asyncio.subprocess.Process, FloClient]:
+    """Starts a server of its own and connects to it. A port taken between
+    the check and the server's bind makes the server exit, so it starts again
+    on another; a slow CI runner gets a minute in all."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 60
+    attempt = 0
+    while True:
+        attempt += 1
+        port = _three_free_ports()
+        log = os.path.join(tmp_path, f"server-{attempt}.log")
+        with open(log, "wb") as out:
+            server = await asyncio.create_subprocess_exec(
+                binary,
+                "server",
+                "start",
+                "--port",
+                str(port),
+                "--data-dir",
+                os.path.join(tmp_path, f"data-{attempt}"),
+                stdout=out,
+                stderr=asyncio.subprocess.STDOUT,
+                env={**os.environ, "HOME": str(tmp_path)},
+            )
+        while server.returncode is None:
+            try:
+                client = FloClient(f"127.0.0.1:{port}", namespace="default")
+                await client.connect()
+                return server, client
+            except Exception:
+                if loop.time() >= deadline:
+                    server.kill()
+                    await server.wait()
+                    with open(log, errors="replace") as f:
+                        pytest.fail(f"the server never came up:\n{f.read()[-4000:]}")
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(server.wait(), 0.1)
+        if loop.time() >= deadline:
+            with open(log, errors="replace") as f:
+                pytest.fail(f"the server exited ({server.returncode}):\n{f.read()[-4000:]}")
+
+
 async def _all_workers(client: FloClient, limit: int = 1024) -> list[WorkerInfo]:
     """Every worker, page by page; each page's cursor must move on."""
     workers: list[WorkerInfo] = []
@@ -282,34 +341,9 @@ async def test_a_drain_with_a_handler_running_ends_soon_after_it_when_the_server
         if IN_CI:
             pytest.fail("FLO_BINARY is not set")
         pytest.skip("FLO_BINARY is not set")
-    # A server of its own, to kill: it listens on port, port+1 and port+2.
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    server = await asyncio.create_subprocess_exec(
-        binary,
-        "server",
-        "start",
-        "--port",
-        str(port),
-        "--data-dir",
-        str(tmp_path),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-        env={**os.environ, "HOME": str(tmp_path)},
-    )
+    server, client = await _own_server(binary, tmp_path)
     try:
-        endpoint = f"127.0.0.1:{port}"
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + 15
-        while True:
-            try:
-                client = FloClient(endpoint, namespace="default")
-                await client.connect()
-                break
-            except Exception:
-                assert loop.time() < deadline, "the server never came up"
-                await asyncio.sleep(0.1)
         action = f"py-dies-{secrets.token_hex(4)}"
         w = client.new_action_worker(worker_id=f"{action}-worker", concurrency=2, block_ms=1000)
         running, finished = asyncio.Event(), asyncio.Event()
