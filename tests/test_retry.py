@@ -18,7 +18,7 @@ from flo.exceptions import (
 )
 from flo.retry import _Backoff, _policy_backoff
 from flo.types import HEADER_SIZE, MAGIC, TABLE_HASH, VERSION, OpCode, Ran, Reason, StatusCode
-from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32
+from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32c
 
 
 def _frame(request_id: int, status: int, data: bytes) -> bytes:
@@ -36,7 +36,7 @@ def _frame(request_id: int, status: int, data: bytes) -> bytes:
             TABLE_HASH,
         )
 
-    return header(compute_crc32(header(0), data)) + data
+    return header(compute_crc32c(header(0), data)) + data
 
 
 def _refusal(request_id: int, status: StatusCode, ran: Ran) -> bytes:
@@ -45,7 +45,7 @@ def _refusal(request_id: int, status: StatusCode, ran: Ran) -> bytes:
 
 
 def _kv_value(request_id: int) -> bytes:
-    return _frame(request_id, StatusCode.OK, struct.pack("<QI", 1, 1) + b"v")
+    return _frame(request_id, StatusCode.OK, struct.pack("<QI", 1, 1) + b"v\x00")
 
 
 Reply = Callable[[int, int, int], bytes]

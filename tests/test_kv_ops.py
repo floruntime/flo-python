@@ -20,7 +20,16 @@ from flo import (
 from flo import kv_body as kb
 from flo.exceptions import IncompleteResponseError, NotFoundError, ValidationError
 from flo.kv_txn import Transaction, begin
-from flo.types import HEADER_SIZE, MGetEntry, OpCode, Ran, Reason, StatusCode, VersionEntry
+from flo.types import (
+    HEADER_SIZE,
+    GetResult,
+    MGetEntry,
+    OpCode,
+    Ran,
+    Reason,
+    StatusCode,
+    VersionEntry,
+)
 from flo.wire import RawResponse, serialize_request
 
 Call = tuple[OpCode, str, bytes, bytes, bytes]
@@ -92,8 +101,8 @@ def test_answers_match_the_servers_schemas() -> None:
     assert kb.decode_delete_answer(H("00")) is None
     assert kb.decode_scan_answer(H("02000100610200626201026332")) == (["a", "bb"], b"c2")
     assert kb.decode_scan_answer(H("000000")) == ([], None)
-    assert kb.decode_history_answer(H("010300000000000000e803000000000000020000007633")) == [
-        VersionEntry(version=3, at_ms=1000, value=b"v3")
+    assert kb.decode_history_answer(H("010300000000000000e80300000000000000020000007633")) == [
+        VersionEntry(version=3, at_ms=1000, deleted=False, value=b"v3")
     ]
     # next 2 of two keys asked: all were answered.
     assert kb.decode_mget_answer(
@@ -115,6 +124,58 @@ def test_answers_match_the_servers_schemas() -> None:
     assert kb.decode_txn_begin_answer(H("01000000000000000200000000000000")) == (1, 2)
     assert kb.decode_txn_commit_answer(H("0a000000000000000200")) == (10, 2)
     kb.decode_empty_answer("kv.txn_rollback", b"")
+
+
+def test_get_answer_carries_expiry_when_the_key_has_a_ttl() -> None:
+    assert kb.decode_get_answer(H("030000000000000002000000763300")) == GetResult(
+        value=b"v3", version=3, expires_at_ms=None
+    )
+    assert kb.decode_get_answer(H("030000000000000002000000763301e803000000000000")) == GetResult(
+        value=b"v3", version=3, expires_at_ms=1000
+    )
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "030000000000000002000000763302e803000000000000",  # presence byte not 0 or 1
+        "030000000000000002000000763301e8030000",  # cut inside the i64
+        "0300000000000000020000007633",  # no presence byte
+        "03000000000000000200000076330000",  # trailing byte
+    ],
+)
+def test_a_malformed_get_answer_is_refused(answer: str) -> None:
+    with pytest.raises(IncompleteResponseError):
+        kb.decode_get_answer(H(answer))
+
+
+def test_history_marks_a_deleted_version() -> None:
+    # Newest first: v3 set, v2 deleted (empty value), v1 set.
+    answer = (
+        "03"
+        "0300000000000000"
+        "e803000000000000"
+        "00"
+        "020000007633"
+        "0200000000000000"
+        "e703000000000000"
+        "01"
+        "00000000"
+        "0100000000000000"
+        "e603000000000000"
+        "00"
+        "020000007631"
+    )
+    assert kb.decode_history_answer(H(answer)) == [
+        VersionEntry(version=3, at_ms=1000, deleted=False, value=b"v3"),
+        VersionEntry(version=2, at_ms=999, deleted=True, value=b""),
+        VersionEntry(version=1, at_ms=998, deleted=False, value=b"v1"),
+    ]
+
+
+def test_a_history_entry_with_a_bad_deleted_byte_is_refused() -> None:
+    with pytest.raises(IncompleteResponseError):
+        kb.decode_history_answer(H("010300000000000000e80300000000000002020000007633"))
 
 
 def test_mget_golden_answer_with_next() -> None:
@@ -196,9 +257,9 @@ async def test_scan_sends_the_prefix_as_key_and_pages_by_cursor(
 
 
 async def test_history_carries_each_versions_time(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, calls = _client(monkeypatch, _ok("010300000000000000e803000000000000020000007633"))
+    client, calls = _client(monkeypatch, _ok("010300000000000000e80300000000000000020000007633"))
     assert await client.kv.history("k", HistoryOptions(limit=2)) == [
-        VersionEntry(version=3, at_ms=1000, value=b"v3")
+        VersionEntry(version=3, at_ms=1000, deleted=False, value=b"v3")
     ]
     await client.kv.history("k", HistoryOptions(routing_key="rk"))
     assert [c[3] for c in calls] == [
