@@ -369,7 +369,9 @@ async def test_start_closes_the_poll_client_when_the_ack_client_fails(
     worker = FloClient("127.0.0.1:1").new_stream_worker(stream="s", group="g", handler=_noop)
     with pytest.raises(ConnectionRefusedError):
         await worker.start()
-    assert closed == clients[:1]
+    # Every client it made is closed, the connected poll client among them.
+    assert clients[0] in closed
+    assert set(closed) == set(clients)
 
 
 @pytest.mark.parametrize("exc", [BrokenPipeError(), ConnectionResetError(), OSError()])

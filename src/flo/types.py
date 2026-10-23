@@ -1039,6 +1039,7 @@ class WorkerRegisterOptions:
     """Options for registering a worker."""
 
     namespace: str | None = None
+    worker_type: WorkerType = WorkerType.ACTION
     concurrency: int = 10
     machine_id: str | None = None
     metadata: str | None = None

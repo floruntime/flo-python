@@ -34,6 +34,7 @@ from .types import (
     WorkerListOptions,
     WorkerListResult,
     WorkerRegisterOptions,
+    WorkerStatus,
     WorkerTouchOptions,
 )
 from .wire import (
@@ -229,6 +230,7 @@ class WorkerOperations:
 
         value = serialize_worker_register_value(
             task_types,
+            worker_type=int(opts.worker_type),
             max_concurrency=opts.concurrency,
             metadata=opts.metadata,
             machine_id=opts.machine_id,
@@ -246,23 +248,56 @@ class WorkerOperations:
         worker_id: str,
         current_load: int = 0,
         namespace: str | None = None,
-    ) -> None:
+    ) -> WorkerStatus:
         """Send a worker heartbeat to keep the registration alive.
 
         Args:
             worker_id: Worker identifier.
             current_load: Current number of active tasks.
             namespace: Optional namespace override.
+
+        Returns:
+            The worker's status on the server: DRAINING once it is drained.
+
+        Raises:
+            NotFoundError: The server doesn't know the worker (it never
+                registered, or was removed after going silent).
         """
         import struct
 
         ns = self._client.get_namespace(namespace)
         value = struct.pack("<I", current_load)
-        await self._client._send_and_check(
+        response = await self._client._send_and_check(
             OpCode.WORKER_HEARTBEAT,
             ns,
             worker_id.encode("utf-8"),
             value,
+        )
+        if len(response.data) != 1:
+            raise ValueError(f"heartbeat answer is {len(response.data)} bytes, want 1")
+        return WorkerStatus(response.data[0])
+
+    async def drain(self, worker_id: str, namespace: str | None = None) -> None:
+        """Mark a worker draining: the server gives it no more work, and
+        its heartbeats answer DRAINING until it deregisters.
+
+        Raises:
+            NotFoundError: The server doesn't know the worker.
+        """
+        await self._client._send_and_check(
+            OpCode.WORKER_DRAIN,
+            self._client.get_namespace(namespace),
+            worker_id.encode("utf-8"),
+            b"",
+        )
+
+    async def deregister(self, worker_id: str, namespace: str | None = None) -> None:
+        """Remove a worker from the registry."""
+        await self._client._send_and_check(
+            OpCode.WORKER_DEREGISTER,
+            self._client.get_namespace(namespace),
+            worker_id.encode("utf-8"),
+            b"",
         )
 
     async def await_task(

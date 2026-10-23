@@ -151,6 +151,7 @@ async def test_an_await_refused_as_unhealthy_heartbeats_at_once_then_polls_again
         OpCode.ACTION_AWAIT,
         OpCode.WORKER_HEARTBEAT,
         OpCode.ACTION_AWAIT,
+        OpCode.WORKER_DEREGISTER,
     ]
 
 
@@ -167,6 +168,7 @@ async def test_an_unhealthy_worker_the_server_removed_registers_again() -> None:
         OpCode.WORKER_HEARTBEAT,
         OpCode.WORKER_REGISTER,
         OpCode.ACTION_AWAIT,
+        OpCode.WORKER_DEREGISTER,
     ]
     first, again = fake.of(OpCode.WORKER_REGISTER)
     assert first[2] == again[2]
