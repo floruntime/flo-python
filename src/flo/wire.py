@@ -9,6 +9,8 @@ import struct
 from dataclasses import dataclass
 from typing import Any
 
+import google_crc32c
+
 from . import types as types
 from .exceptions import (
     BlockTooLongError,
@@ -191,26 +193,9 @@ class OptionsIterator:
 # =============================================================================
 
 
-def _crc32c_table() -> tuple[int, ...]:
-    table = []
-    for n in range(256):
-        c = n
-        for _ in range(8):
-            c = (c >> 1) ^ 0x82F63B78 if c & 1 else c >> 1
-        table.append(c)
-    return tuple(table)
-
-
-_CRC32C_TABLE = _crc32c_table()
-
-
 def crc32c(data: bytes, crc: int = 0) -> int:
     """CRC32C (Castagnoli); pass a previous result as ``crc`` to continue it."""
-    table = _CRC32C_TABLE
-    c = crc ^ 0xFFFFFFFF
-    for b in data:
-        c = table[(c ^ b) & 0xFF] ^ (c >> 8)
-    return c ^ 0xFFFFFFFF
+    return int(google_crc32c.extend(crc, data))
 
 
 def compute_crc32c(header_bytes: bytes, payload: bytes) -> int:
