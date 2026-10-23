@@ -10,6 +10,9 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
+# Frame checksums: a C CRC32C, with its own pure-Python fallback where no
+# wheel fits.
+dependencies = ["google-crc32c>=1.7.0"]
 authors = [
     { name = "Flo Team" }
 ]

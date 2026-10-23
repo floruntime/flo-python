@@ -1,7 +1,9 @@
 """Wire protocol unit tests."""
 
+import os
 import struct
 
+import google_crc32c
 import pytest
 
 from flo.exceptions import IncompleteResponseError, TableMismatchError, ValidationError
@@ -216,6 +218,12 @@ class TestSerializeRequest:
 
     def test_crc32c_check_value(self) -> None:
         assert crc32c(b"123456789") == 0xE3069283
+
+    @pytest.mark.skipif(not os.environ.get("CI"), reason="CI checks the wheel it installed")
+    def test_crc32c_is_the_c_implementation(self) -> None:
+        # The library falls back to pure Python, hundreds of times slower,
+        # where no wheel fits; CI's platforms all have one.
+        assert google_crc32c.implementation == "c"
 
     def test_frame_checksum_matches_the_servers(self) -> None:
         # The same frame as flo's own test of a frame's checksum.
