@@ -210,7 +210,10 @@ class _RegisteredWorker:
     kept by heartbeats, and the end of a run by drain or stop.
 
     A drain (drain(), a DRAINING heartbeat, or an await refused as draining)
-    stops new work while running handlers finish, heartbeats going on. The
+    stops new work while running handlers finish, heartbeats going on. A
+    drain started on the server answers a held action await at once but not
+    a held stream read, so a stream worker learns of it from its next
+    heartbeat (_HEARTBEAT_INTERVAL_S); either way the worker then interrupts its own poll. The
     server is told at once, and again after any re-registration, which marks
     a worker active. stop() ends polling too, without telling the server.
     Both are cleared when start() returns, not when it begins, so one that
@@ -254,8 +257,10 @@ class _RegisteredWorker:
     def drain(self) -> None:
         """Stop taking work and let the running handlers finish; start()
         then returns. The server is told, so it assigns this worker nothing
-        more, and heartbeats go on meanwhile. A drain before start() ends that
-        run once it has registered."""
+        more, and heartbeats go on meanwhile. A blocking await or read is
+        interrupted, so the worker leaves it at once rather than after
+        block_ms. A drain before start() ends that run once it has
+        registered."""
         logger.info("Draining worker...")
         self._begin_drain()
 

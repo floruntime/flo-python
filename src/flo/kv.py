@@ -184,8 +184,10 @@ class KVOperations:
     ) -> GetResult | None:
         """Get value and version for a key.
 
-        Returns ``GetResult(value, version)``, or ``None`` if the key is not
-        found, also when a wait (``wait_ms``) ends without it.
+        Returns ``GetResult(value, version, expires_at_ms)``, or ``None`` if
+        the key is not found, also when a wait (``wait_ms``) ends without it.
+        ``expires_at_ms`` is when the key's TTL runs out (unix ms), ``None``
+        when it has none.
 
         Example:
             result = await client.kv.get("user:123")
@@ -316,8 +318,9 @@ class KVOperations:
         key: str | bytes,
         options: HistoryOptions | None = None,
     ) -> list[VersionEntry]:
-        """A key's versions, newest first, each with when it was written; empty
-        for a missing key.
+        """A key's versions, newest first, each with when it was written and
+        whether it was a delete (``deleted``, with an empty value); empty for
+        a missing key.
 
         Example:
             for entry in await client.kv.history("user:123", HistoryOptions(limit=10)):

@@ -12,7 +12,7 @@ from flo import FloClient
 from flo import worker as worker_mod
 from flo.exceptions import UnexpectedEofError, is_connection_error
 from flo.types import HEADER_SIZE, MAGIC, TABLE_HASH, VERSION, OpCode, StatusCode, StreamID
-from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32
+from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32c
 from flo.worker import StreamContext
 
 
@@ -31,7 +31,7 @@ def _response(request_id: int, data: bytes) -> bytes:
             TABLE_HASH,
         )
 
-    return header(compute_crc32(header(0), data)) + data
+    return header(compute_crc32c(header(0), data)) + data
 
 
 def _records(n: int) -> bytes:

@@ -23,7 +23,7 @@ from .types import _DEFAULT_WORKER_BLOCK_MS, HEADER_SIZE, OpCode, OptionTag, Sta
 from .wire import (
     OptionsIterator,
     RawResponse,
-    compute_crc32,
+    compute_crc32c,
     parse_response_header,
     serialize_request,
 )
@@ -406,10 +406,10 @@ class FloClient:
                 else:
                     response_data = b""
 
-                computed_crc = compute_crc32(header_data, response_data)
+                computed_crc = compute_crc32c(header_data, response_data)
                 if computed_crc != crc:
                     raise InvalidChecksumError(
-                        f"CRC32 mismatch: 0x{computed_crc:08X} != 0x{crc:08X}"
+                        f"CRC32C mismatch: 0x{computed_crc:08X} != 0x{crc:08X}"
                     )
                 if resp_request_id == 0:
                     # The server answers a request it could not parse with

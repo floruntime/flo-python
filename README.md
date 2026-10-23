@@ -463,7 +463,7 @@ Delivery is at-least-once: a result lost to a dropped connection is resent, and 
 
 Both workers register in the worker registry and heartbeat every 30 s, reporting the handlers they are running. One the server removed after missed heartbeats registers again, with the same options, when its next heartbeat is answered not found.
 
-`worker.drain()` stops taking work and lets the running handlers finish, heartbeats going on; the server is told, so it assigns the worker nothing more, and `start()` returns once the last handler has reported. A drain started on the server does the same. `worker.stop()` ends polling at once, also mid-reconnect or mid-drain; running handlers still finish, and a stream worker hands back the records of its last batch it hasn't started. Either one before or during `start()` ends that run, and a worker can be started again afterwards.
+`worker.drain()` stops taking work and lets the running handlers finish, heartbeats going on; the server is told, so it assigns the worker nothing more, and `start()` returns once the last handler has reported. A drain started on the server does the same. Neither waits out `block_ms`: `drain()` interrupts the worker's own poll connection, so an action worker's held await and a stream worker's held read end at once. A drain started on the server answers an action worker's held await at once, refused as `WORKER_DRAINING`; it doesn't wake a stream worker's held group read, so a stream worker learns of it from its next heartbeat (every 30 s) and only then interrupts its read and leaves. `worker.stop()` ends polling at once, also mid-reconnect or mid-drain; running handlers still finish, and a stream worker hands back the records of its last batch it hasn't started. Either one before or during `start()` ends that run, and a worker can be started again afterwards.
 
 ### StreamWorker Example
 
@@ -558,7 +558,7 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 | `GenericServerError` | Any other error status, including one this SDK doesn't know (`status_code` carries it) |
 | `ConnectionFailedError` | Failed to connect |
 | `RequestTimeoutError` | No response within the timeout |
-| `InvalidChecksumError` | Response CRC32 mismatch |
+| `InvalidChecksumError` | Response CRC32C mismatch |
 
 ### Retries
 
