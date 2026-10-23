@@ -11,6 +11,7 @@ import re
 import struct
 from typing import TYPE_CHECKING
 
+from .exceptions import IncompleteResponseError
 from .types import (
     OpCode,
     ProcessingCancelOptions,
@@ -169,48 +170,50 @@ def _parse_processing_status(data: bytes) -> ProcessingStatusResult:
 
     Wire format: [job_id_len:u16][job_id][name_len:u16][name][status:u8]
                  [batch_size:u32][records_processed:u64][created_at:i64]
+                 [reason_len:u16][reason]  (reason is empty unless the job failed)
     """
     pos = 0
 
-    def read_u16() -> int:
+    def take(n: int) -> bytes:
         nonlocal pos
-        v: int = struct.unpack_from("<H", data, pos)[0]
-        pos += 2
-        return v
+        if pos + n > len(data):
+            raise IncompleteResponseError("processing.status answer is truncated")
+        b = data[pos : pos + n]
+        pos += n
+        return b
 
     def read_str() -> str:
-        n = read_u16()
-        nonlocal pos
-        s = data[pos : pos + n].decode("utf-8")
-        pos += n
-        return s
+        (n,) = struct.unpack("<H", take(2))
+        raw = take(n)
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise IncompleteResponseError(
+                "processing.status answer has a field that isn't UTF-8"
+            ) from e
 
     job_id = read_str()
     name = read_str()
 
-    status_byte = data[pos]
-    pos += 1
-    status_str = (
-        _PROCESSING_STATUS_NAMES[status_byte]
-        if status_byte < len(_PROCESSING_STATUS_NAMES)
-        else f"unknown({status_byte})"
-    )
+    status_byte = take(1)[0]
+    if status_byte >= len(_PROCESSING_STATUS_NAMES):
+        raise IncompleteResponseError(f"processing.status answer has unknown status {status_byte}")
 
-    (batch_size,) = struct.unpack_from("<I", data, pos)
-    pos += 4
-
-    (records_processed,) = struct.unpack_from("<Q", data, pos)
-    pos += 8
-
-    (created_at,) = struct.unpack_from("<q", data, pos)
+    batch_size, records_processed, created_at = struct.unpack("<IQq", take(20))
+    reason = read_str()
+    if pos != len(data):
+        raise IncompleteResponseError(
+            f"processing.status answer has {len(data) - pos} bytes after the reason"
+        )
 
     return ProcessingStatusResult(
         job_id=job_id,
         name=name,
-        status=status_str,
+        status=_PROCESSING_STATUS_NAMES[status_byte],
         batch_size=batch_size,
         records_processed=records_processed,
         created_at=created_at,
+        failure_reason=reason or None,
     )
 
 
