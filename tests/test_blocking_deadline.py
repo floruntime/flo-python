@@ -19,7 +19,7 @@ from flo.exceptions import (
     is_connection_error,
 )
 from flo.types import HEADER_SIZE, MAGIC, TABLE_HASH, VERSION, OpCode, StatusCode
-from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32
+from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32c
 from flo.worker import ActionWorker, StreamWorker
 
 
@@ -38,7 +38,7 @@ def _response(request_id: int, data: bytes, status: StatusCode = StatusCode.OK) 
             TABLE_HASH,
         )
 
-    return header(compute_crc32(header(0), data)) + data
+    return header(compute_crc32c(header(0), data)) + data
 
 
 class FakeServer:
@@ -80,7 +80,7 @@ class FakeServer:
                 asyncio.get_running_loop().call_later(
                     delay,
                     writer.write,
-                    _response(request_id, struct.pack("<QI", 1, len(key)) + key),
+                    _response(request_id, struct.pack("<QI", 1, len(key)) + key + b"\x00"),
                 )
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
@@ -172,7 +172,7 @@ async def _bad_frame_client(reply: Any) -> tuple[FloClient, asyncio.Server]:
 
 
 def _corrupt(request_id: int) -> bytes:
-    frame = bytearray(_response(request_id, struct.pack("<QI", 1, 1) + b"k"))
+    frame = bytearray(_response(request_id, struct.pack("<QI", 1, 1) + b"k\x00"))
     frame[-1] ^= 0xFF
     return bytes(frame)
 
@@ -180,10 +180,10 @@ def _corrupt(request_id: int) -> bytes:
 @pytest.mark.parametrize(
     ("reply", "error"),
     [
-        (lambda rid: _response(rid + 1, struct.pack("<QI", 1, 1) + b"k"), ProtocolError),
+        (lambda rid: _response(rid + 1, struct.pack("<QI", 1, 1) + b"k\x00"), ProtocolError),
         (_corrupt, InvalidChecksumError),
         (
-            lambda rid: _response(rid, struct.pack("<QI", 1, 1) + b"k")[:HEADER_SIZE],
+            lambda rid: _response(rid, struct.pack("<QI", 1, 1) + b"k\x00")[:HEADER_SIZE],
             RequestTimeoutError,
         ),
     ],

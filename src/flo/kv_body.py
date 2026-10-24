@@ -325,12 +325,13 @@ class _Answer:
 
 
 def decode_get_answer(data: bytes) -> GetResult:
-    """kv.get's answer: version, value."""
+    """kv.get's answer: version, value, expires_at_ms (absent with no TTL)."""
     a = _Answer("kv.get", data)
     version = a.u64()
     value = a.bytes32()
+    expires_at_ms = a.i64() if a.present() else None
     a.done()
-    return GetResult(value=value, version=version)
+    return GetResult(value=value, version=version, expires_at_ms=expires_at_ms)
 
 
 def decode_set_answer(data: bytes) -> PutResult:
@@ -365,7 +366,8 @@ def decode_history_answer(data: bytes) -> list[VersionEntry]:
     """kv.history's answer: versions, newest first."""
     a = _Answer("kv.history", data)
     versions = [
-        VersionEntry(version=a.u64(), at_ms=a.i64(), value=a.bytes32()) for _ in range(a.u8())
+        VersionEntry(version=a.u64(), at_ms=a.i64(), deleted=a.flag(), value=a.bytes32())
+        for _ in range(a.u8())
     ]
     a.done()
     return versions

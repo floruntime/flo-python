@@ -20,7 +20,7 @@ from flo.types import HEADER_SIZE, MAGIC, TABLE_HASH, VERSION, Ran, Reason, Stat
 from flo.wire import (
     REQUEST_HEADER_FORMAT,
     RESPONSE_HEADER_FORMAT,
-    compute_crc32,
+    compute_crc32c,
     parse_response,
 )
 
@@ -45,7 +45,7 @@ def _frame(request_id: int, status: int, data: bytes) -> bytes:
             TABLE_HASH,
         )
 
-    return header(compute_crc32(header(0), data)) + data
+    return header(compute_crc32c(header(0), data)) + data
 
 
 def test_unavailable_maps_to_unavailable_error_with_the_server_message() -> None:
@@ -80,7 +80,9 @@ async def _client_answering(first_status: int) -> tuple[FloClient, asyncio.Serve
                 if served == 0:
                     reply = _frame(request_id, first_status, _refusal(b"first reply's message"))
                 else:
-                    reply = _frame(request_id, 0, struct.pack("<QI", 7, len(b"second")) + b"second")
+                    reply = _frame(
+                        request_id, 0, struct.pack("<QI", 7, len(b"second")) + b"second\x00"
+                    )
                 served += 1
                 writer.write(reply)
         except (asyncio.IncompleteReadError, ConnectionError):
@@ -152,7 +154,7 @@ async def test_an_answer_from_another_table_is_refused_unread_and_drops_the_conn
                 TABLE_HASH + 1,
             )
 
-        writer.write(head(compute_crc32(head(0), data)) + data)
+        writer.write(head(compute_crc32c(head(0), data)) + data)
         await writer.drain()
 
     server = await asyncio.start_server(handle, "127.0.0.1", 0)

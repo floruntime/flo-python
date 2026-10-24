@@ -1,14 +1,15 @@
 """Flo Wire Protocol
 
 Binary serialization/deserialization for the Flo protocol.
-Header: 32 bytes, little-endian, CRC32 validated.
+Header: 32 bytes, little-endian, CRC32C validated.
 """
 
 import json
 import struct
-from binascii import crc32
 from dataclasses import dataclass
 from typing import Any
+
+import google_crc32c
 
 from . import types as types
 from .exceptions import (
@@ -48,12 +49,12 @@ from .types import (
 
 # Request header (32 bytes):
 #   magic(u32) + payload_len(u32) + request_id(u64)
-#   + crc32(u32) + op_code(u16) + version(u8) + flags(u8) + table_hash(u64)
+#   + crc32c(u32) + op_code(u16) + version(u8) + flags(u8) + table_hash(u64)
 REQUEST_HEADER_FORMAT = "<IIQIHBBQ"
 
 # Response header (32 bytes):
 #   magic(u32) + data_len(u32) + request_id(u64)
-#   + crc32(u32) + version(u8) + status(u8) + flags(u8) + _pad(u8) + table_hash(u64)
+#   + crc32c(u32) + version(u8) + status(u8) + flags(u8) + _pad(u8) + table_hash(u64)
 RESPONSE_HEADER_FORMAT = "<IIQIBBBBQ"
 
 
@@ -192,17 +193,15 @@ class OptionsIterator:
 # =============================================================================
 
 
-def compute_crc32(header_bytes: bytes, payload: bytes) -> int:
-    """Compute CRC32 for header (excluding crc32 field) + payload.
+def crc32c(data: bytes, crc: int = 0) -> int:
+    """CRC32C (Castagnoli); pass a previous result as ``crc`` to continue it."""
+    return int(google_crc32c.extend(crc, data))
 
-    The CRC32 is computed over:
-    - Header bytes 0-15 (magic, payload_length, request_id)
-    - Header bytes 20-31 (op_code/version/flags/table_hash or version/status/flags/pad/table_hash)
-    - Payload bytes
-    """
-    # Hash bytes 0-15 and 20-31 of header (skip crc32 field at 16-19)
-    crc_data = header_bytes[0:16] + header_bytes[20:32] + payload
-    return crc32(crc_data) & 0xFFFFFFFF
+
+def compute_crc32c(header_bytes: bytes, payload: bytes) -> int:
+    """A frame's checksum: CRC32C over header bytes 0-15 and 20-31 (all but
+    the checksum field itself), then the payload."""
+    return crc32c(payload, crc32c(header_bytes[20:32], crc32c(header_bytes[0:16])))
 
 
 def serialize_request(
@@ -268,23 +267,19 @@ def serialize_request(
 
     payload_bytes = bytes(payload)
 
-    # Build header without CRC32
     header_without_crc = struct.pack(
         REQUEST_HEADER_FORMAT,
         MAGIC,
         len(payload_bytes),
         request_id,
-        0,  # CRC32 placeholder
+        0,  # checksum placeholder
         op_code,
         VERSION,
         0,  # flags
         TABLE_HASH,
     )
 
-    # Compute CRC32
-    crc = compute_crc32(header_without_crc, payload_bytes)
-
-    # Build final header with CRC32
+    crc = compute_crc32c(header_without_crc, payload_bytes)
     header = struct.pack(
         REQUEST_HEADER_FORMAT,
         MAGIC,
@@ -329,7 +324,7 @@ def parse_response_header(data: bytes) -> tuple[StatusCode, int, int, int]:
         data: Raw response data (must be at least HEADER_SIZE bytes).
 
     Returns:
-        Tuple of (status, data_len, request_id, crc32).
+        Tuple of (status, data_len, request_id, crc32c).
 
     Raises:
         IncompleteResponseError: If data is too short.
@@ -364,7 +359,7 @@ def parse_response(data: bytes) -> RawResponse:
 
     Raises:
         IncompleteResponseError: If response is incomplete.
-        InvalidChecksumError: If CRC32 validation fails.
+        InvalidChecksumError: If the CRC32C check fails.
     """
     status, data_len, request_id, expected_crc = parse_response_header(data)
 
@@ -374,10 +369,10 @@ def parse_response(data: bytes) -> RawResponse:
 
     response_data = data[HEADER_SIZE : HEADER_SIZE + data_len]
 
-    # Verify CRC32
-    computed_crc = compute_crc32(data[:HEADER_SIZE], response_data)
+    # Verify CRC32C
+    computed_crc = compute_crc32c(data[:HEADER_SIZE], response_data)
     if computed_crc != expected_crc:
-        raise InvalidChecksumError(f"CRC32 mismatch: 0x{computed_crc:08X} != 0x{expected_crc:08X}")
+        raise InvalidChecksumError(f"CRC32C mismatch: 0x{computed_crc:08X} != 0x{expected_crc:08X}")
 
     return RawResponse(status=status, data=response_data, request_id=request_id)
 

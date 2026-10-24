@@ -101,7 +101,7 @@ class TableMismatchError(ProtocolError):
 
 
 class InvalidChecksumError(ProtocolError):
-    """CRC32 checksum validation failed."""
+    """A frame's CRC32C checksum didn't match."""
 
     pass
 

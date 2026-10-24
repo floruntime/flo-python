@@ -10,7 +10,7 @@ import pytest
 
 from flo import ActionContext, FloClient
 from flo.types import HEADER_SIZE, MAGIC, TABLE_HASH, VERSION, OpCode, StatusCode
-from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32
+from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32c
 from flo.worker import ActionWorker, StreamContext, StreamWorker, _EmptyPollBackoff
 
 POLL_OPS = (OpCode.ACTION_AWAIT, OpCode.STREAM_GROUP_READ)
@@ -34,7 +34,7 @@ def _response(request_id: int, data: bytes) -> bytes:
             TABLE_HASH,
         )
 
-    return header(compute_crc32(header(0), data)) + data
+    return header(compute_crc32c(header(0), data)) + data
 
 
 def _one_record() -> bytes:

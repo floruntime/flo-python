@@ -52,10 +52,16 @@ jobs:
       - name: Build flo
         working-directory: flo-src
         run: zig build --release=safe -Dcpu=x86_64_v2
+      # The server's status codes and refusal reasons, for the drift test.
+      - name: Write ops.json
+        working-directory: flo-src
+        run: zig build gen
       - uses: actions/upload-artifact@v4
         with:
           name: flo
-          path: flo-src/zig-out/bin/flo
+          path: |
+            flo-src/zig-out/bin/flo
+            flo-src/zig-out/gen/ops.json
           retention-days: 1
 
   test:
@@ -81,14 +87,15 @@ jobs:
       - name: Start the pinned flo
         run: |
           cd "$RUNNER_TEMP"
-          chmod +x flo-bin/flo
-          echo "FLO_BINARY=$RUNNER_TEMP/flo-bin/flo" >> "$GITHUB_ENV"
+          chmod +x flo-bin/bin/flo
+          echo "FLO_BINARY=$RUNNER_TEMP/flo-bin/bin/flo" >> "$GITHUB_ENV"
+          echo "FLO_OPS_JSON=$RUNNER_TEMP/flo-bin/gen/ops.json" >> "$GITHUB_ENV"
           mkdir -p flo-data flo-expiry-data
-          ./flo-bin/flo server start --port 4453 --data-dir "$RUNNER_TEMP/flo-data" > flo-server.log 2>&1 &
+          ./flo-bin/bin/flo server start --port 4453 --data-dir "$RUNNER_TEMP/flo-data" > flo-server.log 2>&1 &
           # A second server that removes a worker a second after its last
           # heartbeat, for the re-register test.
           printf '[workers]\nheartbeat_timeout_ms = 1000\nremove_after_ms = 1000\n' > flo-fast-expiry.toml
-          ./flo-bin/flo server start --port 4463 --data-dir "$RUNNER_TEMP/flo-expiry-data" \
+          ./flo-bin/bin/flo server start --port 4463 --data-dir "$RUNNER_TEMP/flo-expiry-data" \
             --config "$RUNNER_TEMP/flo-fast-expiry.toml" > flo-expiry-server.log 2>&1 &
           for port in 4453 4463; do
             for _ in $(seq 1 50); do
@@ -99,7 +106,8 @@ jobs:
           done
       - name: Run tests
         # CI=1 turns a missing server into a failure, not a skip; FLO_BINARY
-        # runs the version test against the pinned flo.
+        # runs the version test against the pinned flo, FLO_OPS_JSON the
+        # status and reason drift test.
         env:
           CI: "1"
           FLO_ENDPOINT: localhost:4453

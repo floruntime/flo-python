@@ -52,7 +52,7 @@ def _refused(status: StatusCode, reason: Reason) -> RawResponse:
 
 
 def _get_answer(version: int, value: bytes) -> RawResponse:
-    return _ok(struct.pack("<QI", version, len(value)) + value)
+    return _ok(struct.pack("<QI", version, len(value)) + value + b"\x00")
 
 
 async def test_get_sends_wait_ms_wait_for_routing_key_and_txn(

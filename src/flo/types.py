@@ -13,12 +13,12 @@ from typing import Any, Generic, Optional, TypeVar
 # =============================================================================
 
 MAGIC: int = 0x004F4C46  # "FLO\0" in little-endian
-VERSION: int = 0x02
+VERSION: int = 0x03
 # The hash of the op table this SDK was built for, written into every request
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0x2FBA7DD9AE941830
+TABLE_HASH: int = 0x74E680EB8727C3FB
 
 
 class Reason(IntEnum):
@@ -360,6 +360,7 @@ class VersionEntry:
 
     version: int
     at_ms: int  # When it was written, unix ms
+    deleted: bool  # This version is a delete; value is empty
     value: bytes
 
 
@@ -417,6 +418,8 @@ class GetResult:
 
     value: bytes
     version: int
+    # When the key's TTL runs out, unix ms; None when it has none.
+    expires_at_ms: int | None = None
 
 
 T = TypeVar("T")
