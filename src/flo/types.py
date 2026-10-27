@@ -1048,7 +1048,7 @@ class WorkerDetails:
     shows it), the metadata it registered with, and its processes."""
 
     worker: WorkerInfo
-    metadata: str | None
+    metadata: bytes | None  # As registered; decode it if you know it is text
     processes: list[WorkerProcess]
 
 

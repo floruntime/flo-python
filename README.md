@@ -398,7 +398,8 @@ await client.worker.register(
 ```python
 # Its row (as client.worker.list shows it), its metadata and its processes
 info = await client.worker.info("worker-1")
-print(info.worker.status, info.worker.machine_id, info.metadata)
+print(info.worker.status, info.worker.machine_id)
+print(info.metadata)  # bytes as registered, or None; decode it if you know it's text
 for p in info.processes:  # p.kind: ProcessKind.ACTION or STREAM_CONSUMER
     print(p.name, p.kind.name, p.run_count, p.fail_count, p.last_run_at_ms)
 ```

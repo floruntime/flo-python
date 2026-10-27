@@ -26,7 +26,7 @@ async def test_info_shows_the_row_metadata_and_processes_registered(client: FloC
             WorkerStatus.ACTIVE,
         )
         assert (w.max_concurrency, w.machine_id) == (3, "m-py")
-        assert info.metadata == '{"zone": "a"}'
+        assert info.metadata == b'{"zone": "a"}'
         assert [(p.name, p.kind, p.run_count, p.fail_count) for p in info.processes] == [
             ("py-info-a", ProcessKind.ACTION, 0, 0),
             ("py-info-b", ProcessKind.ACTION, 0, 0),

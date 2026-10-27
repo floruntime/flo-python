@@ -567,7 +567,7 @@ def decode_worker_info_answer(data: bytes) -> WorkerDetails:
     op = "worker.info"
     a = _Answer(op, data)
     worker = _worker_row(a, op)
-    metadata = a.bytes16().decode("utf-8", errors="replace") if a.present() else None
+    metadata = a.bytes16() if a.present() else None
     count = a.u16()
     if count > MAX_WORKER_PROCESSES:
         raise IncompleteResponseError(f"{op} answer lists {count} processes")

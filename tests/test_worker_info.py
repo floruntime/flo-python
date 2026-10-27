@@ -52,7 +52,7 @@ def test_an_answer_with_metadata_and_a_process_of_each_kind() -> None:
     )
     assert (w.current_load, w.max_concurrency, w.tasks_completed, w.tasks_failed) == (2, 8, 40, 3)
     assert (w.registered_at_ms, w.last_heartbeat_ms, w.machine_id) == (1000, 2000, "m-1")
-    assert info.metadata == '{"v": 1}'
+    assert info.metadata == b'{"v": 1}'
     assert info.processes == [
         WorkerProcess(
             name="charge", kind=ProcessKind.ACTION, run_count=5, fail_count=1, last_run_at_ms=3000
@@ -72,6 +72,11 @@ def test_an_answer_with_no_metadata_and_no_processes() -> None:
     assert (info.worker.worker_id, info.worker.machine_id) == ("w-b", None)
     assert info.metadata is None
     assert info.processes == []
+
+
+def test_metadata_comes_back_as_the_bytes_registered_even_when_not_utf8() -> None:
+    answer = ROW + b"\x01" + struct.pack("<H", 2) + b"\xff\x00" + struct.pack("<H", 0)
+    assert decode_worker_info_answer(answer).metadata == b"\xff\x00"
 
 
 def test_an_unknown_process_kind_is_refused() -> None:
