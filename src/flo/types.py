@@ -18,7 +18,7 @@ VERSION: int = 0x03
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0x74E680EB8727C3FB
+TABLE_HASH: int = 0x505FDAA07E866B96
 
 
 class Reason(IntEnum):
@@ -1022,6 +1022,34 @@ class WorkerInfo:
     registered_at_ms: int
     last_heartbeat_ms: int
     machine_id: str | None = None
+
+
+class ProcessKind(IntEnum):
+    """What a process on a worker runs."""
+
+    ACTION = 0
+    STREAM_CONSUMER = 1
+
+
+@dataclass
+class WorkerProcess:
+    """One process a worker registered, with its counts. Times are ms since the epoch."""
+
+    name: str
+    kind: ProcessKind
+    run_count: int
+    fail_count: int
+    last_run_at_ms: int
+
+
+@dataclass
+class WorkerDetails:
+    """A worker's record, as worker.info answers it: its row (as worker.list
+    shows it), the metadata it registered with, and its processes."""
+
+    worker: WorkerInfo
+    metadata: str | None
+    processes: list[WorkerProcess]
 
 
 @dataclass

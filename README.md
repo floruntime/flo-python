@@ -393,6 +393,18 @@ await client.worker.register(
 )
 ```
 
+### Inspect a Worker
+
+```python
+# Its row (as client.worker.list shows it), its metadata and its processes
+info = await client.worker.info("worker-1")
+print(info.worker.status, info.worker.machine_id, info.metadata)
+for p in info.processes:  # p.kind: ProcessKind.ACTION or STREAM_CONSUMER
+    print(p.name, p.kind.name, p.run_count, p.fail_count, p.last_run_at_ms)
+```
+
+The server allows at most 1024 processes per worker and refuses a registration past its limits; the refusal comes back as a `BadRequestError` carrying its reason and message.
+
 ### Await and Process Tasks
 
 ```python

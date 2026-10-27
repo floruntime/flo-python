@@ -21,12 +21,15 @@ from .types import (
     GetResult,
     MGetEntry,
     OpCode,
+    ProcessKind,
     PutOptions,
     PutResult,
     RunStatus,
     VersionEntry,
     WaitFor,
+    WorkerDetails,
     WorkerInfo,
+    WorkerProcess,
     WorkerStatus,
     WorkerType,
 )
@@ -43,6 +46,7 @@ MAX_MGET = 256
 MAX_MGET_KEYS_BYTES = 253_848
 MAX_HISTORY = 65
 MAX_WORKER_LIST = 1024
+MAX_WORKER_PROCESSES = 1024
 _MAX_WORKER_ID = 4096
 # The longest TTL whose nanoseconds fit a u64.
 MAX_TTL_MS = 18_446_744_073_709
@@ -69,6 +73,7 @@ _TABLE_OPS = frozenset(
         OpCode.KV_EXISTS,
         OpCode.ACTION_STATUS,
         OpCode.WORKER_LIST,
+        OpCode.WORKER_INFO,
     }
 )
 
@@ -507,7 +512,7 @@ def decode_action_invoke_answer(data: bytes) -> str:
     return run_id.decode("utf-8")
 
 
-_E = TypeVar("_E", WorkerType, WorkerStatus)
+_E = TypeVar("_E", WorkerType, WorkerStatus, ProcessKind)
 
 
 def _enum8(a: _Answer, op: str, kind: type[_E]) -> _E:
@@ -520,6 +525,29 @@ def _enum8(a: _Answer, op: str, kind: type[_E]) -> _E:
         ) from None
 
 
+def _worker_row(a: _Answer, op: str) -> WorkerInfo:
+    """A worker's row, as worker.list and worker.info both answer it."""
+    worker_id = a.bytes16().decode("utf-8", errors="replace")
+    worker_type = _enum8(a, op, WorkerType)
+    status = _enum8(a, op, WorkerStatus)
+    current_load, max_concurrency = a.u32(), a.u32()
+    tasks_completed, tasks_failed = a.u64(), a.u64()
+    registered_at_ms, last_heartbeat_ms = a.i64(), a.i64()
+    machine_id = a.bytes8().decode("utf-8", errors="replace") if a.present() else None
+    return WorkerInfo(
+        worker_id=worker_id,
+        worker_type=worker_type,
+        status=status,
+        current_load=current_load,
+        max_concurrency=max_concurrency,
+        tasks_completed=tasks_completed,
+        tasks_failed=tasks_failed,
+        registered_at_ms=registered_at_ms,
+        last_heartbeat_ms=last_heartbeat_ms,
+        machine_id=machine_id,
+    )
+
+
 def decode_worker_list_answer(data: bytes) -> tuple[list[WorkerInfo], bytes | None]:
     """worker.list's answer: workers in id order, then the next page's cursor
     (None on the last page)."""
@@ -528,29 +556,33 @@ def decode_worker_list_answer(data: bytes) -> tuple[list[WorkerInfo], bytes | No
     count = a.u16()
     if count > MAX_WORKER_LIST:
         raise IncompleteResponseError(f"{op} answer lists {count} workers")
-    workers = []
-    for _ in range(count):
-        worker_id = a.bytes16().decode("utf-8", errors="replace")
-        worker_type = _enum8(a, op, WorkerType)
-        status = _enum8(a, op, WorkerStatus)
-        current_load, max_concurrency = a.u32(), a.u32()
-        tasks_completed, tasks_failed = a.u64(), a.u64()
-        registered_at_ms, last_heartbeat_ms = a.i64(), a.i64()
-        machine_id = a.bytes8().decode("utf-8", errors="replace") if a.present() else None
-        workers.append(
-            WorkerInfo(
-                worker_id=worker_id,
-                worker_type=worker_type,
-                status=status,
-                current_load=current_load,
-                max_concurrency=max_concurrency,
-                tasks_completed=tasks_completed,
-                tasks_failed=tasks_failed,
-                registered_at_ms=registered_at_ms,
-                last_heartbeat_ms=last_heartbeat_ms,
-                machine_id=machine_id,
-            )
-        )
+    workers = [_worker_row(a, op) for _ in range(count)]
     cursor = a.bytes16() if a.present() else None
     a.done()
     return workers, cursor
+
+
+def decode_worker_info_answer(data: bytes) -> WorkerDetails:
+    """worker.info's answer: the worker's row, its metadata, its processes."""
+    op = "worker.info"
+    a = _Answer(op, data)
+    worker = _worker_row(a, op)
+    metadata = a.bytes16().decode("utf-8", errors="replace") if a.present() else None
+    count = a.u16()
+    if count > MAX_WORKER_PROCESSES:
+        raise IncompleteResponseError(f"{op} answer lists {count} processes")
+    processes = []
+    for _ in range(count):
+        name = a.bytes16().decode("utf-8", errors="replace")
+        kind = _enum8(a, op, ProcessKind)
+        processes.append(
+            WorkerProcess(
+                name=name,
+                kind=kind,
+                run_count=a.u64(),
+                fail_count=a.u64(),
+                last_run_at_ms=a.i64(),
+            )
+        )
+    a.done()
+    return WorkerDetails(worker=worker, metadata=metadata, processes=processes)
