@@ -324,6 +324,10 @@ class _RegisteredWorker:
             status = await client.worker.heartbeat(self._worker_id, current_load=load)
         except NotFoundError:
             logger.warning("Worker was removed by the server; registering again")
+            # Only worker.register: the server keeps it in memory, not in the
+            # log, so it can't come back outcome_pending or halt a shard, and
+            # sending it again is safe. action.register, a logged write, is
+            # sent only from start().
             await self._register(client)
             if self._drain_event.is_set():
                 self._notice_due = True
@@ -883,10 +887,13 @@ class ActionWorker(_RegisteredWorker):
         failed = _worker_backoff()
         halted = _halted_backoff()
         while not leave.is_set():
+            # Whether this pass holds a slot: exactly one place releases it.
+            held = False
             try:
                 # Wait for a slot; a stop or drain ends the wait.
                 if not await _acquire_unless_set(self._semaphore, leave):
                     break
+                held = True
 
                 # Await task from server
                 started = loop.time()
@@ -901,20 +908,25 @@ class ActionWorker(_RegisteredWorker):
 
                 if result.task is None:
                     # No task available, release semaphore and continue
+                    held = False
                     self._semaphore.release()
                     await backoff.empty(loop.time() - started)
                     continue
                 backoff.reset()
 
-                # Execute task in background
+                # Execute task in background; it releases the slot.
+                held = False
                 task = asyncio.create_task(self._execute_task(result.task))
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)
 
             except asyncio.CancelledError:
-                break
+                if held:
+                    self._semaphore.release()
+                raise
             except Exception as e:
-                self._semaphore.release()
+                if held:
+                    self._semaphore.release()
                 reason = e.reason if isinstance(e, ServerError) else None
                 if reason == Reason.WORKER_DRAINING:
                     # The server drained this worker: take no more work, and
@@ -958,7 +970,8 @@ class ActionWorker(_RegisteredWorker):
                                 await self._reconnect_result_client(only_if_down=True)
                             except Exception as rc_err:
                                 logger.warning(f"Failed to reconnect result client: {rc_err}")
-                        # Re-register worker after reconnect
+                        # Re-register worker after reconnect: worker.register
+                        # only, safe to repeat (see _heartbeat).
                         try:
                             await self._register(self._client)
                         except Exception as reg_err:
@@ -1480,10 +1493,13 @@ class StreamWorker(_RegisteredWorker):
         halted = _halted_backoff()
 
         while not leave.is_set():
+            # Whether this pass holds a slot: exactly one place releases it.
+            held = False
             try:
                 # Wait for a slot; a stop or drain ends the wait.
                 if not await _acquire_unless_set(self._semaphore, leave):
                     break
+                held = True
 
                 started = loop.time()
                 result = await self._client.stream.group_read(
@@ -1499,6 +1515,7 @@ class StreamWorker(_RegisteredWorker):
                 halted.reset()
 
                 if not result.records:
+                    held = False
                     self._semaphore.release()
                     await backoff.empty(loop.time() - started)
                     continue
@@ -1506,6 +1523,7 @@ class StreamWorker(_RegisteredWorker):
 
                 # Release semaphore before dispatching — each task will
                 # acquire its own slot via _process_record.
+                held = False
                 self._semaphore.release()
 
                 # A drain handles the whole batch, already delivered here; a
@@ -1515,9 +1533,12 @@ class StreamWorker(_RegisteredWorker):
                     return
 
             except asyncio.CancelledError:
-                break
+                if held:
+                    self._semaphore.release()
+                raise
             except Exception as e:
-                self._semaphore.release()
+                if held:
+                    self._semaphore.release()
                 if leave.is_set():
                     # A stop or drain interrupted the read. Reconnecting would
                     # also reconnect the ack connection under the handlers.

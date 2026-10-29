@@ -400,6 +400,16 @@ async def test_exists(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls[0][3] == H("0000")
 
 
+async def test_an_exists_result_is_truthy_only_when_the_key_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = _client(monkeypatch, _ok("010500000000000000"), _ok("000000000000000000"))
+    # `if await kv.exists(key):` keeps meaning what it did when exists was a bool.
+    assert await client.kv.exists("k")
+    assert not await client.kv.exists("k")
+    assert bool(ExistsResult(exists=False, version=7, stale=True)) is False
+
+
 async def test_json_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     client, calls = _client(
         monkeypatch,

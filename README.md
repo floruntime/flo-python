@@ -163,7 +163,7 @@ await client.kv.expire("lease", 30_000, KVExpireOptions(cas_version=lease_versio
 await client.kv.expire("session:abc", 0)
 
 res = await client.kv.exists("session:abc")
-if res.exists:
+if res:  # truthy when the key exists; res.exists says the same
     print(res.version)
 ```
 
@@ -653,7 +653,11 @@ registration at start and poll, and a stream worker's group join, keep
 trying, waiting from 100 ms up to 30 s, logging each refusal at
 warning with the server's message. A worker started during a halt comes up,
 and one running through it resumes, by itself once the shard is repaired; no
-restart is needed.
+restart is needed. They wait only on a write the shard refused without running it
+(`UNAVAILABLE`, ran `NO`); an `OutcomePendingError` (an action registration or
+group join that committed but hasn't applied) ends `start()` after one try,
+with the server's message, since sending it again could halt the shard again.
+Results and acks the shard refuses are not resent.
 
 ```python
 from flo import FloClient, RetryPolicy

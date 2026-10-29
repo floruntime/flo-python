@@ -86,9 +86,16 @@ def is_refused_unrun(exc: BaseException) -> bool:
 
 
 def is_shard_halted(exc: BaseException) -> bool:
-    """Whether exc says the shard halted: it takes no writes until an
-    operator repairs it."""
-    return isinstance(exc, ServerError) and exc.reason == Reason.SHARD_HALTED
+    """Whether exc is a write a halted shard refused without running it: it
+    takes no writes until an operator repairs it, and asking again then is
+    safe. Not outcome_pending (same reason): that write committed, and
+    resending it would write it twice or halt the shard again."""
+    return (
+        isinstance(exc, ServerError)
+        and exc.status_code == StatusCode.UNAVAILABLE
+        and exc.ran == Ran.NO
+        and exc.reason == Reason.SHARD_HALTED
+    )
 
 
 class _Backoff:

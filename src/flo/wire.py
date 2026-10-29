@@ -19,6 +19,7 @@ from .exceptions import (
     InvalidMagicError,
     KeyTooLargeError,
     NamespaceTooLargeError,
+    ProtocolError,
     TableMismatchError,
     ValidationError,
     ValueTooLargeError,
@@ -27,6 +28,7 @@ from .kv_body import is_table_op
 from .types import (
     HEADER_SIZE,
     MAGIC,
+    MAX_ANSWER_BYTES,
     MAX_BLOCK_MS,
     MAX_KEY_SIZE,
     MAX_NAMESPACE_SIZE,
@@ -333,6 +335,7 @@ def parse_response_header(data: bytes) -> tuple[StatusCode, int, int, int, bool]
     Raises:
         IncompleteResponseError: If data is too short, or a flag bit is set
             that this SDK doesn't know.
+        ProtocolError: If the answer says it is longer than a server sends.
         InvalidMagicError: If magic number is invalid.
         TableMismatchError: If the server was built from another protocol
             version or op table; its body can't be read.
@@ -349,6 +352,12 @@ def parse_response_header(data: bytes) -> tuple[StatusCode, int, int, int, bool]
 
     if version != VERSION or table_hash != TABLE_HASH:
         raise TableMismatchError(version, table_hash)
+
+    if data_len > MAX_ANSWER_BYTES - HEADER_SIZE:
+        raise ProtocolError(
+            f"Answer of {data_len} bytes is past the largest a server sends "
+            f"({MAX_ANSWER_BYTES - HEADER_SIZE})"
+        )
 
     if flags & ~RESPONSE_STALE:
         raise IncompleteResponseError(f"Response has unknown flags 0x{flags:02X}")

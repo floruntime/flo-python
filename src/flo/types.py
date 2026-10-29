@@ -93,6 +93,8 @@ class Ran(IntEnum):
 
 
 HEADER_SIZE: int = 32
+# The most an answer frame holds, header included; a server never sends more.
+MAX_ANSWER_BYTES: int = 256 * 1024
 
 # Size limits (for client-side validation)
 MAX_NAMESPACE_SIZE: int = 255
@@ -399,6 +401,10 @@ class ExistsResult:
     version: int
     # Read from a halted shard's state just before the entry it halted at.
     stale: bool = False
+
+    def __bool__(self) -> bool:
+        # So `if await kv.exists(key):` still reads whether the key exists.
+        return self.exists
 
 
 @dataclass
