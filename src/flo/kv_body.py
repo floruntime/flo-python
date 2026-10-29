@@ -17,16 +17,20 @@ from .types import (
     MAX_WAIT_MS,
     ActionRunStatus,
     Condition,
+    ExistsResult,
     GetOptions,
     GetResult,
     MGetEntry,
     OpCode,
+    ProcessKind,
     PutOptions,
     PutResult,
     RunStatus,
     VersionEntry,
     WaitFor,
+    WorkerDetails,
     WorkerInfo,
+    WorkerProcess,
     WorkerStatus,
     WorkerType,
 )
@@ -43,6 +47,7 @@ MAX_MGET = 256
 MAX_MGET_KEYS_BYTES = 253_848
 MAX_HISTORY = 65
 MAX_WORKER_LIST = 1024
+MAX_WORKER_PROCESSES = 1024
 _MAX_WORKER_ID = 4096
 # The longest TTL whose nanoseconds fit a u64.
 MAX_TTL_MS = 18_446_744_073_709
@@ -69,6 +74,7 @@ _TABLE_OPS = frozenset(
         OpCode.KV_EXISTS,
         OpCode.ACTION_STATUS,
         OpCode.WORKER_LIST,
+        OpCode.WORKER_INFO,
     }
 )
 
@@ -175,9 +181,13 @@ def encode_scan_body(limit: int, cursor: bytes | None) -> bytes:
     return _limit("scan limit", limit, MAX_SCAN) + bytes([len(cursor)]) + cursor
 
 
-def encode_history_body(limit: int, routing_key: str | None) -> bytes:
-    """kv.history's request: limit, routing_key."""
-    return _limit("history limit", limit, MAX_HISTORY) + _routing_key(routing_key)
+def encode_history_body(limit: int, before_version: int | None, routing_key: str | None) -> bytes:
+    """kv.history's request: limit, before_version, routing_key."""
+    return (
+        _limit("history limit", limit, MAX_HISTORY)
+        + _opt_u64("before_version", before_version)
+        + _routing_key(routing_key)
+    )
 
 
 def encode_mget_body(keys: Sequence[bytes], routing_key: str | None = None) -> bytes:
@@ -253,10 +263,13 @@ def encode_json_del_body(path: str | None, routing_key: str | None) -> bytes:
     return _path(path) + _routing_key(routing_key)
 
 
-def encode_worker_list_body(limit: int, cursor: bytes | None) -> bytes:
-    """worker.list's request: limit, cursor (empty starts)."""
-    return _limit("limit", limit, MAX_WORKER_LIST) + _bytes16(
-        "cursor", cursor or b"", _MAX_WORKER_ID
+def encode_worker_list_body(limit: int, cursor: bytes | None, action: str | None = None) -> bytes:
+    """worker.list's request: limit, cursor (empty starts), action (empty for
+    every worker)."""
+    return (
+        _limit("limit", limit, MAX_WORKER_LIST)
+        + _bytes16("cursor", cursor or b"", _MAX_WORKER_ID)
+        + _bytes16("action", (action or "").encode("utf-8"), _MAX_WORKER_ID)
     )
 
 
@@ -325,12 +338,13 @@ class _Answer:
 
 
 def decode_get_answer(data: bytes) -> GetResult:
-    """kv.get's answer: version, value."""
+    """kv.get's answer: version, value, expires_at_ms (absent with no TTL)."""
     a = _Answer("kv.get", data)
     version = a.u64()
     value = a.bytes32()
+    expires_at_ms = a.i64() if a.present() else None
     a.done()
-    return GetResult(value=value, version=version)
+    return GetResult(value=value, version=version, expires_at_ms=expires_at_ms)
 
 
 def decode_set_answer(data: bytes) -> PutResult:
@@ -361,14 +375,17 @@ def decode_scan_answer(data: bytes) -> tuple[list[str], bytes | None]:
     return names, cursor
 
 
-def decode_history_answer(data: bytes) -> list[VersionEntry]:
-    """kv.history's answer: versions, newest first."""
+def decode_history_answer(data: bytes) -> tuple[list[VersionEntry], bool]:
+    """kv.history's answer: versions, newest first, then whether older kept
+    versions follow."""
     a = _Answer("kv.history", data)
     versions = [
-        VersionEntry(version=a.u64(), at_ms=a.i64(), value=a.bytes32()) for _ in range(a.u8())
+        VersionEntry(version=a.u64(), at_ms=a.i64(), deleted=a.flag(), value=a.bytes32())
+        for _ in range(a.u8())
     ]
+    more = a.flag()
     a.done()
-    return versions
+    return versions, more
 
 
 def decode_mget_answer(data: bytes, keys: Sequence[str]) -> tuple[list[MGetEntry], int | None]:
@@ -410,13 +427,13 @@ def decode_empty_answer(op: str, data: bytes) -> None:
     _Answer(op, data).done()
 
 
-def decode_exists_answer(data: bytes) -> tuple[bool, int]:
+def decode_exists_answer(data: bytes) -> ExistsResult:
     """kv.exists's answer: exists, version (0 when absent or buffered in a transaction)."""
     a = _Answer("kv.exists", data)
     exists = a.flag()
     version = a.u64()
     a.done()
-    return exists, version
+    return ExistsResult(exists=exists, version=version)
 
 
 def decode_json_get_answer(data: bytes) -> tuple[int, bytes]:
@@ -505,7 +522,7 @@ def decode_action_invoke_answer(data: bytes) -> str:
     return run_id.decode("utf-8")
 
 
-_E = TypeVar("_E", WorkerType, WorkerStatus)
+_E = TypeVar("_E", WorkerType, WorkerStatus, ProcessKind)
 
 
 def _enum8(a: _Answer, op: str, kind: type[_E]) -> _E:
@@ -518,6 +535,29 @@ def _enum8(a: _Answer, op: str, kind: type[_E]) -> _E:
         ) from None
 
 
+def _worker_row(a: _Answer, op: str) -> WorkerInfo:
+    """A worker's row, as worker.list and worker.info both answer it."""
+    worker_id = a.bytes16().decode("utf-8", errors="replace")
+    worker_type = _enum8(a, op, WorkerType)
+    status = _enum8(a, op, WorkerStatus)
+    current_load, max_concurrency = a.u32(), a.u32()
+    tasks_completed, tasks_failed = a.u64(), a.u64()
+    registered_at_ms, last_heartbeat_ms = a.i64(), a.i64()
+    machine_id = a.bytes8().decode("utf-8", errors="replace") if a.present() else None
+    return WorkerInfo(
+        worker_id=worker_id,
+        worker_type=worker_type,
+        status=status,
+        current_load=current_load,
+        max_concurrency=max_concurrency,
+        tasks_completed=tasks_completed,
+        tasks_failed=tasks_failed,
+        registered_at_ms=registered_at_ms,
+        last_heartbeat_ms=last_heartbeat_ms,
+        machine_id=machine_id,
+    )
+
+
 def decode_worker_list_answer(data: bytes) -> tuple[list[WorkerInfo], bytes | None]:
     """worker.list's answer: workers in id order, then the next page's cursor
     (None on the last page)."""
@@ -526,29 +566,33 @@ def decode_worker_list_answer(data: bytes) -> tuple[list[WorkerInfo], bytes | No
     count = a.u16()
     if count > MAX_WORKER_LIST:
         raise IncompleteResponseError(f"{op} answer lists {count} workers")
-    workers = []
-    for _ in range(count):
-        worker_id = a.bytes16().decode("utf-8", errors="replace")
-        worker_type = _enum8(a, op, WorkerType)
-        status = _enum8(a, op, WorkerStatus)
-        current_load, max_concurrency = a.u32(), a.u32()
-        tasks_completed, tasks_failed = a.u64(), a.u64()
-        registered_at_ms, last_heartbeat_ms = a.i64(), a.i64()
-        machine_id = a.bytes8().decode("utf-8", errors="replace") if a.present() else None
-        workers.append(
-            WorkerInfo(
-                worker_id=worker_id,
-                worker_type=worker_type,
-                status=status,
-                current_load=current_load,
-                max_concurrency=max_concurrency,
-                tasks_completed=tasks_completed,
-                tasks_failed=tasks_failed,
-                registered_at_ms=registered_at_ms,
-                last_heartbeat_ms=last_heartbeat_ms,
-                machine_id=machine_id,
-            )
-        )
+    workers = [_worker_row(a, op) for _ in range(count)]
     cursor = a.bytes16() if a.present() else None
     a.done()
     return workers, cursor
+
+
+def decode_worker_info_answer(data: bytes) -> WorkerDetails:
+    """worker.info's answer: the worker's row, its metadata, its processes."""
+    op = "worker.info"
+    a = _Answer(op, data)
+    worker = _worker_row(a, op)
+    metadata = a.bytes16() if a.present() else None
+    count = a.u16()
+    if count > MAX_WORKER_PROCESSES:
+        raise IncompleteResponseError(f"{op} answer lists {count} processes")
+    processes = []
+    for _ in range(count):
+        name = a.bytes16().decode("utf-8", errors="replace")
+        kind = _enum8(a, op, ProcessKind)
+        processes.append(
+            WorkerProcess(
+                name=name,
+                kind=kind,
+                run_count=a.u64(),
+                fail_count=a.u64(),
+                last_run_at_ms=a.i64(),
+            )
+        )
+    a.done()
+    return WorkerDetails(worker=worker, metadata=metadata, processes=processes)

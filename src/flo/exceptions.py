@@ -101,7 +101,7 @@ class TableMismatchError(ProtocolError):
 
 
 class InvalidChecksumError(ProtocolError):
-    """CRC32 checksum validation failed."""
+    """A frame's CRC32C checksum didn't match."""
 
     pass
 
@@ -166,6 +166,9 @@ class ServerError(FloError):
     reason: Reason = Reason.UNCLASSIFIED
     # Whether the request took effect; unknown unless the server said.
     ran: Ran = Ran.UNKNOWN
+    # A halted shard answered, from its state just before the entry it
+    # halted at.
+    stale: bool = False
 
     def __init__(self, message: str, status_code: StatusCode):
         super().__init__(message)
@@ -177,6 +180,15 @@ class NotFoundError(ServerError):
 
     def __init__(self, message: str = "Not found"):
         super().__init__(message, StatusCode.NOT_FOUND)
+
+
+class StaleNotFoundError(NotFoundError):
+    """A halted shard didn't have the key, as of the entry it halted at
+    (``stale`` is True). It may exist since: a write after the halt hasn't
+    applied. kv.get and kv.json_get raise it rather than report the key
+    absent."""
+
+    stale = True
 
 
 class BadRequestError(ServerError):
@@ -218,11 +230,23 @@ class UnavailableError(ServerError):
     """No leader, or the shard isn't taking writes or is offline. Retryable.
 
     The message says why; an offline shard stays unavailable until an
-    operator acts, so whether and when to retry is the caller's call.
+    operator acts, so whether and when to retry is the caller's call. With
+    reason SHARD_HALTED the shard halted and takes no writes until an
+    operator repairs it; the client doesn't retry that one.
     """
 
     def __init__(self, message: str = StatusCode.UNAVAILABLE.message()):
         super().__init__(message, StatusCode.UNAVAILABLE)
+
+
+class OutcomePendingError(ServerError):
+    """The write committed but hasn't applied: its shard halted at or before
+    it (reason SHARD_HALTED, ran UNKNOWN). The message says whether it
+    applies when the shard resumes. Never retried: resending it would write
+    it twice, or halt again."""
+
+    def __init__(self, message: str = StatusCode.OUTCOME_PENDING.message()):
+        super().__init__(message, StatusCode.OUTCOME_PENDING)
 
 
 class InternalServerError(ServerError):
@@ -292,6 +316,7 @@ def _error_for(status: StatusCode, message: str) -> ServerError:
         StatusCode.UNAUTHORIZED: UnauthorizedError,
         StatusCode.OVERLOADED: OverloadedError,
         StatusCode.UNAVAILABLE: UnavailableError,
+        StatusCode.OUTCOME_PENDING: OutcomePendingError,
         StatusCode.RATE_LIMITED: RateLimitedError,
         StatusCode.INTERNAL_ERROR: InternalServerError,
         StatusCode.ERROR_GENERIC: GenericServerError,

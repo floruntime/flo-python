@@ -7,7 +7,7 @@ import random
 from dataclasses import dataclass
 
 from .exceptions import ServerError, raise_for_status
-from .types import Ran, StatusCode
+from .types import Ran, Reason, StatusCode
 
 _RETRYABLE = (StatusCode.OVERLOADED, StatusCode.UNAVAILABLE)
 
@@ -19,7 +19,9 @@ class RetryPolicy:
     Only a refusal whose status is overloaded or unavailable and whose ``ran``
     is ``Ran.NO`` is retried: the server says it never ran, so resending is
     safe for any operation, writes included. Each retry is a new request with
-    a new id; the server routes it afresh.
+    a new id; the server routes it afresh. Unavailable with reason
+    SHARD_HALTED is not retried: the shard takes no writes until an operator
+    repairs it. Neither is outcome_pending: that write committed.
 
     Attributes:
         max_attempts: Tries in all, the first included; 1 (or less) turns
@@ -71,7 +73,7 @@ def _refused_unrun(status: StatusCode, data: bytes) -> bool:
     try:
         raise_for_status(status, data)
     except ServerError as e:
-        return e.ran == Ran.NO
+        return e.ran == Ran.NO and e.reason != Reason.SHARD_HALTED
     except Exception:
         return False
     return False
@@ -81,6 +83,19 @@ def is_refused_unrun(exc: BaseException) -> bool:
     """Whether exc is a refusal the server says it didn't run, of a kind worth
     trying again later."""
     return isinstance(exc, ServerError) and exc.status_code in _RETRYABLE and exc.ran == Ran.NO
+
+
+def is_shard_halted(exc: BaseException) -> bool:
+    """Whether exc is a write a halted shard refused without running it: it
+    takes no writes until an operator repairs it, and asking again then is
+    safe. Not outcome_pending (same reason): that write committed, and
+    resending it would write it twice or halt the shard again."""
+    return (
+        isinstance(exc, ServerError)
+        and exc.status_code == StatusCode.UNAVAILABLE
+        and exc.ran == Ran.NO
+        and exc.reason == Reason.SHARD_HALTED
+    )
 
 
 class _Backoff:
@@ -112,10 +127,17 @@ def _policy_backoff(policy: RetryPolicy) -> _Backoff:
 # the bottom after a poll that succeeds.
 _WORKER_INITIAL_BACKOFF_S = 0.1
 _WORKER_MAX_BACKOFF_S = 5.0
+# A halted shard stays halted until an operator repairs it, so a worker asks
+# again less often; it resumes on its own once the shard does.
+_HALTED_MAX_BACKOFF_S = 30.0
 
 
 def _worker_backoff() -> _Backoff:
     return _Backoff(_WORKER_INITIAL_BACKOFF_S, _WORKER_MAX_BACKOFF_S)
+
+
+def _halted_backoff() -> _Backoff:
+    return _Backoff(_WORKER_INITIAL_BACKOFF_S, _HALTED_MAX_BACKOFF_S)
 
 
 async def _sleep_unless_stopped(stop: asyncio.Event, seconds: float) -> None:

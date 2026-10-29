@@ -20,7 +20,18 @@ from flo import (
 from flo import kv_body as kb
 from flo.exceptions import IncompleteResponseError, NotFoundError, ValidationError
 from flo.kv_txn import Transaction, begin
-from flo.types import HEADER_SIZE, MGetEntry, OpCode, Ran, Reason, StatusCode, VersionEntry
+from flo.types import (
+    HEADER_SIZE,
+    ExistsResult,
+    GetResult,
+    HistoryResult,
+    MGetEntry,
+    OpCode,
+    Ran,
+    Reason,
+    StatusCode,
+    VersionEntry,
+)
 from flo.wire import RawResponse, serialize_request
 
 Call = tuple[OpCode, str, bytes, bytes, bytes]
@@ -74,8 +85,8 @@ H = bytes.fromhex
 def test_request_bodies_match_the_servers_schemas() -> None:
     assert kb.encode_delete_body(7, "rk", None) == H("010700000000000000010200726b00")
     assert kb.encode_scan_body(2, b"c1") == H("0102000000026331")
-    assert kb.encode_history_body(2, None) == H("010200000000")
-    assert kb.encode_history_body(2, "rk") == H("0102000000010200726b")
+    assert kb.encode_history_body(2, None, None) == H("01020000000000")
+    assert kb.encode_history_body(2, 7, "rk") == H("0102000000010700000000000000010200726b")
     assert kb.encode_mget_body([b"a", b"b"]) == H("020001006101006200")
     assert kb.encode_mget_body([b"a", b"b"], "rk") == H("0200010061010062010200726b")
     assert kb.encode_incr_body(-5, None, 9) == H("01fbffffffffffffff00010900000000000000")
@@ -92,9 +103,10 @@ def test_answers_match_the_servers_schemas() -> None:
     assert kb.decode_delete_answer(H("00")) is None
     assert kb.decode_scan_answer(H("02000100610200626201026332")) == (["a", "bb"], b"c2")
     assert kb.decode_scan_answer(H("000000")) == ([], None)
-    assert kb.decode_history_answer(H("010300000000000000e803000000000000020000007633")) == [
-        VersionEntry(version=3, at_ms=1000, value=b"v3")
-    ]
+    assert kb.decode_history_answer(H("010300000000000000e8030000000000000002000000763301")) == (
+        [VersionEntry(version=3, at_ms=1000, deleted=False, value=b"v3")],
+        True,
+    )
     # next 2 of two keys asked: all were answered.
     assert kb.decode_mget_answer(
         H("0200010200000000000000010000007800000000000000000000000000010200"), ["a", "b"]
@@ -108,13 +120,69 @@ def test_answers_match_the_servers_schemas() -> None:
     assert kb.decode_incr_answer(H("010400000000000000012a00000000000000")) == (4, 42)
     assert kb.decode_incr_answer(H("0000")) == (None, None)
     kb.decode_empty_answer("kv.expire", b"")
-    assert kb.decode_exists_answer(H("010500000000000000")) == (True, 5)
+    assert kb.decode_exists_answer(H("010500000000000000")) == ExistsResult(exists=True, version=5)
     assert kb.decode_json_get_answer(H("0300000000000000020000007b7d")) == (3, b"{}")
     assert kb.decode_json_set_answer(H("0300000000000000")) == 3
     assert kb.decode_json_del_answer(H("00")) is None
     assert kb.decode_txn_begin_answer(H("01000000000000000200000000000000")) == (1, 2)
     assert kb.decode_txn_commit_answer(H("0a000000000000000200")) == (10, 2)
     kb.decode_empty_answer("kv.txn_rollback", b"")
+
+
+def test_get_answer_carries_expiry_when_the_key_has_a_ttl() -> None:
+    assert kb.decode_get_answer(H("030000000000000002000000763300")) == GetResult(
+        value=b"v3", version=3, expires_at_ms=None
+    )
+    assert kb.decode_get_answer(H("030000000000000002000000763301e803000000000000")) == GetResult(
+        value=b"v3", version=3, expires_at_ms=1000
+    )
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "030000000000000002000000763302e803000000000000",  # presence byte not 0 or 1
+        "030000000000000002000000763301e8030000",  # cut inside the i64
+        "0300000000000000020000007633",  # no presence byte
+        "03000000000000000200000076330000",  # trailing byte
+    ],
+)
+def test_a_malformed_get_answer_is_refused(answer: str) -> None:
+    with pytest.raises(IncompleteResponseError):
+        kb.decode_get_answer(H(answer))
+
+
+def test_history_marks_a_deleted_version() -> None:
+    # Newest first: v3 set, v2 deleted (empty value), v1 set.
+    answer = (
+        "03"
+        "0300000000000000"
+        "e803000000000000"
+        "00"
+        "020000007633"
+        "0200000000000000"
+        "e703000000000000"
+        "01"
+        "00000000"
+        "0100000000000000"
+        "e603000000000000"
+        "00"
+        "020000007631"
+        "00"  # more
+    )
+    assert kb.decode_history_answer(H(answer)) == (
+        [
+            VersionEntry(version=3, at_ms=1000, deleted=False, value=b"v3"),
+            VersionEntry(version=2, at_ms=999, deleted=True, value=b""),
+            VersionEntry(version=1, at_ms=998, deleted=False, value=b"v1"),
+        ],
+        False,
+    )
+
+
+def test_a_history_entry_with_a_bad_deleted_byte_is_refused() -> None:
+    with pytest.raises(IncompleteResponseError):
+        kb.decode_history_answer(H("010300000000000000e8030000000000000202000000763300"))
 
 
 def test_mget_golden_answer_with_next() -> None:
@@ -139,6 +207,9 @@ def test_mget_golden_answer_with_next() -> None:
         (kb.decode_scan_answer, "0200010061"),
         (kb.decode_scan_answer, "00000000"),
         (kb.decode_history_answer, "0103000000000000"),
+        (kb.decode_history_answer, "00"),  # no more
+        (kb.decode_history_answer, "0002"),  # more not 0 or 1
+        (kb.decode_history_answer, "000000"),  # trailing byte
         (kb.decode_incr_answer, "00"),
         (kb.decode_incr_answer, "000000"),
         (kb.decode_exists_answer, "01050000000000000000"),
@@ -196,14 +267,16 @@ async def test_scan_sends_the_prefix_as_key_and_pages_by_cursor(
 
 
 async def test_history_carries_each_versions_time(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, calls = _client(monkeypatch, _ok("010300000000000000e803000000000000020000007633"))
-    assert await client.kv.history("k", HistoryOptions(limit=2)) == [
-        VersionEntry(version=3, at_ms=1000, value=b"v3")
-    ]
-    await client.kv.history("k", HistoryOptions(routing_key="rk"))
+    client, calls = _client(monkeypatch, _ok("010300000000000000e8030000000000000002000000763301"))
+    assert await client.kv.history("k", HistoryOptions(limit=2)) == HistoryResult(
+        versions=[VersionEntry(version=3, at_ms=1000, deleted=False, value=b"v3")],
+        more=True,
+        stale=False,
+    )
+    await client.kv.history("k", HistoryOptions(routing_key="rk", before_version=3))
     assert [c[3] for c in calls] == [
-        H("010200000000"),
-        b"\x01" + struct.pack("<I", 10) + H("010200726b"),
+        H("01020000000000"),
+        b"\x01" + struct.pack("<I", 10) + b"\x01" + struct.pack("<Q", 3) + H("010200726b"),
     ]
 
 
@@ -211,7 +284,7 @@ async def test_history_of_a_missing_key_is_empty_and_other_not_founds_raise(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, _ = _client(monkeypatch, _refused(StatusCode.NOT_FOUND, Reason.NOT_FOUND))
-    assert await client.kv.history("missing") == []
+    assert await client.kv.history("missing") == HistoryResult(versions=[], more=False)
     client, _ = _client(monkeypatch, _refused(StatusCode.NOT_FOUND, Reason.NO_SUCH_TRANSACTION))
     with pytest.raises(NotFoundError):
         await client.kv.history("k")
@@ -322,9 +395,19 @@ async def test_expire_sends_cas_and_routing_key(monkeypatch: pytest.MonkeyPatch)
 
 async def test_exists(monkeypatch: pytest.MonkeyPatch) -> None:
     client, calls = _client(monkeypatch, _ok("010500000000000000"), _ok("000000000000000000"))
-    assert await client.kv.exists("k") is True
-    assert await client.kv.exists("k") is False
+    assert await client.kv.exists("k") == ExistsResult(exists=True, version=5)
+    assert await client.kv.exists("k") == ExistsResult(exists=False, version=0)
     assert calls[0][3] == H("0000")
+
+
+async def test_an_exists_result_is_truthy_only_when_the_key_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = _client(monkeypatch, _ok("010500000000000000"), _ok("000000000000000000"))
+    # `if await kv.exists(key):` keeps meaning what it did when exists was a bool.
+    assert await client.kv.exists("k")
+    assert not await client.kv.exists("k")
+    assert bool(ExistsResult(exists=False, version=7, stale=True)) is False
 
 
 async def test_json_ops(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -416,7 +499,7 @@ async def test_txn_ops_carry_the_txn_and_its_routing_key(
     assert await txn.delete("a", DeleteOptions(routing_key="ignored")) is None
     assert await txn.incr("b", -5) is None
     await txn.expire("c", 60000)
-    assert await txn.exists("d") is True
+    assert (await txn.exists("d")).exists is True
     res = await txn.commit()
     assert (res.commit_index, res.op_count) == (10, 2)
 

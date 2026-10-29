@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from .kv_body import (
     decode_action_invoke_answer,
     decode_action_status_answer,
+    decode_worker_info_answer,
     decode_worker_list_answer,
     encode_worker_list_body,
 )
@@ -30,6 +31,7 @@ from .types import (
     WorkerAwaitOptions,
     WorkerAwaitResult,
     WorkerCompleteOptions,
+    WorkerDetails,
     WorkerFailOptions,
     WorkerListOptions,
     WorkerListResult,
@@ -447,8 +449,23 @@ class WorkerOperations:
             OpCode.WORKER_LIST,
             namespace,
             b"",
-            encode_worker_list_body(opts.limit, opts.cursor),
+            encode_worker_list_body(opts.limit, opts.cursor, opts.action),
         )
 
         workers, cursor = decode_worker_list_answer(response.data)
         return WorkerListResult(workers=workers, cursor=cursor)
+
+    async def info(self, worker_id: str, namespace: str | None = None) -> WorkerDetails:
+        """A worker's record: its row, as :meth:`list` shows it, the metadata
+        it registered with, and its processes with their run and fail counts.
+
+        Raises:
+            NotFoundError: The server doesn't know the worker.
+        """
+        response = await self._client._send_and_check(
+            OpCode.WORKER_INFO,
+            self._client.get_namespace(namespace),
+            worker_id.encode("utf-8"),
+            b"",
+        )
+        return decode_worker_info_answer(response.data)

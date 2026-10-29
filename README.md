@@ -101,14 +101,16 @@ await client.kv.delete("lock:resource", DeleteOptions(cas_version=held_version))
 ```python
 from flo import ScanOptions
 
-# Names of keys with a prefix ("" for all), up to 1024 per page by default
-result = await client.kv.scan("user:")
-for name in result.names:
-    print(name)
-
-# Next pages: the cursor is None on the last page (limit is 1..1024)
-while result.cursor is not None:
-    result = await client.kv.scan("user:", ScanOptions(cursor=result.cursor, limit=100))
+# Names of keys with a prefix ("" for all), a page at a time (limit 1..1024,
+# default 1024); the cursor is None on the last page
+opts = ScanOptions(limit=100)
+while True:
+    result = await client.kv.scan("user:", opts)
+    for name in result.names:
+        print(name)
+    if result.cursor is None or not result.names:
+        break
+    opts = ScanOptions(cursor=result.cursor, limit=100)
 ```
 
 ### MGet
@@ -131,12 +133,20 @@ await client.kv.mget(["user:1:name", "user:1:email"], KVMGetOptions(routing_key=
 ```python
 from flo import HistoryOptions
 
-# Versions newest first (limit 1..65, default 10), each with its write time in ms;
-# empty for a missing key
-history = await client.kv.history("user:123", HistoryOptions(limit=10))
-for entry in history:
-    print(f"v{entry.version} at {entry.at_ms}: {entry.value.decode()}")
+# A page of versions newest first (limit 1..65, default 10), each with its write
+# time in ms and whether it was a delete; empty for a missing key. `more` says
+# older kept versions follow: ask again from before the last one.
+opts = HistoryOptions(limit=10)
+while True:
+    page = await client.kv.history("user:123", opts)
+    for entry in page.versions:
+        print(f"v{entry.version} at {entry.at_ms}: {entry.value.decode()}")
+    if not page.more or not page.versions:
+        break
+    opts = HistoryOptions(limit=10, before_version=page.versions[-1].version)
 ```
+
+A key keeps at most 64 older versions, and 64 KiB of them; the oldest go first.
 
 ### Counters, TTL and exists
 
@@ -152,8 +162,9 @@ await client.kv.expire("session:abc", 60_000)
 await client.kv.expire("lease", 30_000, KVExpireOptions(cas_version=lease_version))
 await client.kv.expire("session:abc", 0)
 
-if await client.kv.exists("session:abc"):
-    ...
+res = await client.kv.exists("session:abc")
+if res:  # truthy when the key exists; res.exists says the same
+    print(res.version)
 ```
 
 ### JSON documents
@@ -393,6 +404,34 @@ await client.worker.register(
 )
 ```
 
+### Inspect a Worker
+
+```python
+# Its row (as client.worker.list shows it), its metadata and its processes
+info = await client.worker.info("worker-1")
+print(info.worker.status, info.worker.machine_id)
+print(info.metadata)  # bytes as registered, or None; decode it if you know it's text
+for p in info.processes:  # p.kind: ProcessKind.ACTION or STREAM_CONSUMER
+    print(p.name, p.kind.name, p.run_count, p.fail_count, p.last_run_at_ms)
+```
+
+List the namespace's workers a page at a time, optionally only those that run an action:
+
+```python
+from flo import WorkerListOptions
+
+opts = WorkerListOptions(limit=100, action="process-image")
+while True:
+    page = await client.worker.list(opts)
+    for w in page.workers:
+        print(w.worker_id, w.status)
+    if page.cursor is None or not page.workers:
+        break
+    opts = WorkerListOptions(limit=100, action="process-image", cursor=page.cursor)
+```
+
+The server allows at most 1024 processes per worker and refuses a registration past its limits; the refusal comes back as a `BadRequestError` carrying its reason (`OUT_OF_RANGE` for too many processes, `FIELD_TOO_LONG` for a process name, the processes together or a machine id too long) and message.
+
 ### Await and Process Tasks
 
 ```python
@@ -463,7 +502,7 @@ Delivery is at-least-once: a result lost to a dropped connection is resent, and 
 
 Both workers register in the worker registry and heartbeat every 30 s, reporting the handlers they are running. One the server removed after missed heartbeats registers again, with the same options, when its next heartbeat is answered not found.
 
-`worker.drain()` stops taking work and lets the running handlers finish, heartbeats going on; the server is told, so it assigns the worker nothing more, and `start()` returns once the last handler has reported. A drain started on the server does the same. `worker.stop()` ends polling at once, also mid-reconnect or mid-drain; running handlers still finish, and a stream worker hands back the records of its last batch it hasn't started. Either one before or during `start()` ends that run, and a worker can be started again afterwards.
+`worker.drain()` stops taking work and lets the running handlers finish, heartbeats going on; the server is told, so it assigns the worker nothing more, and `start()` returns once the last handler has reported. A drain started on the server does the same. Neither waits out `block_ms`: `drain()` interrupts the worker's own poll connection, so an action worker's held await and a stream worker's held read end at once. A drain started on the server answers an action worker's held await at once, refused as `WORKER_DRAINING`; it doesn't wake a stream worker's held group read, so a stream worker learns of it from its next heartbeat (every 30 s) and only then interrupts its read and leaves. `worker.stop()` ends polling at once, also mid-reconnect or mid-drain; running handlers still finish, and a stream worker hands back the records of its last batch it hasn't started. Either one before or during `start()` ends that run, and a worker can be started again afterwards.
 
 ### StreamWorker Example
 
@@ -554,11 +593,13 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 | `UnauthorizedError` | Authentication failed |
 | `OverloadedError` | Server is overloaded, and the client's retries ran out |
 | `UnavailableError` | No leader, or the shard isn't taking writes or is offline, and the client's retries ran out (the message says why, and whether an operator must act first) |
+| `StaleNotFoundError` | `kv.get` or `kv.json_get` found no key, but a halted shard answered: absent only as of the entry it halted at |
+| `OutcomePendingError` | The write committed but hasn't applied: its shard halted at or before it (reason `SHARD_HALTED`, ran `UNKNOWN`; the message says whether it applies when the shard resumes). Never retried |
 | `InternalServerError` | Server internal error; not retryable (may mean committed but not applied) |
 | `GenericServerError` | Any other error status, including one this SDK doesn't know (`status_code` carries it) |
 | `ConnectionFailedError` | Failed to connect |
 | `RequestTimeoutError` | No response within the timeout |
-| `InvalidChecksumError` | Response CRC32 mismatch |
+| `InvalidChecksumError` | Response CRC32C mismatch |
 
 ### Retries
 
@@ -567,6 +608,27 @@ didn't run it (`error.ran == Ran.NO`), the client sends it again itself, as a
 new request, after a jittered wait. Because the server never ran it, this is
 safe for writes too. Any other refusal, or one that may have run, comes
 straight back.
+
+Two refusals from a halted shard are never retried, and come back after one
+attempt for the caller to decide:
+
+- `OutcomePendingError`: the write committed, so resending it would write it
+  twice, or halt the shard again.
+- `UnavailableError` with `error.reason == Reason.SHARD_HALTED`: the shard
+  takes no writes until an operator repairs it. The reason tells it apart from
+  a leader change.
+
+A halted shard still answers reads, from its state just before the entry it
+halted at. Such a read succeeds; its result says so with `stale=True` (on
+`GetResult`, `GetJsonResult`, each `MGetEntry`, `ScanResult`, `HistoryResult`,
+`ExistsResult`, and the raw response). It is not an error. A key absent on
+such an answer is absent only as of the halt, so `kv.get` and `kv.json_get`
+raise `StaleNotFoundError` (a `NotFoundError` with `stale` True) instead of
+returning `None`; `kv.history` returns an empty page with `stale=True`, and
+`kv.exists` and `kv.mget` entries say `stale` too. A refusal from a halted
+shard carries `error.stale` as well. Reads other than KV ones (streams,
+queues, workers and the rest) don't surface the flag yet; they drop it this
+release.
 
 | `RetryPolicy` field | Default | |
 |---|---|---|
@@ -584,6 +646,18 @@ The action and stream workers use their client's policy, and wait the same way
 between failed polls, from 100 ms up to 5 s, starting again from 100 ms after a
 poll that succeeds; `stop()` cuts the wait short. A stream worker retries a
 group join refused this way instead of stopping.
+
+Workers are the exception to the halted-shard rule: registering, polling and
+joining a group are safe to repeat, so on `SHARD_HALTED` either worker's
+registration at start and poll, and a stream worker's group join, keep
+trying, waiting from 100 ms up to 30 s, logging each refusal at
+warning with the server's message. A worker started during a halt comes up,
+and one running through it resumes, by itself once the shard is repaired; no
+restart is needed. They wait only on a write the shard refused without running it
+(`UNAVAILABLE`, ran `NO`); an `OutcomePendingError` (an action registration or
+group join that committed but hasn't applied) ends `start()` after one try,
+with the server's message, since sending it again could halt the shard again.
+Results and acks the shard refuses are not resent.
 
 ```python
 from flo import FloClient, RetryPolicy

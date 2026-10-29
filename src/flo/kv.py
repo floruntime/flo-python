@@ -6,7 +6,12 @@ Key-value store operations for Flo client.
 import json
 from typing import TYPE_CHECKING, Any
 
-from .exceptions import IncompleteResponseError, ServerError, raise_for_status
+from .exceptions import (
+    IncompleteResponseError,
+    ServerError,
+    StaleNotFoundError,
+    raise_for_status,
+)
 from .kv_body import (
     decode_delete_answer,
     decode_empty_answer,
@@ -36,10 +41,12 @@ from .kv_body import (
 )
 from .types import (
     DeleteOptions,
+    ExistsResult,
     GetJsonResult,
     GetOptions,
     GetResult,
     HistoryOptions,
+    HistoryResult,
     IncrResult,
     KVExistsOptions,
     KVExpireOptions,
@@ -53,7 +60,6 @@ from .types import (
     Reason,
     ScanOptions,
     ScanResult,
-    VersionEntry,
 )
 from .wire import RawResponse
 
@@ -66,17 +72,24 @@ def _key(key: str | bytes) -> bytes:
     return key.encode("utf-8") if isinstance(key, str) else key
 
 
-def _absent(response: RawResponse) -> bool:
+def _absent(response: RawResponse, *, stale_raises: bool = False) -> bool:
     """Whether a not-found answer says the thing is absent; any other not-found
-    (no such transaction) is raised."""
+    (no such transaction) is raised. With stale_raises, an absent key on a
+    stale answer raises StaleNotFoundError: absent as of the halt is not
+    absent."""
     if not response.is_not_found():
         return False
     try:
         raise_for_status(response.status, response.data)
     except ServerError as e:
-        if e.reason == Reason.NOT_FOUND:
-            return True
-        raise
+        e.stale = response.stale
+        if e.reason != Reason.NOT_FOUND:
+            raise
+        if stale_raises and response.stale:
+            stale = StaleNotFoundError(str(e))
+            stale.reason, stale.ran = e.reason, e.ran
+            raise stale from None
+        return True
     return False  # pragma: no cover - raise_for_status always raises here
 
 
@@ -87,9 +100,11 @@ async def kv_get(
     response = await client._send_and_check(
         OpCode.KV_GET, namespace, _key(key), encode_get_body(opts, txn), allow_not_found=True
     )
-    if _absent(response):
+    if _absent(response, stale_raises=True):
         return None
-    return decode_get_answer(response.data)
+    result = decode_get_answer(response.data)
+    result.stale = response.stale
+    return result
 
 
 async def kv_set(
@@ -163,12 +178,14 @@ async def kv_exists(
     key: str | bytes,
     opts: KVExistsOptions,
     txn: int | None = None,
-) -> bool:
+) -> ExistsResult:
     """kv.exists, inside transaction ``txn`` when given."""
     response = await client._send_and_check(
         OpCode.KV_EXISTS, namespace, _key(key), encode_exists_body(opts.routing_key, txn)
     )
-    return decode_exists_answer(response.data)[0]
+    result = decode_exists_answer(response.data)
+    result.stale = response.stale
+    return result
 
 
 class KVOperations:
@@ -184,8 +201,14 @@ class KVOperations:
     ) -> GetResult | None:
         """Get value and version for a key.
 
-        Returns ``GetResult(value, version)``, or ``None`` if the key is not
-        found, also when a wait (``wait_ms``) ends without it.
+        Returns ``GetResult(value, version, expires_at_ms)``, or ``None`` if
+        the key is not found, also when a wait (``wait_ms``) ends without it.
+        ``expires_at_ms`` is when the key's TTL runs out (unix ms), ``None``
+        when it has none. ``stale`` says a halted shard answered.
+
+        Raises:
+            StaleNotFoundError: A halted shard had no such key as of the entry
+                it halted at; it may exist since.
 
         Example:
             result = await client.kv.get("user:123")
@@ -281,6 +304,8 @@ class KVOperations:
                 )
                 if next_index == 0:
                     raise IncompleteResponseError("kv.mget answered none of the keys asked")
+                for e in entries:
+                    e.stale = response.stale
                 out.extend(entries)
                 done += len(entries)
         return out
@@ -293,13 +318,14 @@ class KVOperations:
         """List the names of keys with a prefix ("" for all), a page at a time.
 
         Example:
-            result = await client.kv.scan("user:")
-            for name in result.names:
-                print(name)
-
-            # Next pages
-            while result.cursor is not None:
-                result = await client.kv.scan("user:", ScanOptions(cursor=result.cursor))
+            opts = ScanOptions()
+            while True:
+                result = await client.kv.scan("user:", opts)
+                for name in result.names:
+                    print(name)
+                if result.cursor is None or not result.names:
+                    break
+                opts = ScanOptions(cursor=result.cursor)
         """
         opts = options or ScanOptions()
         response = await self._client._send_and_check(
@@ -309,31 +335,41 @@ class KVOperations:
             encode_scan_body(opts.limit, opts.cursor),
         )
         names, cursor = decode_scan_answer(response.data)
-        return ScanResult(names=names, cursor=cursor)
+        return ScanResult(names=names, cursor=cursor, stale=response.stale)
 
     async def history(
         self,
         key: str | bytes,
         options: HistoryOptions | None = None,
-    ) -> list[VersionEntry]:
-        """A key's versions, newest first, each with when it was written; empty
-        for a missing key.
+    ) -> HistoryResult:
+        """A page of a key's versions, newest first, each with when it was
+        written and whether it was a delete (``deleted``, with an empty
+        value); empty for a missing key. ``more`` says older kept versions
+        follow: ask again with ``before_version`` set to the last version of
+        this page.
 
         Example:
-            for entry in await client.kv.history("user:123", HistoryOptions(limit=10)):
-                print(f"v{entry.version} at {entry.at_ms}: {entry.value}")
+            opts = HistoryOptions(limit=10)
+            while True:
+                page = await client.kv.history("user:123", opts)
+                for entry in page.versions:
+                    print(f"v{entry.version} at {entry.at_ms}: {entry.value}")
+                if not page.more or not page.versions:
+                    break
+                opts = HistoryOptions(limit=10, before_version=page.versions[-1].version)
         """
         opts = options or HistoryOptions()
         response = await self._client._send_and_check(
             OpCode.KV_HISTORY,
             self._client.get_namespace(opts.namespace),
             _key(key),
-            encode_history_body(opts.limit, opts.routing_key),
+            encode_history_body(opts.limit, opts.before_version, opts.routing_key),
             allow_not_found=True,
         )
         if _absent(response):
-            return []
-        return decode_history_answer(response.data)
+            return HistoryResult(versions=[], more=False, stale=response.stale)
+        versions, more = decode_history_answer(response.data)
+        return HistoryResult(versions=versions, more=more, stale=response.stale)
 
     # ── Counters, TTL, exists, JSON paths ──────────────────────────────
 
@@ -373,8 +409,8 @@ class KVOperations:
         self,
         key: str | bytes,
         options: KVExistsOptions | None = None,
-    ) -> bool:
-        """Return ``True`` if ``key`` is present without transferring its value."""
+    ) -> ExistsResult:
+        """Whether ``key`` is present, and its version, without transferring its value."""
         opts = options or KVExistsOptions()
         return await kv_exists(self._client, self._client.get_namespace(opts.namespace), key, opts)
 
@@ -388,7 +424,8 @@ class KVOperations:
 
         Returns a :class:`GetJsonResult` whose ``value`` is the parsed JSON,
         with the document's current version, or ``None`` if the key or path
-        is missing.
+        is missing. A missing key on a halted shard's answer raises
+        :class:`StaleNotFoundError` instead.
         """
         opts = options or KVJsonOptions()
         response = await self._client._send_and_check(
@@ -398,10 +435,12 @@ class KVOperations:
             encode_json_get_body(path, opts.routing_key),
             allow_not_found=True,
         )
-        if _absent(response):
+        if _absent(response, stale_raises=True):
             return None
         version, document = decode_json_get_answer(response.data)
-        return GetJsonResult(value=json.loads(document.decode("utf-8")), version=version)
+        return GetJsonResult(
+            value=json.loads(document.decode("utf-8")), version=version, stale=response.stale
+        )
 
     async def json_set(
         self,

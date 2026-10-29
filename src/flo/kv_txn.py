@@ -28,6 +28,7 @@ from .kv_body import (
 )
 from .types import (
     DeleteOptions,
+    ExistsResult,
     GetOptions,
     GetResult,
     KVCommitResult,
@@ -143,7 +144,7 @@ class Transaction:
         opts = dataclasses.replace(options or KVExpireOptions(), routing_key=self._routing_key)
         await kv_expire(self._client, self._namespace, key, ttl_ms, opts, self._txn_id)
 
-    async def exists(self, key: str | bytes) -> bool:
+    async def exists(self, key: str | bytes) -> ExistsResult:
         """Check key existence inside the transaction (sees buffered writes)."""
         self._check_alive()
         opts = KVExistsOptions(routing_key=self._routing_key)
