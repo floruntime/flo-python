@@ -44,10 +44,19 @@ def test_worker_list_is_a_table_op() -> None:
 
 
 def test_the_request_is_a_present_limit_then_the_cursor() -> None:
-    assert encode_worker_list_body(5, None) == b"\x01" + struct.pack("<I", 5) + b"\x00\x00"
-    assert encode_worker_list_body(1024, b"w-b") == (
-        b"\x01" + struct.pack("<I", 1024) + struct.pack("<H", 3) + b"w-b"
+    assert encode_worker_list_body(5, None) == (
+        b"\x01" + struct.pack("<I", 5) + b"\x00\x00" + b"\x00\x00"
     )
+    assert encode_worker_list_body(1024, b"w-b") == (
+        b"\x01" + struct.pack("<I", 1024) + struct.pack("<H", 3) + b"w-b" + b"\x00\x00"
+    )
+
+
+def test_the_action_filter_follows_the_cursor() -> None:
+    assert encode_worker_list_body(5, None, "charge") == (
+        b"\x01" + struct.pack("<I", 5) + b"\x00\x00" + struct.pack("<H", 6) + b"charge"
+    )
+    assert encode_worker_list_body(5, None, None) == encode_worker_list_body(5, None, "")
 
 
 @pytest.mark.parametrize("limit", [0, 1025, -1])

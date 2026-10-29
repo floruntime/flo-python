@@ -17,6 +17,7 @@ from .types import (
     MAX_WAIT_MS,
     ActionRunStatus,
     Condition,
+    ExistsResult,
     GetOptions,
     GetResult,
     MGetEntry,
@@ -180,9 +181,13 @@ def encode_scan_body(limit: int, cursor: bytes | None) -> bytes:
     return _limit("scan limit", limit, MAX_SCAN) + bytes([len(cursor)]) + cursor
 
 
-def encode_history_body(limit: int, routing_key: str | None) -> bytes:
-    """kv.history's request: limit, routing_key."""
-    return _limit("history limit", limit, MAX_HISTORY) + _routing_key(routing_key)
+def encode_history_body(limit: int, before_version: int | None, routing_key: str | None) -> bytes:
+    """kv.history's request: limit, before_version, routing_key."""
+    return (
+        _limit("history limit", limit, MAX_HISTORY)
+        + _opt_u64("before_version", before_version)
+        + _routing_key(routing_key)
+    )
 
 
 def encode_mget_body(keys: Sequence[bytes], routing_key: str | None = None) -> bytes:
@@ -258,10 +263,13 @@ def encode_json_del_body(path: str | None, routing_key: str | None) -> bytes:
     return _path(path) + _routing_key(routing_key)
 
 
-def encode_worker_list_body(limit: int, cursor: bytes | None) -> bytes:
-    """worker.list's request: limit, cursor (empty starts)."""
-    return _limit("limit", limit, MAX_WORKER_LIST) + _bytes16(
-        "cursor", cursor or b"", _MAX_WORKER_ID
+def encode_worker_list_body(limit: int, cursor: bytes | None, action: str | None = None) -> bytes:
+    """worker.list's request: limit, cursor (empty starts), action (empty for
+    every worker)."""
+    return (
+        _limit("limit", limit, MAX_WORKER_LIST)
+        + _bytes16("cursor", cursor or b"", _MAX_WORKER_ID)
+        + _bytes16("action", (action or "").encode("utf-8"), _MAX_WORKER_ID)
     )
 
 
@@ -367,15 +375,17 @@ def decode_scan_answer(data: bytes) -> tuple[list[str], bytes | None]:
     return names, cursor
 
 
-def decode_history_answer(data: bytes) -> list[VersionEntry]:
-    """kv.history's answer: versions, newest first."""
+def decode_history_answer(data: bytes) -> tuple[list[VersionEntry], bool]:
+    """kv.history's answer: versions, newest first, then whether older kept
+    versions follow."""
     a = _Answer("kv.history", data)
     versions = [
         VersionEntry(version=a.u64(), at_ms=a.i64(), deleted=a.flag(), value=a.bytes32())
         for _ in range(a.u8())
     ]
+    more = a.flag()
     a.done()
-    return versions
+    return versions, more
 
 
 def decode_mget_answer(data: bytes, keys: Sequence[str]) -> tuple[list[MGetEntry], int | None]:
@@ -417,13 +427,13 @@ def decode_empty_answer(op: str, data: bytes) -> None:
     _Answer(op, data).done()
 
 
-def decode_exists_answer(data: bytes) -> tuple[bool, int]:
+def decode_exists_answer(data: bytes) -> ExistsResult:
     """kv.exists's answer: exists, version (0 when absent or buffered in a transaction)."""
     a = _Answer("kv.exists", data)
     exists = a.flag()
     version = a.u64()
     a.done()
-    return exists, version
+    return ExistsResult(exists=exists, version=version)
 
 
 def decode_json_get_answer(data: bytes) -> tuple[int, bytes]:

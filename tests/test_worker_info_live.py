@@ -5,7 +5,14 @@ import secrets
 
 import pytest
 
-from flo import FloClient, ProcessKind, WorkerRegisterOptions, WorkerStatus, WorkerType
+from flo import (
+    FloClient,
+    ProcessKind,
+    WorkerListOptions,
+    WorkerRegisterOptions,
+    WorkerStatus,
+    WorkerType,
+)
 from flo.exceptions import BadRequestError, NotFoundError
 from flo.types import Ran, Reason, StatusCode
 
@@ -50,18 +57,68 @@ async def test_info_shows_the_row_metadata_and_processes_registered(client: FloC
         await client.worker.deregister(stream_id)
 
 
-async def test_a_registration_of_1025_processes_is_refused(client: FloClient) -> None:
-    worker_id = f"py-info-many-{secrets.token_hex(4)}"
+@pytest.mark.parametrize(
+    ("processes", "options", "reason", "message"),
+    [
+        (
+            [f"p{i}" for i in range(1025)],
+            WorkerRegisterOptions(),
+            Reason.OUT_OF_RANGE,
+            "more than 1024 processes",
+        ),
+        (
+            ["p" * 4097],
+            WorkerRegisterOptions(),
+            Reason.FIELD_TOO_LONG,
+            "process name longer than 4096 bytes",
+        ),
+        (
+            ["p"],
+            WorkerRegisterOptions(machine_id="m" * 256),
+            Reason.FIELD_TOO_LONG,
+            "machine id longer than 255 bytes",
+        ),
+    ],
+    ids=["1025-processes", "4097-byte-name", "256-byte-machine-id"],
+)
+async def test_a_registration_past_the_servers_limits_is_refused(
+    client: FloClient,
+    processes: list[str],
+    options: WorkerRegisterOptions,
+    reason: Reason,
+    message: str,
+) -> None:
+    worker_id = f"py-info-limit-{secrets.token_hex(4)}"
     with pytest.raises(BadRequestError) as e:
-        await client.worker.register(worker_id, [f"p{i}" for i in range(1025)])
-    assert (e.value.status_code, e.value.reason, e.value.ran) == (
+        await client.worker.register(worker_id, processes, options)
+    assert (e.value.status_code, e.value.reason, e.value.ran, str(e.value)) == (
         StatusCode.BAD_REQUEST,
-        Reason.UNCLASSIFIED,
+        reason,
         Ran.NO,
+        message,
     )
-    assert str(e.value) == "more than 1024 processes"
     with pytest.raises(NotFoundError):
         await client.worker.info(worker_id)
+
+
+async def test_worker_list_filters_by_action(client: FloClient) -> None:
+    tag = secrets.token_hex(4)
+    a, b = f"py-filter-a-{tag}", f"py-filter-b-{tag}"
+    await client.worker.register(a, [f"py-act-a-{tag}"])
+    await client.worker.register(b, [f"py-act-b-{tag}", f"py-act-c-{tag}"])
+    try:
+        for action, want in [
+            (f"py-act-a-{tag}", [a]),
+            (f"py-act-c-{tag}", [b]),
+            (f"py-act-none-{tag}", []),
+        ]:
+            page = await client.worker.list(WorkerListOptions(limit=1024, action=action))
+            assert [w.worker_id for w in page.workers] == want
+        every = await client.worker.list(WorkerListOptions(limit=1024))
+        assert {a, b} <= {w.worker_id for w in every.workers}
+    finally:
+        await client.worker.deregister(a)
+        await client.worker.deregister(b)
 
 
 async def test_info_for_a_missing_worker_is_not_found(client: FloClient) -> None:

@@ -23,6 +23,7 @@ Example::
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import json
 import logging
 import secrets
@@ -33,7 +34,13 @@ from typing import Any
 
 from .client import FloClient
 from .exceptions import NonRetryableError, NotFoundError, ServerError, is_connection_error
-from .retry import _sleep_unless_stopped, _worker_backoff, is_refused_unrun
+from .retry import (
+    _halted_backoff,
+    _sleep_unless_stopped,
+    _worker_backoff,
+    is_refused_unrun,
+    is_shard_halted,
+)
 from .types import (
     _DEFAULT_WORKER_BLOCK_MS,
     ActionRegisterOptions,
@@ -249,6 +256,24 @@ class _RegisteredWorker:
 
     async def _register(self, client: FloClient) -> None:
         raise NotImplementedError
+
+    async def _while_halted(self, what: str, call: Callable[[], Awaitable[object]]) -> bool:
+        """Run call, asking again while the shard is halted: it resumes once an
+        operator repairs it, and the worker comes up by itself then. False if
+        a stop or drain ended the wait."""
+        halted = _halted_backoff()
+        while True:
+            try:
+                await call()
+                return True
+            except Exception as e:
+                if not is_shard_halted(e):
+                    raise
+                d = halted.next()
+                logger.warning(f"{what} refused, shard halted: {e}; retrying in {d:.3f}s")
+                await _sleep_unless_stopped(self._leave_event, d)
+                if self._leave_event.is_set():
+                    return False
 
     def _load(self) -> int:
         """The handlers running: the load heartbeats report."""
@@ -775,16 +800,21 @@ class ActionWorker(_RegisteredWorker):
             # the poll one.
             action_names = list(self._handlers.keys())
             self._action_names = action_names
+            results = self._result_client
             for action_name in action_names:
-                await self._result_client.action.register(
-                    action_name, ActionType.USER, self._action_options[action_name]
-                )
+                opts = self._action_options[action_name]
+                if not await self._while_halted(
+                    f"Registering action {action_name}",
+                    functools.partial(results.action.register, action_name, ActionType.USER, opts),
+                ):
+                    return
                 logger.debug(f"Registered action with server: {action_name}")
 
             # Deregistered at the end even if this answer is lost: the
             # registration may still have taken.
             registered = True
-            await self._register(self._result_client)
+            if not await self._while_halted("Registering", lambda: self._register(results)):
+                return
             logger.info(f"Worker registered with {len(action_names)} actions")
 
             self._semaphore = asyncio.Semaphore(self.config.concurrency)
@@ -851,6 +881,7 @@ class ActionWorker(_RegisteredWorker):
         leave = self._leave_event
         backoff = _EmptyPollBackoff(self.config.block_ms, leave)
         failed = _worker_backoff()
+        halted = _halted_backoff()
         while not leave.is_set():
             try:
                 # Wait for a slot; a stop or drain ends the wait.
@@ -866,6 +897,7 @@ class ActionWorker(_RegisteredWorker):
                 )
                 reconnect_pause = 0.0
                 failed.reset()
+                halted.reset()
 
                 if result.task is None:
                     # No task available, release semaphore and continue
@@ -900,6 +932,10 @@ class ActionWorker(_RegisteredWorker):
                         logger.warning(f"Heartbeat failed: {hb_err}")
                     d = failed.next()
                     logger.warning(f"Await refused, worker unhealthy; retrying in {d:.3f}s")
+                    await _sleep_unless_stopped(leave, d)
+                elif is_shard_halted(e):
+                    d = halted.next()
+                    logger.warning(f"Await refused, shard halted: {e}; retrying in {d:.3f}s")
                     await _sleep_unless_stopped(leave, d)
                 elif is_connection_error(e):
                     # A stop or drain interrupts the poll connection: that is
@@ -1359,7 +1395,9 @@ class StreamWorker(_RegisteredWorker):
             # Deregistered at the end even if this answer is lost: the
             # registration may still have taken.
             registered = True
-            await self._register(self._ack_client)
+            acks = self._ack_client
+            if not await self._while_halted("Registering", lambda: self._register(acks)):
+                return
             self._start_heartbeats()
 
             # Join consumer group. A connection error here (a stalled or dropped
@@ -1439,6 +1477,7 @@ class StreamWorker(_RegisteredWorker):
         leave = self._leave_event
         backoff = _EmptyPollBackoff(self.config.block_ms, leave)
         failed = _worker_backoff()
+        halted = _halted_backoff()
 
         while not leave.is_set():
             try:
@@ -1457,6 +1496,7 @@ class StreamWorker(_RegisteredWorker):
                     ),
                 )
                 failed.reset()
+                halted.reset()
 
                 if not result.records:
                     self._semaphore.release()
@@ -1491,6 +1531,10 @@ class StreamWorker(_RegisteredWorker):
                     except Exception as recon_err:
                         logger.error(f"Stream worker reconnect failed: {recon_err}, retrying...")
                         await _sleep_unless_stopped(leave, 1)
+                elif is_shard_halted(e):
+                    d = halted.next()
+                    logger.warning(f"Stream read refused, shard halted: {e}; retrying in {d:.3f}s")
+                    await _sleep_unless_stopped(leave, d)
                 else:
                     d = failed.next()
                     logger.error(f"Stream read error: {e}, retrying in {d:.3f}s...")
@@ -1528,11 +1572,14 @@ class StreamWorker(_RegisteredWorker):
         A connection error (a stalled or dropped connection at startup) triggers
         a reconnect-and-retry instead of failing the worker. A join the server
         refused without running it (overloaded or unavailable, past the
-        client's own retries) is tried again with the worker backoff. Other
-        errors (e.g. an invalid request) remain fatal and are raised.
+        client's own retries) is tried again with the worker backoff, and one
+        refused because the shard halted every 30 s at most, until an
+        operator repairs it. Other errors (e.g. an invalid request) remain
+        fatal and are raised.
         """
         assert self._client is not None
         failed = _worker_backoff()
+        halted = _halted_backoff()
         leave = self._leave_event
         while True:
             if leave.is_set():
@@ -1545,6 +1592,11 @@ class StreamWorker(_RegisteredWorker):
                 )
                 return
             except Exception as e:
+                if is_shard_halted(e):
+                    d = halted.next()
+                    logger.warning(f"Group join refused, shard halted: {e}; retrying in {d:.3f}s")
+                    await _sleep_unless_stopped(leave, d)
+                    continue
                 if is_refused_unrun(e):
                     d = failed.next()
                     logger.warning(f"Group join refused: {e}, retrying in {d:.3f}s...")

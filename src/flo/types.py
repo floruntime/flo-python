@@ -18,7 +18,10 @@ VERSION: int = 0x03
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0x505FDAA07E866B96
+TABLE_HASH: int = 0x05FE53F432E943C4
+# Response header flag: a halted shard answered a read from the state just
+# before the entry it halted at. The read succeeded.
+RESPONSE_STALE: int = 0x01
 
 
 class Reason(IntEnum):
@@ -73,6 +76,9 @@ class Reason(IntEnum):
     WORKER_UNHEALTHY = 27
     # An await from a draining worker: it takes no new work.
     WORKER_DRAINING = 28
+    # The shard halted at an entry every replica fails the same way; it takes
+    # no writes until an operator repairs it.
+    SHARD_HALTED = 29
 
 
 class Ran(IntEnum):
@@ -257,6 +263,9 @@ class StatusCode(IntEnum):
     OVERLOADED = 10
     RATE_LIMITED = 11
     UNAVAILABLE = 12
+    # The write committed but hasn't applied: its shard halted at or before
+    # it. Resending it would write it twice, or halt again.
+    OUTCOME_PENDING = 13
 
     @classmethod
     def _missing_(cls, value: object) -> "StatusCode | None":
@@ -291,6 +300,9 @@ class StatusCode(IntEnum):
             StatusCode.RATE_LIMITED: "Request rate limit exceeded",
             StatusCode.UNAVAILABLE: (
                 "Unavailable: no leader or the shard isn't taking writes; retry"
+            ),
+            StatusCode.OUTCOME_PENDING: (
+                "Committed, not applied: its shard halted; don't resend it unchanged"
             ),
         }
         return messages.get(self, f"Unknown status {int(self)}")
@@ -348,6 +360,8 @@ class ScanResult:
 
     names: list[str]
     cursor: bytes | None  # None on the last page
+    # Read from a halted shard's state just before the entry it halted at.
+    stale: bool = False
 
     @property
     def has_more(self) -> bool:
@@ -362,6 +376,29 @@ class VersionEntry:
     at_ms: int  # When it was written, unix ms
     deleted: bool  # This version is a delete; value is empty
     value: bytes
+
+
+@dataclass
+class HistoryResult:
+    """A page of a key's versions, newest first. ``more`` says older kept
+    versions follow: ask again with ``before_version`` set to the last
+    version here."""
+
+    versions: list[VersionEntry]
+    more: bool
+    # Read from a halted shard's state just before the entry it halted at.
+    stale: bool = False
+
+
+@dataclass
+class ExistsResult:
+    """Whether a key exists, and its version (0 when absent, or for a write
+    buffered in a transaction)."""
+
+    exists: bool
+    version: int
+    # Read from a halted shard's state just before the entry it halted at.
+    stale: bool = False
 
 
 @dataclass
@@ -420,6 +457,8 @@ class GetResult:
     version: int
     # When the key's TTL runs out, unix ms; None when it has none.
     expires_at_ms: int | None = None
+    # Read from a halted shard's state just before the entry it halted at.
+    stale: bool = False
 
 
 T = TypeVar("T")
@@ -440,6 +479,8 @@ class GetJsonResult(Generic[T]):
 
     value: Any
     version: int
+    # Read from a halted shard's state just before the entry it halted at.
+    stale: bool = False
 
 
 @dataclass
@@ -454,6 +495,8 @@ class MGetEntry:
     value: bytes
     version: int
     found: bool
+    # Read from a halted shard's state just before the entry it halted at.
+    stale: bool = False
 
 
 @dataclass
@@ -650,6 +693,9 @@ class HistoryOptions:
 
     namespace: str | None = None
     limit: int = 10  # 1..65 versions, newest first
+    # Only versions older than this one (the last version of the page
+    # before); None starts from the newest.
+    before_version: int | None = None
     # Routes the request in place of the key.
     routing_key: str | None = None
 
@@ -1116,6 +1162,8 @@ class WorkerListOptions:
     namespace: str | None = None
     limit: int = 100
     cursor: bytes | None = None
+    # Only workers that run this action; None for every worker.
+    action: str | None = None
 
 
 # =============================================================================

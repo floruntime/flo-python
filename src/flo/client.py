@@ -15,6 +15,7 @@ from .exceptions import (
     NotConnectedError,
     ProtocolError,
     RequestTimeoutError,
+    ServerError,
     UnexpectedEofError,
     raise_for_status,
 )
@@ -387,7 +388,7 @@ class FloClient:
                 except asyncio.TimeoutError as e:
                     raise RequestTimeoutError(f"No response to {op_code.name}") from e
 
-                status, data_len, resp_request_id, crc = parse_response_header(header_data)
+                status, data_len, resp_request_id, crc, stale = parse_response_header(header_data)
 
                 if data_len > 0:
                     try:
@@ -435,7 +436,9 @@ class FloClient:
             if self._debug:
                 logger.debug(f"[flo] <- {status.name} {len(response_data)} bytes")
 
-            return RawResponse(status=status, data=response_data, request_id=resp_request_id)
+            return RawResponse(
+                status=status, data=response_data, request_id=resp_request_id, stale=stale
+            )
 
     async def _send_and_check(
         self,
@@ -471,7 +474,11 @@ class FloClient:
         if allow_not_found and response.status == StatusCode.NOT_FOUND:
             return response
 
-        raise_for_status(response.status, response.data)
+        try:
+            raise_for_status(response.status, response.data)
+        except ServerError as e:
+            e.stale = response.stale
+            raise
         return response  # Unreachable, but makes type checker happy
 
     def get_namespace(self, override: str | None) -> str:

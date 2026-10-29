@@ -449,7 +449,7 @@ class WorkerOperations:
             OpCode.WORKER_LIST,
             namespace,
             b"",
-            encode_worker_list_body(opts.limit, opts.cursor),
+            encode_worker_list_body(opts.limit, opts.cursor, opts.action),
         )
 
         workers, cursor = decode_worker_list_answer(response.data)

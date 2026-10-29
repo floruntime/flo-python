@@ -31,6 +31,7 @@ from .types import (
     MAX_KEY_SIZE,
     MAX_NAMESPACE_SIZE,
     MAX_VALUE_SIZE,
+    RESPONSE_STALE,
     TABLE_HASH,
     VERSION,
     DequeueResult,
@@ -307,6 +308,9 @@ class RawResponse:
     status: StatusCode
     data: bytes
     request_id: int
+    # The RESPONSE_STALE flag: a halted shard answered this read from the
+    # state just before the entry it halted at. Not an error.
+    stale: bool = False
 
     def is_ok(self) -> bool:
         """Check if response status is OK."""
@@ -317,17 +321,18 @@ class RawResponse:
         return self.status == StatusCode.NOT_FOUND
 
 
-def parse_response_header(data: bytes) -> tuple[StatusCode, int, int, int]:
+def parse_response_header(data: bytes) -> tuple[StatusCode, int, int, int, bool]:
     """Parse response header.
 
     Args:
         data: Raw response data (must be at least HEADER_SIZE bytes).
 
     Returns:
-        Tuple of (status, data_len, request_id, crc32c).
+        Tuple of (status, data_len, request_id, crc32c, stale).
 
     Raises:
-        IncompleteResponseError: If data is too short.
+        IncompleteResponseError: If data is too short, or a flag bit is set
+            that this SDK doesn't know.
         InvalidMagicError: If magic number is invalid.
         TableMismatchError: If the server was built from another protocol
             version or op table; its body can't be read.
@@ -345,7 +350,10 @@ def parse_response_header(data: bytes) -> tuple[StatusCode, int, int, int]:
     if version != VERSION or table_hash != TABLE_HASH:
         raise TableMismatchError(version, table_hash)
 
-    return StatusCode(status), data_len, request_id, crc
+    if flags & ~RESPONSE_STALE:
+        raise IncompleteResponseError(f"Response has unknown flags 0x{flags:02X}")
+
+    return StatusCode(status), data_len, request_id, crc, bool(flags & RESPONSE_STALE)
 
 
 def parse_response(data: bytes) -> RawResponse:
@@ -361,7 +369,7 @@ def parse_response(data: bytes) -> RawResponse:
         IncompleteResponseError: If response is incomplete.
         InvalidChecksumError: If the CRC32C check fails.
     """
-    status, data_len, request_id, expected_crc = parse_response_header(data)
+    status, data_len, request_id, expected_crc, stale = parse_response_header(data)
 
     expected_size = HEADER_SIZE + data_len
     if len(data) < expected_size:
@@ -374,7 +382,7 @@ def parse_response(data: bytes) -> RawResponse:
     if computed_crc != expected_crc:
         raise InvalidChecksumError(f"CRC32C mismatch: 0x{computed_crc:08X} != 0x{expected_crc:08X}")
 
-    return RawResponse(status=status, data=response_data, request_id=request_id)
+    return RawResponse(status=status, data=response_data, request_id=request_id, stale=stale)
 
 
 # =============================================================================
