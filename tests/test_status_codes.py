@@ -10,6 +10,7 @@ from flo import FloClient, RetryPolicy, StreamID
 from flo.exceptions import (
     GenericServerError,
     IncompleteResponseError,
+    NoNamespaceError,
     NotFoundError,
     ServerError,
     TableMismatchError,
@@ -55,6 +56,17 @@ def test_unavailable_maps_to_unavailable_error_with_the_server_message() -> None
         raise_for_status(resp.status, resp.data)
     assert str(raised.value) == "shard 3 is offline"
     assert raised.value.status_code == StatusCode.UNAVAILABLE
+
+
+def test_no_namespace_maps_to_its_own_error_not_not_found() -> None:
+    resp = parse_response(_frame(1, 14, _refusal(b"namespace 'gone' doesn't exist")))
+    assert resp.status == StatusCode.NO_NAMESPACE
+    assert not resp.is_not_found()
+    with pytest.raises(NoNamespaceError) as raised:
+        raise_for_status(resp.status, resp.data)
+    assert not isinstance(raised.value, NotFoundError)
+    assert str(raised.value) == "namespace 'gone' doesn't exist"
+    assert raised.value.status_code == StatusCode.NO_NAMESPACE
 
 
 def test_unknown_status_maps_to_generic_error_naming_it() -> None:

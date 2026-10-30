@@ -191,6 +191,15 @@ class StaleNotFoundError(NotFoundError):
     stale = True
 
 
+class NoNamespaceError(ServerError):
+    """The namespace the request names doesn't exist. Not a NotFoundError,
+    which means a missing key, so a missing namespace never reads as an
+    absent key."""
+
+    def __init__(self, message: str = StatusCode.NO_NAMESPACE.message()):
+        super().__init__(message, StatusCode.NO_NAMESPACE)
+
+
 class BadRequestError(ServerError):
     """Invalid request parameters."""
 
@@ -311,6 +320,7 @@ def _error_for(status: StatusCode, message: str) -> ServerError:
 
     error_map: dict[StatusCode, Callable[[str], ServerError]] = {
         StatusCode.NOT_FOUND: NotFoundError,
+        StatusCode.NO_NAMESPACE: NoNamespaceError,
         StatusCode.BAD_REQUEST: BadRequestError,
         StatusCode.CONFLICT: ConflictError,
         StatusCode.UNAUTHORIZED: UnauthorizedError,

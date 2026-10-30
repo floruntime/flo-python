@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from .kv_body import (
     decode_action_invoke_answer,
+    decode_action_list_answer,
     decode_action_status_answer,
     decode_worker_info_answer,
     decode_worker_list_answer,
@@ -159,28 +160,28 @@ class ActionOperations:
         self,
         options: ActionListOptions | None = None,
     ) -> ActionListResult:
-        """List registered actions.
+        """List a page of the namespace's registered actions.
 
         Args:
-            options: Optional list options.
+            options: The page's limit and cursor (the last page's ``cursor``;
+                None starts).
 
         Returns:
-            ActionListResult with list of actions.
+            ActionListResult with the page's action names and the next
+            page's cursor, None on the last page.
         """
         opts = options or ActionListOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        value = serialize_action_list_value(limit=opts.limit)
-
-        await self._client._send_and_check(
+        response = await self._client._send_and_check(
             OpCode.ACTION_LIST,
             namespace,
             (opts.prefix or "").encode("utf-8"),
-            value,
+            serialize_action_list_value(limit=opts.limit, cursor=opts.cursor),
         )
 
-        # Parse list response - format TBD based on server implementation
-        return ActionListResult(actions=[])
+        names, cursor = decode_action_list_answer(response.data)
+        return ActionListResult(names=names, cursor=cursor)
 
     async def delete(
         self,

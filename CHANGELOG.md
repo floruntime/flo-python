@@ -1,0 +1,42 @@
+# Changelog
+
+All notable changes to the Flo Python SDK will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+The op table hash moves with the server in this release: this SDK talks only
+to the flo it pins, and the pin lands with the release.
+
+### Added
+
+- `NoNamespaceError` for status `NO_NAMESPACE` (14): the namespace a request
+  names doesn't exist. It is not a `NotFoundError`, which means a missing key
+- `Reason.ADMIN_ONLY` (30): the op is served only on a node's admin socket
+- `ActionListOptions.cursor` and `ActionListResult.has_more`: `action.list`
+  pages
+
+### Changed
+
+- `action.list` returns the page's action names (`ActionListResult.names`)
+  and the next page's cursor; it returned an empty list whatever the server
+  answered
+- A `kv.scan` cursor holds the shard and the last key returned, so it may be
+  up to 4098 bytes (was 64); its length prefix is a u16 in the request and
+  the answer
+- `NAMESPACE_ENSURE` (0x016) is a known op code; shards send it to each
+  other, and no client API sends it
+
+### Breaking
+
+- The cluster op codes are the server's: `CLUSTER_PROMOTE` (0x032),
+  `CLUSTER_REMOVE` (0x033) and `CLUSTER_REPAIR_SKIP` (0x034, admin socket
+  only) replace `CLUSTER_JOIN`, `CLUSTER_LEAVE`, `CLUSTER_TRANSFER_LEADER`,
+  `CLUSTER_ADD_NODE` and `CLUSTER_REMOVE_NODE`, which the server never
+  served. No client API sends them
+- `NAMESPACE_CONFIG_SET` and `NAMESPACE_CONFIG_GET` (0x014, 0x015) are gone:
+  the server retired them
+- `ActionListResult.actions` is now `ActionListResult.names`, and
+  `ActionInfo` is gone: the action list carries names only

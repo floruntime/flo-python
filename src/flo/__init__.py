@@ -46,6 +46,7 @@ from .exceptions import (
     InvalidMagicError,
     KeyTooLargeError,
     NamespaceTooLargeError,
+    NoNamespaceError,
     NonRetryableError,
     NotConnectedError,
     NotFoundError,
@@ -71,7 +72,6 @@ from .retry import DEFAULT_RETRY_POLICY, RetryPolicy
 from .types import (
     AckOptions,
     ActionDeleteOptions,
-    ActionInfo,
     ActionInvokeOptions,
     ActionInvokeResult,
     ActionListOptions,
@@ -240,6 +240,7 @@ __all__ = [
     "BlockTooLongError",
     "ServerError",
     "NotFoundError",
+    "NoNamespaceError",
     "BadRequestError",
     "ConflictError",
     "UnauthorizedError",
@@ -299,7 +300,6 @@ __all__ = [
     # Action types
     "ActionType",
     "RunStatus",
-    "ActionInfo",
     "ActionRunStatus",
     "ActionInvokeResult",
     "ActionListResult",

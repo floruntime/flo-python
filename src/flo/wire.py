@@ -833,12 +833,13 @@ def serialize_action_invoke_value(
     return b"\x01" + struct.pack("<H", len(labels_bytes)) + labels_bytes + input_data
 
 
-def serialize_action_list_value(limit: int = 100) -> bytes:
+def serialize_action_list_value(limit: int = 100, cursor: bytes | None = None) -> bytes:
     """Serialize action list value.
 
-    Format: [limit:u32][cursor...] (cursor omitted if empty)
+    Format: [limit:u32][cursor...] (cursor omitted on the first page; limit 0
+    is the server's default)
     """
-    return struct.pack("<I", limit)
+    return struct.pack("<I", limit) + (cursor or b"")
 
 
 def serialize_worker_register_value(

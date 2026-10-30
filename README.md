@@ -380,11 +380,15 @@ if status.error_message is not None:
 ```python
 from flo import ActionListOptions
 
-# List all actions
-actions = await client.action.list()
-
-# List with prefix filter
-actions = await client.action.list(ActionListOptions(prefix="process-"))
+# List the namespace's actions a page at a time
+opts = ActionListOptions(limit=100)
+while True:
+    page = await client.action.list(opts)
+    for name in page.names:
+        print(name)
+    if page.cursor is None:
+        break
+    opts = ActionListOptions(limit=100, cursor=page.cursor)
 
 # Delete an action
 await client.action.delete("process-image")
@@ -588,6 +592,7 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 | Error | Description |
 |-------|-------------|
 | `NotFoundError` | Key or resource not found |
+| `NoNamespaceError` | The namespace the request names doesn't exist (not a `NotFoundError`) |
 | `BadRequestError` | Invalid request parameters |
 | `ConflictError` | CAS version mismatch |
 | `UnauthorizedError` | Authentication failed |
