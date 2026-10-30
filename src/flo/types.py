@@ -172,6 +172,7 @@ class OpCode(IntEnum):
     STREAM_LIST = 0x13B
     STREAM_CREATE = 0x13D
     STREAM_ALTER = 0x13F
+    STREAM_DELETE = 0x140
 
     # ── Stream Consumer Groups (0x150 – 0x16F) ──
     STREAM_GROUP_CREATE = 0x150
@@ -339,6 +340,7 @@ class OptionTag(IntEnum):
     PARTITION_KEY = 0x25  # string: Key for partition routing
     MAX_AGE_SECONDS = 0x26  # u64: Maximum age in seconds for retention
     DRY_RUN = 0x28  # void: Flag to preview what would be deleted
+    FORCE = 0x2C  # void: Flag to delete a stream that still has records
 
     # Consumer Group Options (0x30 - 0x3F)
     ACK_TIMEOUT_MS = 0x30  # u32: Time before unacked message auto-redelivers
@@ -857,6 +859,14 @@ class StreamTrimResult:
 
     removed: int  # Records removed
     first_seq: int  # Sequence of the first record left; meaningful only when records remain
+
+
+@dataclass
+class StreamDeleteOptions:
+    """Options for stream delete operations."""
+
+    namespace: str | None = None
+    force: bool = False  # Delete even if the stream still has records
 
 
 @dataclass

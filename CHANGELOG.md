@@ -17,6 +17,9 @@ to the flo it pins, and the pin lands with the release.
 - `Reason.ADMIN_ONLY` (30): the op is served only on a node's admin socket
 - `ActionListOptions.cursor` and `ActionListResult.has_more`: `action.list`
   pages
+- `stream.delete` (`STREAM_DELETE`, 0x140) deletes a stream's records and
+  metadata; a missing stream succeeds, and one that still has records raises
+  `ConflictError` unless `StreamDeleteOptions(force=True)`
 
 ### Changed
 

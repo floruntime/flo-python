@@ -14,6 +14,7 @@ from .types import (
     StreamAppendOptions,
     StreamAppendResult,
     StreamClaimResult,
+    StreamDeleteOptions,
     StreamGroupAckOptions,
     StreamGroupJoinOptions,
     StreamGroupNackOptions,
@@ -238,6 +239,34 @@ class StreamOperations:
             raise ValueError(f"stream trim: response is {len(response.data)} bytes, want 16")
         removed, first_seq = struct.unpack("<QQ", response.data)
         return StreamTrimResult(removed=removed, first_seq=first_seq)
+
+    async def delete(
+        self,
+        stream: str,
+        options: StreamDeleteOptions | None = None,
+    ) -> None:
+        """Delete a stream's records and metadata.
+
+        Deleting a stream that doesn't exist succeeds. A stream that still has
+        records is refused with ``ConflictError`` unless ``force`` is set.
+
+        Example:
+            await client.stream.delete("events", StreamDeleteOptions(force=True))
+        """
+        opts = options or StreamDeleteOptions()
+        namespace = self._client.get_namespace(opts.namespace)
+
+        builder = OptionsBuilder()
+        if opts.force:
+            builder.add_flag(OptionTag.FORCE)
+
+        await self._client._send_and_check(
+            OpCode.STREAM_DELETE,
+            namespace,
+            stream.encode("utf-8"),
+            b"",
+            builder.build(),
+        )
 
     async def group_join(
         self,
