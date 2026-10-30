@@ -108,7 +108,7 @@ while True:
     result = await client.kv.scan("user:", opts)
     for name in result.names:
         print(name)
-    if result.cursor is None or not result.names:
+    if result.cursor is None:
         break
     opts = ScanOptions(cursor=result.cursor, limit=100)
 ```
@@ -433,7 +433,7 @@ while True:
     page = await client.worker.list(opts)
     for w in page.workers:
         print(w.worker_id, w.status)
-    if page.cursor is None or not page.workers:
+    if page.cursor is None:
         break
     opts = WorkerListOptions(limit=100, action="process-image", cursor=page.cursor)
 ```
