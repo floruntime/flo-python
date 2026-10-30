@@ -46,3 +46,6 @@ to the flo it pins, and the pin lands with the release.
 - `processing.list` returns a `ProcessingListResult` (`entries`, `cursor`,
   `has_more`) in place of a bare list, so a caller can page past the first
   page with `ProcessingListOptions.cursor`; it dropped the server's cursor
+- `workflow.list_definitions` returns a `WorkflowListDefinitionsResult`
+  (`entries` of `WorkflowDefinitionEntry`, `cursor`, `has_more`) in place of
+  the raw answer bytes

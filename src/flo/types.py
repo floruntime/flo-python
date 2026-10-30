@@ -1293,6 +1293,28 @@ class WorkflowSyncResult:
     action: str  # "created", "updated", "unchanged"
 
 
+@dataclass
+class WorkflowDefinitionEntry:
+    """A workflow definition as a definition list names it."""
+
+    name: str
+    version: str
+    created_at: int
+
+
+@dataclass
+class WorkflowListDefinitionsResult:
+    """A page of workflow definitions. ``cursor`` gives the next page; None on
+    the last. A page may hold fewer than the limit and still have more."""
+
+    entries: list[WorkflowDefinitionEntry]
+    cursor: bytes | None = None
+
+    @property
+    def has_more(self) -> bool:
+        return self.cursor is not None
+
+
 # =============================================================================
 # Processing Types
 # =============================================================================

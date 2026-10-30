@@ -10,12 +10,14 @@ from flo import (
     ActionListOptions,
     FloClient,
     ProcessingListOptions,
+    WorkflowDefinitionEntry,
     WorkflowListDefinitionsOptions,
 )
 from flo.exceptions import IncompleteResponseError
 from flo.kv_body import decode_action_list_answer
 from flo.types import OpCode, OptionTag, StatusCode
 from flo.wire import OptionsIterator, RawResponse
+from flo.workflows import _parse_definition_list
 
 Call = tuple[OpCode, str, bytes, bytes, bytes]
 
@@ -96,6 +98,65 @@ async def test_workflow_list_definitions(sent: tuple[FloClient, list[Call]]) -> 
     client, calls = sent
     await client.workflow.list_definitions(WorkflowListDefinitionsOptions(limit=7, cursor=b"cur"))
     assert_paging(calls[0], OpCode.WORKFLOW_LIST_DEFINITIONS, 7, b"cur")
+
+
+def _definition_page(defs: list[tuple[bytes, bytes, int]], cursor: bytes | None) -> bytes:
+    """workflow.list_definitions' answer: [count:u32]([name_len:u16][name]
+    [version_len:u16][version][created_at:i64])*[has_more:u8][cursor_len:u16][cursor]."""
+    out = struct.pack("<I", len(defs))
+    for name, version, created_at in defs:
+        out += struct.pack("<H", len(name)) + name + struct.pack("<H", len(version)) + version
+        out += struct.pack("<q", created_at)
+    cursor = cursor or b""
+    return out + bytes([1 if cursor else 0]) + struct.pack("<H", len(cursor)) + cursor
+
+
+async def test_workflow_list_definitions_pages_by_the_cursor_it_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FloClient("localhost:1")
+    cursor = b"\x08\x80\x05\x00\x00\x00"
+    pages = [
+        # Short of the limit, yet more to come: the shards after the first
+        # window hold the rest.
+        _definition_page([(b"order", b"1.0.0", 5)], cursor),
+        _definition_page([(b"refund", b"2.1.0", 7)], None),
+    ]
+    values: list[bytes] = []
+
+    async def fake_send(
+        op_code: OpCode, namespace: str, key: bytes, value: bytes, options: bytes = b"", **_: Any
+    ) -> RawResponse:
+        values.append(value)
+        return RawResponse(status=StatusCode.OK, data=pages[len(values) - 1], request_id=0)
+
+    monkeypatch.setattr(client, "_send_and_check", fake_send)
+
+    page = await client.workflow.list_definitions(WorkflowListDefinitionsOptions(limit=3))
+    assert page.entries == [WorkflowDefinitionEntry(name="order", version="1.0.0", created_at=5)]
+    assert (page.cursor, page.has_more) == (cursor, True)
+    page = await client.workflow.list_definitions(
+        WorkflowListDefinitionsOptions(limit=3, cursor=page.cursor)
+    )
+    assert [(e.name, e.version) for e in page.entries] == [("refund", "2.1.0")]
+    assert (page.cursor, page.has_more) == (None, False)
+    assert values == [struct.pack("<I", 3), struct.pack("<I", 3) + cursor]
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        _definition_page([(b"a", b"1", 0)], None)[:-1],  # cut short
+        _definition_page([(b"a", b"1", 0)], None) + b"\x00",  # a byte left over
+        struct.pack("<I", 0) + b"\x01" + struct.pack("<H", 0),  # more, but no cursor
+        struct.pack("<I", 0) + b"\x02" + struct.pack("<H", 0),  # has_more isn't a flag
+        struct.pack("<I", 1025),  # more than a page holds
+    ],
+    ids=["short", "trailing", "more-without-cursor", "bad-flag", "too-many"],
+)
+def test_workflow_list_definitions_answer_is_refused_when_malformed(data: bytes) -> None:
+    with pytest.raises(IncompleteResponseError):
+        _parse_definition_list(data)
 
 
 async def test_action_list(sent: tuple[FloClient, list[Call]]) -> None:
