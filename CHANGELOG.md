@@ -40,3 +40,6 @@ to the flo it pins, and the pin lands with the release.
   the server retired them
 - `ActionListResult.actions` is now `ActionListResult.names`, and
   `ActionInfo` is gone: the action list carries names only
+- `processing.list` returns a `ProcessingListResult` (`entries`, `cursor`,
+  `has_more`) in place of a bare list, so a caller can page past the first
+  page with `ProcessingListOptions.cursor`; it dropped the server's cursor

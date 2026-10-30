@@ -111,6 +111,7 @@ from .types import (
     ProcessingCancelOptions,
     ProcessingListEntry,
     ProcessingListOptions,
+    ProcessingListResult,
     ProcessingStatusOptions,
     ProcessingStatusResult,
     ProcessingStopOptions,
@@ -351,5 +352,6 @@ __all__ = [
     "ProcessingSyncOptions",
     "ProcessingStatusResult",
     "ProcessingListEntry",
+    "ProcessingListResult",
     "ProcessingSyncResult",
 ]

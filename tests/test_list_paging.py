@@ -56,6 +56,42 @@ async def test_processing_list(sent: tuple[FloClient, list[Call]]) -> None:
     assert_paging(calls[0], OpCode.PROCESSING_LIST, 10, b"cur")
 
 
+async def test_processing_list_pages_by_the_cursor_it_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FloClient("localhost:1")
+    cursor = b"\x00\x80\x01\x00\x00\x00"
+
+    def job(name: bytes) -> bytes:
+        return b"".join(struct.pack("<H", len(f)) + f for f in (name, b"id-" + name, b"RUNNING"))
+
+    pages = [
+        struct.pack("<I", 1)
+        + job(b"etl")
+        + struct.pack("<q", 5)
+        + b"\x01"
+        + struct.pack("<H", len(cursor))
+        + cursor,
+        EMPTY_PAGE,
+    ]
+    values: list[bytes] = []
+
+    async def fake_send(
+        op_code: OpCode, namespace: str, key: bytes, value: bytes, options: bytes = b"", **_: Any
+    ) -> RawResponse:
+        values.append(value)
+        return RawResponse(status=StatusCode.OK, data=pages[len(values) - 1], request_id=0)
+
+    monkeypatch.setattr(client, "_send_and_check", fake_send)
+
+    page = await client.processing.list(ProcessingListOptions(limit=1))
+    assert [e.name for e in page.entries] == ["etl"]
+    assert (page.cursor, page.has_more) == (cursor, True)
+    page = await client.processing.list(ProcessingListOptions(limit=1, cursor=page.cursor))
+    assert (page.entries, page.cursor, page.has_more) == ([], None, False)
+    assert values == [struct.pack("<I", 1), struct.pack("<I", 1) + cursor]
+
+
 async def test_workflow_list_definitions(sent: tuple[FloClient, list[Call]]) -> None:
     client, calls = sent
     await client.workflow.list_definitions(WorkflowListDefinitionsOptions(limit=7, cursor=b"cur"))

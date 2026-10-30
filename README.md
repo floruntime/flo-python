@@ -390,6 +390,10 @@ while True:
         break
     opts = ActionListOptions(limit=100, cursor=page.cursor)
 
+# Only actions whose names start with a prefix (needs the next server
+# release; the current one lists every action)
+page = await client.action.list(ActionListOptions(prefix="process-"))
+
 # Delete an action
 await client.action.delete("process-image")
 ```

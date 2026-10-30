@@ -65,7 +65,39 @@ def test_list() -> None:
     data += _s("a") + _s("j1") + _s("RUNNING") + struct.pack("<q", 7)
     data += _s("b") + _s("j2") + _s("failed") + struct.pack("<q", 8)
     data += b"\x00" + struct.pack("<H", 0)
-    assert _parse_processing_list(data) == [
-        ProcessingListEntry(name="a", job_id="j1", status="RUNNING", created_at=7),
-        ProcessingListEntry(name="b", job_id="j2", status="failed", created_at=8),
-    ]
+    assert _parse_processing_list(data) == (
+        [
+            ProcessingListEntry(name="a", job_id="j1", status="RUNNING", created_at=7),
+            ProcessingListEntry(name="b", job_id="j2", status="failed", created_at=8),
+        ],
+        None,
+    )
+
+
+def _list(cursor: bytes | None) -> bytes:
+    data = struct.pack("<I", 1) + _s("a") + _s("j1") + _s("FAILED: boom") + struct.pack("<q", 7)
+    cursor = cursor or b""
+    return data + bytes([1 if cursor else 0]) + struct.pack("<H", len(cursor)) + cursor
+
+
+def test_list_carries_the_next_pages_cursor() -> None:
+    entries, cursor = _parse_processing_list(_list(b"\x01\x80\x01\x00\x00\x00"))
+    assert [e.status for e in entries] == ["FAILED: boom"]
+    assert cursor == b"\x01\x80\x01\x00\x00\x00"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"",
+        _list(None)[:-1],  # cut short
+        _list(None) + b"\x00",  # a byte left over
+        _list(None)[:-3] + b"\x01" + struct.pack("<H", 0),  # more, but no cursor
+        _list(None)[:-3] + b"\x02" + struct.pack("<H", 0),  # has_more not 0 or 1
+        struct.pack("<I", 1025),  # more than a page holds
+    ],
+    ids=["empty", "short", "trailing", "more-without-cursor", "bad-has-more", "too-many"],
+)
+def test_list_refuses_a_malformed_answer(data: bytes) -> None:
+    with pytest.raises(IncompleteResponseError):
+        _parse_processing_list(data)

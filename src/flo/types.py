@@ -1304,7 +1304,9 @@ class ProcessingStatusOptions:
 
 @dataclass
 class ProcessingListOptions:
-    """Options for listing processing jobs."""
+    """Options for listing processing jobs: at most ``limit`` (1..1024; 0 is
+    the server's default) after ``cursor``, the last page's cursor (None
+    starts)."""
 
     namespace: str | None = None
     limit: int = 100
@@ -1353,6 +1355,19 @@ class ProcessingListEntry:
     job_id: str
     status: str
     created_at: int
+
+
+@dataclass
+class ProcessingListResult:
+    """A page of processing jobs. ``cursor`` gives the next page; None on the
+    last."""
+
+    entries: list[ProcessingListEntry]
+    cursor: bytes | None = None
+
+    @property
+    def has_more(self) -> bool:
+        return self.cursor is not None
 
 
 @dataclass
