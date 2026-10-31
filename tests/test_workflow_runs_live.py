@@ -22,16 +22,25 @@ from flo.exceptions import ConflictError
 
 LIMIT = 3
 
-# No worker serves the action, so every run waits on it and stays live.
+# Every run waits for a signal no test sends, so it stays live. (A run of an
+# action no one registered can fail at once, when the action would be on the
+# run's own shard.)
 WORKFLOW_YAML = """\
 kind: Workflow
 name: {name}
 version: "1.0.0"
+terminals:
+  Approved:
+    status: completed
+  Rejected:
+    status: failed
 start:
-  run: "@actions/py-runs-unserved"
+  wait_for_signal:
+    type: never-sent
+    timeout_ms: 600000
   transitions:
-    success: flo.Completed
-    failure: flo.Failed
+    success: Approved
+    timeout: Rejected
 """
 
 
