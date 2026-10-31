@@ -18,7 +18,7 @@ VERSION: int = 0x03
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0xA8DE7758AFA69427
+TABLE_HASH: int = 0xC751512225A42D04
 # Response header flag: a halted shard answered a read from the state just
 # before the entry it halted at. The read succeeded.
 RESPONSE_STALE: int = 0x01
@@ -1244,12 +1244,20 @@ class WorkflowHistoryOptions:
 
 @dataclass
 class WorkflowListRunsOptions:
-    """Options for listing workflow runs."""
+    """Options for listing workflow runs.
+
+    ``workflow_name`` None lists every workflow's runs. ``status`` and
+    ``search`` (a case-insensitive substring of the run's id, workflow, step,
+    input or tags) narrow the list; None for any. ``cursor`` is the last
+    page's, None to start. ``limit`` 0 asks for the server's default (100);
+    the server sends at most 1024.
+    """
 
     namespace: str | None = None
     workflow_name: str | None = None
-    status_filter: str | None = None
+    status: str | None = None
     cursor: bytes | None = None
+    search: str | None = None
     limit: int = 100
 
 
@@ -1300,6 +1308,31 @@ class WorkflowDefinitionEntry:
     name: str
     version: str
     created_at: int
+
+
+@dataclass
+class WorkflowRunEntry:
+    """A workflow run as a run list names it. ``created_at`` is when the run
+    started, in milliseconds since the epoch."""
+
+    run_id: str
+    workflow: str
+    status: str
+    created_at: int
+
+
+@dataclass
+class WorkflowListRunsResult:
+    """A page of workflow runs, newest first. ``cursor`` gives the next page;
+    None on the last. A page may hold fewer than the limit and still have
+    more."""
+
+    runs: list[WorkflowRunEntry]
+    cursor: bytes | None = None
+
+    @property
+    def has_more(self) -> bool:
+        return self.cursor is not None
 
 
 @dataclass

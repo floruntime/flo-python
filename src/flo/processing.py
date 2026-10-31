@@ -65,7 +65,11 @@ class ProcessingOperations:
     async def status(
         self, job_id: str, options: ProcessingStatusOptions | None = None
     ) -> ProcessingStatusResult | None:
-        """Get the status of a processing job. Returns None if not found."""
+        """Get the status of a processing job. Returns None if not found.
+
+        Raises:
+            NoNamespaceError: The namespace was never created.
+        """
         opts = options or ProcessingStatusOptions()
         namespace = self._client.get_namespace(opts.namespace)
 

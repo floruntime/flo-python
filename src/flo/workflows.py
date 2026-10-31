@@ -11,7 +11,7 @@ import re
 import struct
 from typing import TYPE_CHECKING, Any
 
-from .exceptions import IncompleteResponseError
+from .exceptions import IncompleteResponseError, ValidationError
 from .types import (
     OpCode,
     StatusCode,
@@ -25,6 +25,8 @@ from .types import (
     WorkflowListDefinitionsOptions,
     WorkflowListDefinitionsResult,
     WorkflowListRunsOptions,
+    WorkflowListRunsResult,
+    WorkflowRunEntry,
     WorkflowSignalOptions,
     WorkflowStartOptions,
     WorkflowStatusOptions,
@@ -65,7 +67,11 @@ class WorkflowOperations:
     async def get_definition(
         self, name: str, options: WorkflowGetDefinitionOptions | None = None
     ) -> str | None:
-        """Get the YAML definition of a workflow. Returns None if not found."""
+        """Get the YAML definition of a workflow. Returns None if not found.
+
+        Raises:
+            NoNamespaceError: The namespace was never created.
+        """
         opts = options or WorkflowGetDefinitionOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
@@ -301,25 +307,38 @@ class WorkflowOperations:
 
         return resp.data
 
-    async def list_runs(self, options: WorkflowListRunsOptions | None = None) -> bytes:
-        """List workflow runs. Returns raw response bytes."""
+    async def list_runs(
+        self, options: WorkflowListRunsOptions | None = None
+    ) -> WorkflowListRunsResult:
+        """List one page of workflow runs, newest first.
+
+        Args:
+            options: The workflow (None for every workflow's runs), status and
+                search filters, limit, and cursor (the last page's ``cursor``;
+                None starts).
+
+        Returns:
+            WorkflowListRunsResult with the page's runs and the next page's
+            cursor, None on the last page. Page until ``has_more`` is False,
+            not until a page comes back short.
+        """
         opts = options or WorkflowListRunsOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
         key = opts.workflow_name.encode("utf-8") if opts.workflow_name else b""
 
-        # Value: [limit:u32][status_len:u16][status][cursor_len:u16][cursor][search_len:u16][search]
-        status_bytes = opts.status_filter.encode("utf-8") if opts.status_filter else b""
-        cursor_bytes = opts.cursor if opts.cursor else b""
-        search_bytes = b""  # search not exposed yet
-        value = bytearray()
-        value.extend(struct.pack("<I", opts.limit))
-        value.extend(struct.pack("<H", len(status_bytes)))
-        value.extend(status_bytes)
-        value.extend(struct.pack("<H", len(cursor_bytes)))
-        value.extend(cursor_bytes)
-        value.extend(struct.pack("<H", len(search_bytes)))
-        value.extend(search_bytes)
+        # [limit:u32][status_len:u16][status][cursor_len:u16][cursor]
+        # [search_len:u16][search], every field sent, an empty one as length 0.
+        if not 0 <= opts.limit <= 0xFFFFFFFF:
+            raise ValidationError(f"limit must be 0 to 4294967295, not {opts.limit}")
+        value = bytearray(struct.pack("<I", opts.limit))
+        for field in (
+            opts.status.encode("utf-8") if opts.status else b"",
+            opts.cursor or b"",
+            opts.search.encode("utf-8") if opts.search else b"",
+        ):
+            value.extend(struct.pack("<H", len(field)))
+            value.extend(field)
 
         resp = await self._client._send_and_check(
             OpCode.WORKFLOW_LIST_RUNS,
@@ -327,8 +346,8 @@ class WorkflowOperations:
             key,
             bytes(value),
         )
-
-        return resp.data
+        runs, cursor = _parse_run_list(resp.data)
+        return WorkflowListRunsResult(runs=runs, cursor=cursor)
 
     async def list_definitions(
         self, options: WorkflowListDefinitionsOptions | None = None
@@ -448,6 +467,62 @@ class WorkflowOperations:
 
 # A page holds at most this many entries; a larger count is a corrupt answer.
 _MAX_DEFINITION_LIST = 1024
+_MAX_RUN_LIST = 1024
+
+
+def _parse_run_list(data: bytes) -> tuple[list[WorkflowRunEntry], bytes | None]:
+    """The page's runs and the next page's cursor, None on the last page.
+
+    Wire format: [count:u32]([run_id_len:u16][run_id][workflow_len:u16][workflow]
+                 [status_len:u16][status][created_at:i64])*
+                 [has_more:u8][cursor_len:u16][cursor]
+    """
+    pos = 0
+
+    def take(n: int) -> bytes:
+        nonlocal pos
+        if pos + n > len(data):
+            raise IncompleteResponseError("workflow.list_runs answer is truncated")
+        b = data[pos : pos + n]
+        pos += n
+        return b
+
+    def read_str() -> str:
+        (n,) = struct.unpack("<H", take(2))
+        try:
+            return take(n).decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise IncompleteResponseError(
+                "workflow.list_runs answer has a field that isn't UTF-8"
+            ) from e
+
+    (count,) = struct.unpack("<I", take(4))
+    if count > _MAX_RUN_LIST:
+        raise IncompleteResponseError(f"workflow.list_runs answer lists {count} runs")
+    runs: list[WorkflowRunEntry] = []
+    for _ in range(count):
+        run_id = read_str()
+        workflow = read_str()
+        status = read_str()
+        (created_at,) = struct.unpack("<q", take(8))
+        runs.append(
+            WorkflowRunEntry(run_id=run_id, workflow=workflow, status=status, created_at=created_at)
+        )
+
+    has_more = take(1)[0]
+    if has_more > 1:
+        raise IncompleteResponseError(f"workflow.list_runs answer has a has_more of {has_more}")
+    (cursor_len,) = struct.unpack("<H", take(2))
+    cursor = take(cursor_len)
+    if pos != len(data):
+        raise IncompleteResponseError(
+            f"workflow.list_runs answer has {len(data) - pos} bytes after the cursor"
+        )
+    if has_more and not cursor:
+        raise IncompleteResponseError("workflow.list_runs answer has more pages but no cursor")
+    if not has_more and cursor:
+        raise IncompleteResponseError("workflow.list_runs answer has a cursor on its last page")
+    return runs, cursor if has_more else None
 
 
 def _parse_definition_list(

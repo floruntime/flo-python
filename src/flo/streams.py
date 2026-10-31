@@ -173,6 +173,10 @@ class StreamOperations:
         Returns:
             StreamInfo with first_id, last_id, count, bytes_size.
 
+        Raises:
+            NotFoundError: No such stream.
+            NoNamespaceError: The namespace was never created.
+
         Example:
             info = await client.stream.info("events")
             print(f"Stream has {info.count} records ({info.bytes_size} bytes)")
