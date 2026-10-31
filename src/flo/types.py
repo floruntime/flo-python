@@ -1307,7 +1307,7 @@ class WorkflowListDefinitionsResult:
     """A page of workflow definitions. ``cursor`` gives the next page; None on
     the last. A page may hold fewer than the limit and still have more."""
 
-    entries: list[WorkflowDefinitionEntry]
+    definitions: list[WorkflowDefinitionEntry]
     cursor: bytes | None = None
 
     @property
@@ -1394,7 +1394,7 @@ class ProcessingListResult:
     """A page of processing jobs. ``cursor`` gives the next page; None on the
     last."""
 
-    entries: list[ProcessingListEntry]
+    jobs: list[ProcessingListEntry]
     cursor: bytes | None = None
 
     @property

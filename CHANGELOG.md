@@ -13,8 +13,10 @@ The server's op table hash is now `0xa8de7758afa69427` (`TABLE_HASH`).
 
 ### Added
 
-- `NoNamespaceError` for status `NO_NAMESPACE` (14): the namespace a request
-  names doesn't exist. It is not a `NotFoundError`, which means a missing key
+- `NoNamespaceError` for status `NO_NAMESPACE` (14), its own error rather
+  than a `NotFoundError` (a missing key). Reads in a namespace that was never
+  created raise it from the server version that adds it; the pinned server
+  answers them as a missing key or an empty page
 - `Reason.ADMIN_ONLY` (30): the op is served only on a node's admin socket
 - `ActionListOptions.cursor` and `ActionListResult.has_more`: `action.list`
   pages
@@ -24,10 +26,6 @@ The server's op table hash is now `0xa8de7758afa69427` (`TABLE_HASH`).
 
 ### Changed
 
-- A `NOT_FOUND` answer to `stream.append`, `read`, `info`, `group_join`,
-  `group_leave`, `group_read`, `group_pending`, `group_claim` or
-  `workflow.history` raises `NotFoundError`; the refusal's body was parsed as
-  the answer (`workflow.history` of a missing run returned it as the history)
 - `action.list` returns the page's action names (`ActionListResult.names`)
   and the next page's cursor; it returned an empty list whatever the server
   answered
@@ -39,6 +37,11 @@ The server's op table hash is now `0xa8de7758afa69427` (`TABLE_HASH`).
 
 ### Breaking
 
+- `workflow.history` and `workflow.status` of a missing run, and a
+  `NOT_FOUND` answer to `stream.append`, `read`, `info`, `group_join`,
+  `group_leave`, `group_read`, `group_pending` or `group_claim`, raise
+  `NotFoundError`; the refusal's body was parsed as the answer
+  (`workflow.history` of a missing run returned it as the history)
 - The cluster op codes are the server's: `CLUSTER_PROMOTE` (0x032),
   `CLUSTER_REMOVE` (0x033) and `CLUSTER_REPAIR_SKIP` (0x034, admin socket
   only) replace `CLUSTER_JOIN`, `CLUSTER_LEAVE`, `CLUSTER_TRANSFER_LEADER`,
@@ -48,9 +51,9 @@ The server's op table hash is now `0xa8de7758afa69427` (`TABLE_HASH`).
   the server retired them
 - `ActionListResult.actions` is now `ActionListResult.names`, and
   `ActionInfo` is gone: the action list carries names only
-- `processing.list` returns a `ProcessingListResult` (`entries`, `cursor`,
+- `processing.list` returns a `ProcessingListResult` (`jobs`, `cursor`,
   `has_more`) in place of a bare list, so a caller can page past the first
   page with `ProcessingListOptions.cursor`; it dropped the server's cursor
 - `workflow.list_definitions` returns a `WorkflowListDefinitionsResult`
-  (`entries` of `WorkflowDefinitionEntry`, `cursor`, `has_more`) in place of
+  (`definitions` of `WorkflowDefinitionEntry`, `cursor`, `has_more`) in place of
   the raw answer bytes

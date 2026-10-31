@@ -535,13 +535,18 @@ def decode_action_list_answer(data: bytes) -> tuple[list[str], bytes | None]:
         raise IncompleteResponseError(f"{op} answer lists {count} actions")
     names = []
     for _ in range(count):
-        names.append(a.bytes16().decode("utf-8", errors="replace"))
+        try:
+            names.append(a.bytes16().decode("utf-8"))
+        except UnicodeDecodeError as e:
+            raise IncompleteResponseError(f"{op} answer has a name that isn't UTF-8") from e
         a.bytes32()
     has_more = a.flag()
     cursor = a.bytes16()
     a.done()
     if has_more and not cursor:
         raise IncompleteResponseError(f"{op} answer has more pages but no cursor")
+    if not has_more and cursor:
+        raise IncompleteResponseError(f"{op} answer has a cursor on its last page")
     return names, cursor if has_more else None
 
 

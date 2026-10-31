@@ -317,7 +317,7 @@ class TestListDefinitions:
         opts = WorkflowListDefinitionsOptions()
         while True:
             page = await client.workflow.list_definitions(opts)
-            defs.extend(page.entries)
+            defs.extend(page.definitions)
             if not page.has_more:
                 break
             opts = WorkflowListDefinitionsOptions(cursor=page.cursor)

@@ -596,7 +596,7 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 | Error | Description |
 |-------|-------------|
 | `NotFoundError` | Key or resource not found |
-| `NoNamespaceError` | The namespace the request names doesn't exist (not a `NotFoundError`) |
+| `NoNamespaceError` | Status `NO_NAMESPACE` (14), not a `NotFoundError`; reads in a namespace that was never created raise it from the server version that adds it |
 | `BadRequestError` | Invalid request parameters |
 | `ConflictError` | CAS version mismatch |
 | `UnauthorizedError` | Authentication failed |

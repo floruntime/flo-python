@@ -105,7 +105,7 @@ async def test_workflow_list_definitions_pages_every_definition_once(
         r = await client.workflow.list_definitions(
             WorkflowListDefinitionsOptions(namespace=ns, limit=LIMIT, cursor=cursor)
         )
-        return [e.name for e in r.entries], r.cursor
+        return [e.name for e in r.definitions], r.cursor
 
     names = await page_all(fetch)
     assert_exact(names, want)
@@ -148,7 +148,7 @@ async def test_processing_list_pages_every_job_once(client: FloClient) -> None:
             r = await client.processing.list(
                 ProcessingListOptions(namespace=ns, limit=LIMIT, cursor=cursor)
             )
-            return [e.name for e in r.entries], r.cursor
+            return [e.name for e in r.jobs], r.cursor
 
         names = await page_all(fetch)
         assert_exact(names, want)

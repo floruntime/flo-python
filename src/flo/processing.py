@@ -109,7 +109,7 @@ class ProcessingOperations:
         )
 
         entries, next_cursor = _parse_processing_list(resp.data)
-        return ProcessingListResult(entries=entries, cursor=next_cursor)
+        return ProcessingListResult(jobs=entries, cursor=next_cursor)
 
     async def stop(self, job_id: str, options: ProcessingStopOptions | None = None) -> None:
         """Gracefully stop a processing job."""
@@ -282,6 +282,8 @@ def _parse_processing_list(data: bytes) -> tuple[list[ProcessingListEntry], byte
         )
     if has_more and not cursor:
         raise IncompleteResponseError("processing.list answer has more pages but no cursor")
+    if not has_more and cursor:
+        raise IncompleteResponseError("processing.list answer has a cursor on its last page")
     return entries, cursor if has_more else None
 
 

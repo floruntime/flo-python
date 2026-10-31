@@ -87,10 +87,10 @@ async def test_processing_list_pages_by_the_cursor_it_returns(
     monkeypatch.setattr(client, "_send_and_check", fake_send)
 
     page = await client.processing.list(ProcessingListOptions(limit=1))
-    assert [e.name for e in page.entries] == ["etl"]
+    assert [e.name for e in page.jobs] == ["etl"]
     assert (page.cursor, page.has_more) == (cursor, True)
     page = await client.processing.list(ProcessingListOptions(limit=1, cursor=page.cursor))
-    assert (page.entries, page.cursor, page.has_more) == ([], None, False)
+    assert (page.jobs, page.cursor, page.has_more) == ([], None, False)
     assert values == [struct.pack("<I", 1), struct.pack("<I", 1) + cursor]
 
 
@@ -133,12 +133,14 @@ async def test_workflow_list_definitions_pages_by_the_cursor_it_returns(
     monkeypatch.setattr(client, "_send_and_check", fake_send)
 
     page = await client.workflow.list_definitions(WorkflowListDefinitionsOptions(limit=3))
-    assert page.entries == [WorkflowDefinitionEntry(name="order", version="1.0.0", created_at=5)]
+    assert page.definitions == [
+        WorkflowDefinitionEntry(name="order", version="1.0.0", created_at=5)
+    ]
     assert (page.cursor, page.has_more) == (cursor, True)
     page = await client.workflow.list_definitions(
         WorkflowListDefinitionsOptions(limit=3, cursor=page.cursor)
     )
-    assert [(e.name, e.version) for e in page.entries] == [("refund", "2.1.0")]
+    assert [(e.name, e.version) for e in page.definitions] == [("refund", "2.1.0")]
     assert (page.cursor, page.has_more) == (None, False)
     assert values == [struct.pack("<I", 3), struct.pack("<I", 3) + cursor]
 
@@ -150,9 +152,10 @@ async def test_workflow_list_definitions_pages_by_the_cursor_it_returns(
         _definition_page([(b"a", b"1", 0)], None) + b"\x00",  # a byte left over
         struct.pack("<I", 0) + b"\x01" + struct.pack("<H", 0),  # more, but no cursor
         struct.pack("<I", 0) + b"\x02" + struct.pack("<H", 0),  # has_more isn't a flag
+        struct.pack("<I", 0) + b"\x00" + struct.pack("<H", 1) + b"c",  # last page, yet a cursor
         struct.pack("<I", 1025),  # more than a page holds
     ],
-    ids=["short", "trailing", "more-without-cursor", "bad-flag", "too-many"],
+    ids=["short", "trailing", "more-without-cursor", "bad-flag", "cursor-on-last-page", "too-many"],
 )
 def test_workflow_list_definitions_answer_is_refused_when_malformed(data: bytes) -> None:
     with pytest.raises(IncompleteResponseError):
@@ -213,9 +216,11 @@ async def test_action_list_pages_by_the_cursor_it_returns(
         _action_page([b"a"], None)[:-1],  # cut short
         _action_page([b"a"], None) + b"\x00",  # a byte left over
         struct.pack("<I", 0) + b"\x01" + struct.pack("<H", 0),  # more, but no cursor
+        struct.pack("<I", 0) + b"\x00" + struct.pack("<H", 1) + b"c",  # last page, yet a cursor
+        _action_page([b"\xff"], None),  # a name that isn't UTF-8
         struct.pack("<I", 1025),  # more than a page holds
     ],
-    ids=["short", "trailing", "more-without-cursor", "too-many"],
+    ids=["short", "trailing", "more-without-cursor", "cursor-on-last-page", "bad-utf8", "too-many"],
 )
 def test_action_list_answer_is_refused_when_malformed(data: bytes) -> None:
     with pytest.raises(IncompleteResponseError):

@@ -357,7 +357,7 @@ class WorkflowOperations:
             value,
         )
         entries, cursor = _parse_definition_list(resp.data)
-        return WorkflowListDefinitionsResult(entries=entries, cursor=cursor)
+        return WorkflowListDefinitionsResult(definitions=entries, cursor=cursor)
 
     async def disable(self, name: str, options: WorkflowDisableOptions | None = None) -> None:
         """Disable a workflow definition (prevents new runs)."""
@@ -501,6 +501,10 @@ def _parse_definition_list(
     if has_more and not cursor:
         raise IncompleteResponseError(
             "workflow.list_definitions answer has more pages but no cursor"
+        )
+    if not has_more and cursor:
+        raise IncompleteResponseError(
+            "workflow.list_definitions answer has a cursor on its last page"
         )
     return entries, cursor if has_more else None
 

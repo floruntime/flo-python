@@ -94,9 +94,18 @@ def test_list_carries_the_next_pages_cursor() -> None:
         _list(None) + b"\x00",  # a byte left over
         _list(None)[:-3] + b"\x01" + struct.pack("<H", 0),  # more, but no cursor
         _list(None)[:-3] + b"\x02" + struct.pack("<H", 0),  # has_more not 0 or 1
+        _list(None)[:-3] + b"\x00" + struct.pack("<H", 1) + b"c",  # last page, yet a cursor
         struct.pack("<I", 1025),  # more than a page holds
     ],
-    ids=["empty", "short", "trailing", "more-without-cursor", "bad-has-more", "too-many"],
+    ids=[
+        "empty",
+        "short",
+        "trailing",
+        "more-without-cursor",
+        "bad-has-more",
+        "cursor-on-last-page",
+        "too-many",
+    ],
 )
 def test_list_refuses_a_malformed_answer(data: bytes) -> None:
     with pytest.raises(IncompleteResponseError):
