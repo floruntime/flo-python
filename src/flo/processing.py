@@ -17,6 +17,7 @@ from .types import (
     ProcessingCancelOptions,
     ProcessingListEntry,
     ProcessingListOptions,
+    ProcessingListResult,
     ProcessingStatusOptions,
     ProcessingStatusResult,
     ProcessingStopOptions,
@@ -29,6 +30,8 @@ if TYPE_CHECKING:
     from .client import FloClient
 
 _PROCESSING_STATUS_NAMES = ["running", "stopped", "cancelled", "failed", "completed"]
+# The most jobs one list page holds.
+_MAX_PROCESSING_LIST = 1024
 
 
 class ProcessingOperations:
@@ -81,14 +84,22 @@ class ProcessingOperations:
 
         return _parse_processing_status(resp.data)
 
-    async def list(self, options: ProcessingListOptions | None = None) -> list[ProcessingListEntry]:
-        """List processing jobs."""
+    async def list(self, options: ProcessingListOptions | None = None) -> ProcessingListResult:
+        """List a page of the namespace's processing jobs.
+
+        Args:
+            options: The page's limit and cursor (the last page's ``cursor``;
+                None starts).
+
+        Returns:
+            ProcessingListResult with the page's jobs and the next page's
+            cursor, None on the last page.
+        """
         opts = options or ProcessingListOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
         # Wire format: [limit:u32][cursor...]
-        cursor = opts.cursor or b""
-        value = struct.pack("<I", opts.limit) + cursor
+        value = struct.pack("<I", opts.limit) + (opts.cursor or b"")
 
         resp = await self._client._send_and_check(
             OpCode.PROCESSING_LIST,
@@ -97,7 +108,8 @@ class ProcessingOperations:
             value,
         )
 
-        return _parse_processing_list(resp.data)
+        entries, next_cursor = _parse_processing_list(resp.data)
+        return ProcessingListResult(jobs=entries, cursor=next_cursor)
 
     async def stop(self, job_id: str, options: ProcessingStopOptions | None = None) -> None:
         """Gracefully stop a processing job."""
@@ -217,50 +229,62 @@ def _parse_processing_status(data: bytes) -> ProcessingStatusResult:
     )
 
 
-def _parse_processing_list(data: bytes) -> list[ProcessingListEntry]:
-    """Parse binary wire format for processing job list.
+def _parse_processing_list(data: bytes) -> tuple[list[ProcessingListEntry], bytes | None]:
+    """Parse binary wire format for processing job list: the page's jobs and
+    the next page's cursor, None on the last page.
 
     Wire format: [count:u32]([name_len:u16][name][job_id_len:u16][job_id]
                  [status_len:u16][status][created_at:i64])*
+                 [has_more:u8][cursor_len:u16][cursor]
+    A failed job's status reads "FAILED: <reason>".
     """
-    if len(data) < 4:
-        return []
+    pos = 0
 
-    (count,) = struct.unpack_from("<I", data, 0)
-    pos = 4
-    results: list[ProcessingListEntry] = []
-
-    def read_u16() -> int:
+    def take(n: int) -> bytes:
         nonlocal pos
-        v: int = struct.unpack_from("<H", data, pos)[0]
-        pos += 2
-        return v
+        if pos + n > len(data):
+            raise IncompleteResponseError("processing.list answer is truncated")
+        b = data[pos : pos + n]
+        pos += n
+        return b
 
     def read_str() -> str:
-        n = read_u16()
-        nonlocal pos
-        s = data[pos : pos + n].decode("utf-8")
-        pos += n
-        return s
+        (n,) = struct.unpack("<H", take(2))
+        raw = take(n)
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise IncompleteResponseError(
+                "processing.list answer has a field that isn't UTF-8"
+            ) from e
 
+    (count,) = struct.unpack("<I", take(4))
+    if count > _MAX_PROCESSING_LIST:
+        raise IncompleteResponseError(f"processing.list answer lists {count} jobs")
+    entries: list[ProcessingListEntry] = []
     for _ in range(count):
         name = read_str()
         job_id = read_str()
         status = read_str()
-
-        (created_at,) = struct.unpack_from("<q", data, pos)
-        pos += 8
-
-        results.append(
-            ProcessingListEntry(
-                name=name,
-                job_id=job_id,
-                status=status,
-                created_at=created_at,
-            )
+        (created_at,) = struct.unpack("<q", take(8))
+        entries.append(
+            ProcessingListEntry(name=name, job_id=job_id, status=status, created_at=created_at)
         )
 
-    return results
+    has_more = take(1)[0]
+    if has_more > 1:
+        raise IncompleteResponseError(f"processing.list answer has a has_more of {has_more}")
+    (cursor_len,) = struct.unpack("<H", take(2))
+    cursor = take(cursor_len)
+    if pos != len(data):
+        raise IncompleteResponseError(
+            f"processing.list answer has {len(data) - pos} bytes after the cursor"
+        )
+    if has_more and not cursor:
+        raise IncompleteResponseError("processing.list answer has more pages but no cursor")
+    if not has_more and cursor:
+        raise IncompleteResponseError("processing.list answer has a cursor on its last page")
+    return entries, cursor if has_more else None
 
 
 # =============================================================================

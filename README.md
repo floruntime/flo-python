@@ -108,7 +108,7 @@ while True:
     result = await client.kv.scan("user:", opts)
     for name in result.names:
         print(name)
-    if result.cursor is None or not result.names:
+    if result.cursor is None:
         break
     opts = ScanOptions(cursor=result.cursor, limit=100)
 ```
@@ -380,11 +380,19 @@ if status.error_message is not None:
 ```python
 from flo import ActionListOptions
 
-# List all actions
-actions = await client.action.list()
+# List the namespace's actions a page at a time
+opts = ActionListOptions(limit=100)
+while True:
+    page = await client.action.list(opts)
+    for name in page.names:
+        print(name)
+    if page.cursor is None:
+        break
+    opts = ActionListOptions(limit=100, cursor=page.cursor)
 
-# List with prefix filter
-actions = await client.action.list(ActionListOptions(prefix="process-"))
+# Only actions whose names start with a prefix (needs the next server
+# release; the current one lists every action)
+page = await client.action.list(ActionListOptions(prefix="process-"))
 
 # Delete an action
 await client.action.delete("process-image")
@@ -425,7 +433,7 @@ while True:
     page = await client.worker.list(opts)
     for w in page.workers:
         print(w.worker_id, w.status)
-    if page.cursor is None or not page.workers:
+    if page.cursor is None:
         break
     opts = WorkerListOptions(limit=100, action="process-image", cursor=page.cursor)
 ```
@@ -588,6 +596,7 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 | Error | Description |
 |-------|-------------|
 | `NotFoundError` | Key or resource not found |
+| `NoNamespaceError` | Status `NO_NAMESPACE` (14), not a `NotFoundError`; reads in a namespace that was never created raise it from the server version that adds it |
 | `BadRequestError` | Invalid request parameters |
 | `ConflictError` | CAS version mismatch |
 | `UnauthorizedError` | Authentication failed |

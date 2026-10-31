@@ -18,7 +18,7 @@ VERSION: int = 0x03
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0x05FE53F432E943C4
+TABLE_HASH: int = 0xA8DE7758AFA69427
 # Response header flag: a halted shard answered a read from the state just
 # before the entry it halted at. The read succeeded.
 RESPONSE_STALE: int = 0x01
@@ -79,6 +79,8 @@ class Reason(IntEnum):
     # The shard halted at an entry every replica fails the same way; it takes
     # no writes until an operator repairs it.
     SHARD_HALTED = 29
+    # The op is served only on a node's admin socket.
+    ADMIN_ONLY = 30
 
 
 class Ran(IntEnum):
@@ -131,17 +133,16 @@ class OpCode(IntEnum):
     NAMESPACE_DELETE = 0x011
     NAMESPACE_LIST = 0x012
     NAMESPACE_INFO = 0x013
-    NAMESPACE_CONFIG_SET = 0x014
-    NAMESPACE_CONFIG_GET = 0x015
+    # Sent by one shard to another, never by a client.
+    NAMESPACE_ENSURE = 0x016
 
     # ── Cluster (0x030 – 0x04F) ──
     CLUSTER_STATUS = 0x030
     CLUSTER_MEMBERS = 0x031
-    CLUSTER_JOIN = 0x032
-    CLUSTER_LEAVE = 0x033
-    CLUSTER_TRANSFER_LEADER = 0x034
-    CLUSTER_ADD_NODE = 0x035
-    CLUSTER_REMOVE_NODE = 0x036
+    CLUSTER_PROMOTE = 0x032
+    CLUSTER_REMOVE = 0x033
+    # Served only on a node's admin socket.
+    CLUSTER_REPAIR_SKIP = 0x034
 
     # ── KV (0x100 – 0x12F) ──
     KV_PUT = 0x100
@@ -171,6 +172,7 @@ class OpCode(IntEnum):
     STREAM_LIST = 0x13B
     STREAM_CREATE = 0x13D
     STREAM_ALTER = 0x13F
+    STREAM_DELETE = 0x140
 
     # ── Stream Consumer Groups (0x150 – 0x16F) ──
     STREAM_GROUP_CREATE = 0x150
@@ -268,6 +270,9 @@ class StatusCode(IntEnum):
     # The write committed but hasn't applied: its shard halted at or before
     # it. Resending it would write it twice, or halt again.
     OUTCOME_PENDING = 13
+    # The namespace the request names doesn't exist; NOT_FOUND means a
+    # missing key.
+    NO_NAMESPACE = 14
 
     @classmethod
     def _missing_(cls, value: object) -> "StatusCode | None":
@@ -306,6 +311,7 @@ class StatusCode(IntEnum):
             StatusCode.OUTCOME_PENDING: (
                 "Committed, not applied: its shard halted; don't resend it unchanged"
             ),
+            StatusCode.NO_NAMESPACE: "Namespace not found",
         }
         return messages.get(self, f"Unknown status {int(self)}")
 
@@ -334,6 +340,7 @@ class OptionTag(IntEnum):
     PARTITION_KEY = 0x25  # string: Key for partition routing
     MAX_AGE_SECONDS = 0x26  # u64: Maximum age in seconds for retention
     DRY_RUN = 0x28  # void: Flag to preview what would be deleted
+    FORCE = 0x2C  # void: Flag to delete a stream that still has records
 
     # Consumer Group Options (0x30 - 0x3F)
     ACK_TIMEOUT_MS = 0x30  # u32: Time before unacked message auto-redelivers
@@ -855,6 +862,14 @@ class StreamTrimResult:
 
 
 @dataclass
+class StreamDeleteOptions:
+    """Options for stream delete operations."""
+
+    namespace: str | None = None
+    force: bool = False  # Delete even if the stream still has records
+
+
+@dataclass
 class StreamInfoOptions:
     """Options for stream info operations."""
 
@@ -904,17 +919,6 @@ class ActionType(IntEnum):
     USER = 0  # External worker-based action
 
 
-@dataclass
-class ActionInfo:
-    """Information about a registered action."""
-
-    name: str
-    action_type: ActionType
-    timeout_ms: int
-    max_retries: int
-    description: str | None = None
-
-
 class RunStatus(IntEnum):
     """An action run's status."""
 
@@ -954,10 +958,15 @@ class ActionInvokeResult:
 
 @dataclass
 class ActionListResult:
-    """Result of listing actions."""
+    """A page of registered action names. ``cursor`` gives the next page; None
+    on the last."""
 
-    actions: list[ActionInfo]
+    names: list[str]
     cursor: bytes | None = None
+
+    @property
+    def has_more(self) -> bool:
+        return self.cursor is not None
 
 
 # =============================================================================
@@ -1005,11 +1014,13 @@ class ActionStatusOptions:
 
 @dataclass
 class ActionListOptions:
-    """Options for listing actions."""
+    """Options for listing actions: at most ``limit`` (1..1024; 0 is the
+    server's default) after ``cursor``, the last page's cursor (None starts)."""
 
     namespace: str | None = None
     limit: int = 100
     prefix: str | None = None
+    cursor: bytes | None = None
 
 
 @dataclass
@@ -1282,6 +1293,28 @@ class WorkflowSyncResult:
     action: str  # "created", "updated", "unchanged"
 
 
+@dataclass
+class WorkflowDefinitionEntry:
+    """A workflow definition as a definition list names it."""
+
+    name: str
+    version: str
+    created_at: int
+
+
+@dataclass
+class WorkflowListDefinitionsResult:
+    """A page of workflow definitions. ``cursor`` gives the next page; None on
+    the last. A page may hold fewer than the limit and still have more."""
+
+    definitions: list[WorkflowDefinitionEntry]
+    cursor: bytes | None = None
+
+    @property
+    def has_more(self) -> bool:
+        return self.cursor is not None
+
+
 # =============================================================================
 # Processing Types
 # =============================================================================
@@ -1303,7 +1336,9 @@ class ProcessingStatusOptions:
 
 @dataclass
 class ProcessingListOptions:
-    """Options for listing processing jobs."""
+    """Options for listing processing jobs: at most ``limit`` (1..1024; 0 is
+    the server's default) after ``cursor``, the last page's cursor (None
+    starts)."""
 
     namespace: str | None = None
     limit: int = 100
@@ -1352,6 +1387,19 @@ class ProcessingListEntry:
     job_id: str
     status: str
     created_at: int
+
+
+@dataclass
+class ProcessingListResult:
+    """A page of processing jobs. ``cursor`` gives the next page; None on the
+    last."""
+
+    jobs: list[ProcessingListEntry]
+    cursor: bytes | None = None
+
+    @property
+    def has_more(self) -> bool:
+        return self.cursor is not None
 
 
 @dataclass

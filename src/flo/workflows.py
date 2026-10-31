@@ -11,16 +11,19 @@ import re
 import struct
 from typing import TYPE_CHECKING, Any
 
+from .exceptions import IncompleteResponseError
 from .types import (
     OpCode,
     StatusCode,
     WorkflowCancelOptions,
     WorkflowCreateOptions,
+    WorkflowDefinitionEntry,
     WorkflowDisableOptions,
     WorkflowEnableOptions,
     WorkflowGetDefinitionOptions,
     WorkflowHistoryOptions,
     WorkflowListDefinitionsOptions,
+    WorkflowListDefinitionsResult,
     WorkflowListRunsOptions,
     WorkflowSignalOptions,
     WorkflowStartOptions,
@@ -294,7 +297,6 @@ class WorkflowOperations:
             namespace,
             run_id.encode("utf-8"),
             value,
-            allow_not_found=True,
         )
 
         return resp.data
@@ -330,14 +332,23 @@ class WorkflowOperations:
 
     async def list_definitions(
         self, options: WorkflowListDefinitionsOptions | None = None
-    ) -> bytes:
-        """List workflow definitions. Returns raw response bytes."""
+    ) -> WorkflowListDefinitionsResult:
+        """List one page of workflow definitions.
+
+        Args:
+            options: The page's limit and cursor (the last page's ``cursor``;
+                None starts).
+
+        Returns:
+            WorkflowListDefinitionsResult with the page's definitions and the
+            next page's cursor, None on the last page. Page until ``has_more``
+            is False, not until a page comes back short.
+        """
         opts = options or WorkflowListDefinitionsOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
         # Wire format: [limit:u32][cursor...]
-        cursor = opts.cursor or b""
-        value = struct.pack("<I", opts.limit) + cursor
+        value = struct.pack("<I", opts.limit) + (opts.cursor or b"")
 
         resp = await self._client._send_and_check(
             OpCode.WORKFLOW_LIST_DEFINITIONS,
@@ -345,8 +356,8 @@ class WorkflowOperations:
             b"",
             value,
         )
-
-        return resp.data
+        entries, cursor = _parse_definition_list(resp.data)
+        return WorkflowListDefinitionsResult(definitions=entries, cursor=cursor)
 
     async def disable(self, name: str, options: WorkflowDisableOptions | None = None) -> None:
         """Disable a workflow definition (prevents new runs)."""
@@ -433,6 +444,69 @@ class WorkflowOperations:
                 result = await self.sync(yaml_content, options)
                 results.append(result)
         return results
+
+
+# A page holds at most this many entries; a larger count is a corrupt answer.
+_MAX_DEFINITION_LIST = 1024
+
+
+def _parse_definition_list(
+    data: bytes,
+) -> tuple[list[WorkflowDefinitionEntry], bytes | None]:
+    """The page's definitions and the next page's cursor, None on the last page.
+
+    Wire format: [count:u32]([name_len:u16][name][version_len:u16][version]
+                 [created_at:i64])*[has_more:u8][cursor_len:u16][cursor]
+    """
+    pos = 0
+
+    def take(n: int) -> bytes:
+        nonlocal pos
+        if pos + n > len(data):
+            raise IncompleteResponseError("workflow.list_definitions answer is truncated")
+        b = data[pos : pos + n]
+        pos += n
+        return b
+
+    def read_str() -> str:
+        (n,) = struct.unpack("<H", take(2))
+        try:
+            return take(n).decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise IncompleteResponseError(
+                "workflow.list_definitions answer has a field that isn't UTF-8"
+            ) from e
+
+    (count,) = struct.unpack("<I", take(4))
+    if count > _MAX_DEFINITION_LIST:
+        raise IncompleteResponseError(f"workflow.list_definitions answer lists {count} definitions")
+    entries: list[WorkflowDefinitionEntry] = []
+    for _ in range(count):
+        name = read_str()
+        version = read_str()
+        (created_at,) = struct.unpack("<q", take(8))
+        entries.append(WorkflowDefinitionEntry(name=name, version=version, created_at=created_at))
+
+    has_more = take(1)[0]
+    if has_more > 1:
+        raise IncompleteResponseError(
+            f"workflow.list_definitions answer has a has_more of {has_more}"
+        )
+    (cursor_len,) = struct.unpack("<H", take(2))
+    cursor = take(cursor_len)
+    if pos != len(data):
+        raise IncompleteResponseError(
+            f"workflow.list_definitions answer has {len(data) - pos} bytes after the cursor"
+        )
+    if has_more and not cursor:
+        raise IncompleteResponseError(
+            "workflow.list_definitions answer has more pages but no cursor"
+        )
+    if not has_more and cursor:
+        raise IncompleteResponseError(
+            "workflow.list_definitions answer has a cursor on its last page"
+        )
+    return entries, cursor if has_more else None
 
 
 # =============================================================================

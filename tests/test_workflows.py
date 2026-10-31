@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from flo import FloClient
+from flo import FloClient, WorkflowListDefinitionsOptions
 from flo.exceptions import FloError, NotFoundError
 from flo.types import RunStatus
 from flo.worker import ActionWorker
@@ -140,13 +140,6 @@ class RunEntry:
     created_at: int
 
 
-@dataclass
-class DefinitionEntry:
-    name: str
-    version: str
-    created_at: int
-
-
 def parse_history(data: bytes) -> list[HistoryEvent]:
     """Parse binary history response.
 
@@ -230,44 +223,6 @@ def parse_list_runs(data: bytes) -> list[RunEntry]:
 
         runs.append(RunEntry(run_id=run_id, workflow=workflow, status=status, created_at=ts))
     return runs
-
-
-def parse_list_definitions(data: bytes) -> list[DefinitionEntry]:
-    """Parse binary list-definitions response.
-
-    Format: [count:u32]([name_len:u16][name][ver_len:u16][ver][ts:i64])*
-    """
-    if len(data) < 4:
-        return []
-    count = struct.unpack_from("<I", data, 0)[0]
-    pos = 4
-    defs = []
-    for _ in range(count):
-        if pos + 2 > len(data):
-            break
-        name_len = struct.unpack_from("<H", data, pos)[0]
-        pos += 2
-        if pos + name_len > len(data):
-            break
-        name = data[pos : pos + name_len].decode("utf-8")
-        pos += name_len
-
-        if pos + 2 > len(data):
-            break
-        ver_len = struct.unpack_from("<H", data, pos)[0]
-        pos += 2
-        if pos + ver_len > len(data):
-            break
-        version = data[pos : pos + ver_len].decode("utf-8")
-        pos += ver_len
-
-        if pos + 8 > len(data):
-            break
-        ts = struct.unpack_from("<q", data, pos)[0]
-        pos += 8
-
-        defs.append(DefinitionEntry(name=name, version=version, created_at=ts))
-    return defs
 
 
 # ---------------------------------------------------------------------------
@@ -358,8 +313,14 @@ class TestListDefinitions:
     async def test_list_definitions(self, client: FloClient, worker: ActionWorker):
         await sync_test_workflows(client)
 
-        data = await client.workflow.list_definitions()
-        defs = parse_list_definitions(data)
+        defs = []
+        opts = WorkflowListDefinitionsOptions()
+        while True:
+            page = await client.workflow.list_definitions(opts)
+            defs.extend(page.definitions)
+            if not page.has_more:
+                break
+            opts = WorkflowListDefinitionsOptions(cursor=page.cursor)
         assert len(defs) >= 1, "Expected at least one workflow definition"
 
         names = {d.name for d in defs}

@@ -323,7 +323,7 @@ class KVOperations:
                 result = await client.kv.scan("user:", opts)
                 for name in result.names:
                     print(name)
-                if result.cursor is None or not result.names:
+                if result.cursor is None:
                     break
                 opts = ScanOptions(cursor=result.cursor)
         """

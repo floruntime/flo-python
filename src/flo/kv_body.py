@@ -39,7 +39,9 @@ from .types import (
 _MAX_ROUTING_KEY = 4096
 _MAX_JSON_PATH = 1024
 _MAX_JSON_DOCUMENT = 252_819
-_MAX_SCAN_CURSOR = 64
+# A scan's cursor: the shard it stopped on (u16), then the last key it
+# returned; its length prefix is a u16.
+_MAX_SCAN_CURSOR = 2 + 4096
 MAX_SCAN = 1024
 MAX_MGET = 256
 # The most bytes of mget key elements (each [len:u16][key]) in one request:
@@ -47,6 +49,7 @@ MAX_MGET = 256
 MAX_MGET_KEYS_BYTES = 253_848
 MAX_HISTORY = 65
 MAX_WORKER_LIST = 1024
+MAX_ACTION_LIST = 1024
 MAX_WORKER_PROCESSES = 1024
 _MAX_WORKER_ID = 4096
 # The longest TTL whose nanoseconds fit a u64.
@@ -175,10 +178,9 @@ def encode_delete_body(
 
 def encode_scan_body(limit: int, cursor: bytes | None) -> bytes:
     """kv.scan's request: limit, cursor (empty for the first page)."""
-    cursor = cursor or b""
-    if len(cursor) > _MAX_SCAN_CURSOR:
-        raise ValidationError(f"scan cursor is {len(cursor)} bytes, at most {_MAX_SCAN_CURSOR}")
-    return _limit("scan limit", limit, MAX_SCAN) + bytes([len(cursor)]) + cursor
+    return _limit("scan limit", limit, MAX_SCAN) + _bytes16(
+        "scan cursor", cursor or b"", _MAX_SCAN_CURSOR
+    )
 
 
 def encode_history_body(limit: int, before_version: int | None, routing_key: str | None) -> bytes:
@@ -370,7 +372,7 @@ def decode_scan_answer(data: bytes) -> tuple[list[str], bytes | None]:
         names = [a.bytes16().decode("utf-8") for _ in range(a.u16())]
     except UnicodeDecodeError as e:
         raise IncompleteResponseError("kv.scan answer has a name that isn't UTF-8") from e
-    cursor = a.bytes8() if a.present() else None
+    cursor = a.bytes16() if a.present() else None
     a.done()
     return names, cursor
 
@@ -520,6 +522,32 @@ def decode_action_invoke_answer(data: bytes) -> str:
         raise IncompleteResponseError("action.invoke answer carries an output")
     a.done()
     return run_id.decode("utf-8")
+
+
+def decode_action_list_answer(data: bytes) -> tuple[list[str], bytes | None]:
+    """action.list's answer: [count:u32]([name_len:u16][name][value_len:u32][value])*
+    [has_more:u8][cursor_len:u16][cursor]. Returns the names and the next
+    page's cursor, None on the last page; the values aren't read."""
+    op = "action.list"
+    a = _Answer(op, data)
+    count = a.u32()
+    if count > MAX_ACTION_LIST:
+        raise IncompleteResponseError(f"{op} answer lists {count} actions")
+    names = []
+    for _ in range(count):
+        try:
+            names.append(a.bytes16().decode("utf-8"))
+        except UnicodeDecodeError as e:
+            raise IncompleteResponseError(f"{op} answer has a name that isn't UTF-8") from e
+        a.bytes32()
+    has_more = a.flag()
+    cursor = a.bytes16()
+    a.done()
+    if has_more and not cursor:
+        raise IncompleteResponseError(f"{op} answer has more pages but no cursor")
+    if not has_more and cursor:
+        raise IncompleteResponseError(f"{op} answer has a cursor on its last page")
+    return names, cursor if has_more else None
 
 
 _E = TypeVar("_E", WorkerType, WorkerStatus, ProcessKind)

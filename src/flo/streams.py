@@ -14,6 +14,7 @@ from .types import (
     StreamAppendOptions,
     StreamAppendResult,
     StreamClaimResult,
+    StreamDeleteOptions,
     StreamGroupAckOptions,
     StreamGroupJoinOptions,
     StreamGroupNackOptions,
@@ -82,7 +83,6 @@ class StreamOperations:
             namespace,
             stream.encode("utf-8"),
             value,
-            allow_not_found=True,
         )
 
         return parse_stream_append_response(response.data)
@@ -155,7 +155,6 @@ class StreamOperations:
             stream.encode("utf-8"),
             b"",
             builder.build(),
-            allow_not_found=True,
         )
 
         return parse_stream_read_response(response.data)
@@ -186,7 +185,6 @@ class StreamOperations:
             namespace,
             stream.encode("utf-8"),
             b"",
-            allow_not_found=True,
         )
 
         return parse_stream_info_response(response.data)
@@ -239,6 +237,34 @@ class StreamOperations:
         removed, first_seq = struct.unpack("<QQ", response.data)
         return StreamTrimResult(removed=removed, first_seq=first_seq)
 
+    async def delete(
+        self,
+        stream: str,
+        options: StreamDeleteOptions | None = None,
+    ) -> None:
+        """Delete a stream's records and metadata.
+
+        Deleting a stream that doesn't exist succeeds. A stream that still has
+        records is refused with ``ConflictError`` unless ``force`` is set.
+
+        Example:
+            await client.stream.delete("events", StreamDeleteOptions(force=True))
+        """
+        opts = options or StreamDeleteOptions()
+        namespace = self._client.get_namespace(opts.namespace)
+
+        builder = OptionsBuilder()
+        if opts.force:
+            builder.add_flag(OptionTag.FORCE)
+
+        await self._client._send_and_check(
+            OpCode.STREAM_DELETE,
+            namespace,
+            stream.encode("utf-8"),
+            b"",
+            builder.build(),
+        )
+
     async def group_join(
         self,
         stream: str,
@@ -267,7 +293,6 @@ class StreamOperations:
             namespace,
             stream.encode("utf-8"),
             value,
-            allow_not_found=True,
         )
 
     async def group_leave(
@@ -298,7 +323,6 @@ class StreamOperations:
             namespace,
             stream.encode("utf-8"),
             value,
-            allow_not_found=True,
         )
 
     async def group_read(
@@ -356,7 +380,6 @@ class StreamOperations:
             stream.encode("utf-8"),
             value,
             builder.build(),
-            allow_not_found=True,
         )
 
         return parse_stream_read_response(response.data)
@@ -386,7 +409,6 @@ class StreamOperations:
             namespace,
             stream.encode("utf-8"),
             value,
-            allow_not_found=True,
         )
 
         return parse_pending_entries(response.data)
@@ -432,7 +454,6 @@ class StreamOperations:
             namespace,
             stream.encode("utf-8"),
             value,
-            allow_not_found=True,
         )
 
         # Response = <records blob> + [next_ts:u64][next_seq:u64] trailer.

@@ -18,7 +18,12 @@ from flo import (
     ScanOptions,
 )
 from flo import kv_body as kb
-from flo.exceptions import IncompleteResponseError, NotFoundError, ValidationError
+from flo.exceptions import (
+    IncompleteResponseError,
+    NoNamespaceError,
+    NotFoundError,
+    ValidationError,
+)
 from flo.kv_txn import Transaction, begin
 from flo.types import (
     HEADER_SIZE,
@@ -84,7 +89,7 @@ H = bytes.fromhex
 
 def test_request_bodies_match_the_servers_schemas() -> None:
     assert kb.encode_delete_body(7, "rk", None) == H("010700000000000000010200726b00")
-    assert kb.encode_scan_body(2, b"c1") == H("0102000000026331")
+    assert kb.encode_scan_body(2, b"c1") == H("010200000002006331")
     assert kb.encode_history_body(2, None, None) == H("01020000000000")
     assert kb.encode_history_body(2, 7, "rk") == H("0102000000010700000000000000010200726b")
     assert kb.encode_mget_body([b"a", b"b"]) == H("020001006101006200")
@@ -101,7 +106,7 @@ def test_request_bodies_match_the_servers_schemas() -> None:
 def test_answers_match_the_servers_schemas() -> None:
     assert kb.decode_delete_answer(H("0101")) is True
     assert kb.decode_delete_answer(H("00")) is None
-    assert kb.decode_scan_answer(H("02000100610200626201026332")) == (["a", "bb"], b"c2")
+    assert kb.decode_scan_answer(H("0200010061020062620102006332")) == (["a", "bb"], b"c2")
     assert kb.decode_scan_answer(H("000000")) == ([], None)
     assert kb.decode_history_answer(H("010300000000000000e8030000000000000002000000763301")) == (
         [VersionEntry(version=3, at_ms=1000, deleted=False, value=b"v3")],
@@ -253,17 +258,30 @@ async def test_delete_says_whether_the_key_existed(monkeypatch: pytest.MonkeyPat
 async def test_scan_sends_the_prefix_as_key_and_pages_by_cursor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client, calls = _client(monkeypatch, _ok("02000100610200626201026332"), _ok("000000"))
+    client, calls = _client(monkeypatch, _ok("0200010061020062620102006332"), _ok("000000"))
     page = await client.kv.scan("p", ScanOptions(limit=2))
     assert (page.names, page.cursor, page.has_more) == (["a", "bb"], b"c2", True)
     page = await client.kv.scan("p", ScanOptions(limit=2, cursor=page.cursor))
     assert (page.names, page.cursor, page.has_more) == ([], None, False)
     assert [(c[2], c[3]) for c in calls] == [
-        (b"p", H("010200000000")),
-        (b"p", H("0102000000026332")),
+        (b"p", H("01020000000000")),
+        (b"p", H("010200000002006332")),
     ]
     await client.kv.scan()
-    assert calls[2][2:4] == (b"", b"\x01" + struct.pack("<I", 1024) + b"\x00")
+    assert calls[2][2:4] == (b"", b"\x01" + struct.pack("<I", 1024) + b"\x00\x00")
+
+
+async def test_a_scan_cursor_holding_a_whole_key_round_trips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # [shard:u16][last key]: the longest a 4096-byte key makes.
+    cursor = struct.pack("<H", 3) + b"k" * 4096
+    answer = H("0100") + H("01006b") + b"\x01" + struct.pack("<H", len(cursor)) + cursor
+    client, calls = _client(monkeypatch, _ok(answer), _ok("000000"))
+    page = await client.kv.scan("p", ScanOptions(limit=1))
+    assert (page.names, page.cursor) == (["k"], cursor)
+    await client.kv.scan("p", ScanOptions(limit=1, cursor=page.cursor))
+    assert calls[1][3] == H("0101000000") + struct.pack("<H", len(cursor)) + cursor
 
 
 async def test_history_carries_each_versions_time(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -442,12 +460,24 @@ async def test_json_get_is_absent_on_not_found_and_raises_on_any_other(
         await client.kv.json_get("k")
 
 
+async def test_a_missing_namespace_raises_though_its_reason_is_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The server sends no_namespace with reason NOT_FOUND: only the status
+    # tells it from an absent key.
+    client, _ = _client(monkeypatch, _refused(StatusCode.NO_NAMESPACE, Reason.NOT_FOUND))
+    with pytest.raises(NoNamespaceError):
+        await client.kv.json_get("k")
+    with pytest.raises(NoNamespaceError):
+        await client.kv.get("k")
+
+
 async def test_bounds_are_refused_before_a_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
     client, calls = _client(monkeypatch, _ok(b""))
     refused = [
         client.kv.scan("p", ScanOptions(limit=0)),
         client.kv.scan("p", ScanOptions(limit=1025)),
-        client.kv.scan("p", ScanOptions(cursor=bytes(65))),
+        client.kv.scan("p", ScanOptions(cursor=bytes(4099))),
         client.kv.history("k", HistoryOptions(limit=66)),
         client.kv.history("k", HistoryOptions(limit=0)),
         client.kv.mget([f"k{i}" for i in range(257)]),
