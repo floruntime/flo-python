@@ -37,7 +37,7 @@ The server's op table hash is now `0xa8de7758afa69427` (`TABLE_HASH`).
 
 ### Breaking
 
-- `workflow.history` and `workflow.status` of a missing run, and a
+- `workflow.history` of a missing run, and a
   `NOT_FOUND` answer to `stream.append`, `read`, `info`, `group_join`,
   `group_leave`, `group_read`, `group_pending` or `group_claim`, raise
   `NotFoundError`; the refusal's body was parsed as the answer
