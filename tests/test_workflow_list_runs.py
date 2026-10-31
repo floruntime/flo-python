@@ -97,3 +97,14 @@ async def test_list_runs_sends_every_field_and_pages_by_the_cursor(
 def test_list_runs_answer_is_refused_when_malformed(data: bytes) -> None:
     with pytest.raises(IncompleteResponseError):
         _parse_run_list(data)
+
+
+@pytest.mark.asyncio
+async def test_list_runs_refuses_a_limit_outside_u32() -> None:
+    from flo import FloClient, WorkflowListRunsOptions
+    from flo.exceptions import ValidationError
+
+    client = FloClient("127.0.0.1:1")
+    for limit in (-1, 1 << 32):
+        with pytest.raises(ValidationError):
+            await client.workflow.list_runs(WorkflowListRunsOptions(limit=limit))

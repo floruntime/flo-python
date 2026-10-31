@@ -40,6 +40,9 @@ The server's op table hash is now `0xc751512225a42d04` (`TABLE_HASH`).
 
 ### Breaking
 
+- Listing workers in a namespace never created raises `NoNamespaceError`, so
+  a list right after starting a worker there can raise it until the worker
+  has registered (the write that creates the namespace).
 - `workflow.history` of a missing run, and a
   `NOT_FOUND` answer to `stream.append`, `read`, `info`, `group_join`,
   `group_leave`, `group_read`, `group_pending` or `group_claim`, raise

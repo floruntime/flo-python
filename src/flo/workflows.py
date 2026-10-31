@@ -11,7 +11,7 @@ import re
 import struct
 from typing import TYPE_CHECKING, Any
 
-from .exceptions import IncompleteResponseError
+from .exceptions import IncompleteResponseError, ValidationError
 from .types import (
     OpCode,
     StatusCode,
@@ -67,7 +67,11 @@ class WorkflowOperations:
     async def get_definition(
         self, name: str, options: WorkflowGetDefinitionOptions | None = None
     ) -> str | None:
-        """Get the YAML definition of a workflow. Returns None if not found."""
+        """Get the YAML definition of a workflow. Returns None if not found.
+
+        Raises:
+            NoNamespaceError: The namespace was never created.
+        """
         opts = options or WorkflowGetDefinitionOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
@@ -325,6 +329,8 @@ class WorkflowOperations:
 
         # [limit:u32][status_len:u16][status][cursor_len:u16][cursor]
         # [search_len:u16][search], every field sent, an empty one as length 0.
+        if not 0 <= opts.limit <= 0xFFFFFFFF:
+            raise ValidationError(f"limit must be 0 to 4294967295, not {opts.limit}")
         value = bytearray(struct.pack("<I", opts.limit))
         for field in (
             opts.status.encode("utf-8") if opts.status else b"",

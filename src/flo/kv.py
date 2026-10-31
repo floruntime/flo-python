@@ -207,6 +207,7 @@ class KVOperations:
         when it has none. ``stale`` says a halted shard answered.
 
         Raises:
+            NoNamespaceError: The namespace was never created.
             StaleNotFoundError: A halted shard had no such key as of the entry
                 it halted at; it may exist since.
 
