@@ -121,7 +121,7 @@ ORDER_WORKFLOW_PATH = str(Path(__file__).parent / "order-workflow.yaml")
 
 
 # ---------------------------------------------------------------------------
-# Binary response parsers (matching Go parseHistory/parseListRuns/etc.)
+# Binary response parsers (matching Go parseHistory)
 # ---------------------------------------------------------------------------
 
 
@@ -130,14 +130,6 @@ class HistoryEvent:
     type: str
     detail: str
     timestamp: int
-
-
-@dataclass
-class RunEntry:
-    run_id: str
-    workflow: str
-    status: str
-    created_at: int
 
 
 def parse_history(data: bytes) -> list[HistoryEvent]:
@@ -176,53 +168,6 @@ def parse_history(data: bytes) -> list[HistoryEvent]:
 
         events.append(HistoryEvent(type=typ, detail=detail, timestamp=ts))
     return events
-
-
-def parse_list_runs(data: bytes) -> list[RunEntry]:
-    """Parse binary list-runs response.
-
-    Format: [count:u32]([rid_len:u16][rid][wf_len:u16][wf][st_len:u16][st][ts:i64])*
-    """
-    if len(data) < 4:
-        return []
-    count = struct.unpack_from("<I", data, 0)[0]
-    pos = 4
-    runs = []
-    for _ in range(count):
-        if pos + 2 > len(data):
-            break
-        rid_len = struct.unpack_from("<H", data, pos)[0]
-        pos += 2
-        if pos + rid_len > len(data):
-            break
-        run_id = data[pos : pos + rid_len].decode("utf-8")
-        pos += rid_len
-
-        if pos + 2 > len(data):
-            break
-        wf_len = struct.unpack_from("<H", data, pos)[0]
-        pos += 2
-        if pos + wf_len > len(data):
-            break
-        workflow = data[pos : pos + wf_len].decode("utf-8")
-        pos += wf_len
-
-        if pos + 2 > len(data):
-            break
-        st_len = struct.unpack_from("<H", data, pos)[0]
-        pos += 2
-        if pos + st_len > len(data):
-            break
-        status = data[pos : pos + st_len].decode("utf-8")
-        pos += st_len
-
-        if pos + 8 > len(data):
-            break
-        ts = struct.unpack_from("<q", data, pos)[0]
-        pos += 8
-
-        runs.append(RunEntry(run_id=run_id, workflow=workflow, status=status, created_at=ts))
-    return runs
 
 
 # ---------------------------------------------------------------------------
@@ -574,14 +519,18 @@ class TestListRuns:
 
         from flo.types import WorkflowListRunsOptions
 
-        data = await client.workflow.list_runs(
-            WorkflowListRunsOptions(workflow_name="order-processing", limit=50)
-        )
-        runs = parse_list_runs(data)
-        assert len(runs) >= 1, "Expected at least one run"
+        run_ids: set[str] = set()
+        cursor: bytes | None = None
+        while True:
+            page = await client.workflow.list_runs(
+                WorkflowListRunsOptions(workflow_name="order-processing", limit=50, cursor=cursor)
+            )
+            run_ids.update(r.run_id for r in page.runs)
+            if not page.has_more:
+                break
+            cursor = page.cursor
 
         # Our run should be in there
-        run_ids = {r.run_id for r in runs}
         assert run_id in run_ids, f"Run {run_id} not found in {run_ids}"
 
 

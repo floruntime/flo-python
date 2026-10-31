@@ -9,14 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 The op table hash moves with the server in this release: this SDK talks only
 to the flo it pins, and the pin lands with the release.
-The server's op table hash is now `0xa8de7758afa69427` (`TABLE_HASH`).
+The server's op table hash is now `0xc751512225a42d04` (`TABLE_HASH`).
 
 ### Added
 
 - `NoNamespaceError` for status `NO_NAMESPACE` (14), its own error rather
-  than a `NotFoundError` (a missing key). Reads in a namespace that was never
-  created raise it from the server version that adds it; the pinned server
-  answers them as a missing key or an empty page
+  than a `NotFoundError` (a missing key)
+- `WorkflowListRunsOptions.search`: only runs whose id, workflow, step,
+  input or tags hold it, ignoring case
+- `WorkflowListRunsResult` carries a run list's page (`runs` of
+  `WorkflowRunEntry`: `run_id`, `workflow`, `status`, `created_at`) with
+  `cursor` and `has_more`
 - `Reason.ADMIN_ONLY` (30): the op is served only on a node's admin socket
 - `ActionListOptions.cursor` and `ActionListResult.has_more`: `action.list`
   pages
@@ -57,3 +60,12 @@ The server's op table hash is now `0xa8de7758afa69427` (`TABLE_HASH`).
 - `workflow.list_definitions` returns a `WorkflowListDefinitionsResult`
   (`definitions` of `WorkflowDefinitionEntry`, `cursor`, `has_more`) in place of
   the raw answer bytes
+- `workflow.list_runs` returns a `WorkflowListRunsResult` in place of the raw
+  answer bytes, newest first, and refuses a malformed answer.
+  `WorkflowListRunsOptions.status_filter` is now `status`. A page can come
+  back short with more after it: page until `has_more` is False
+- `stream.info` of a stream that doesn't exist raises `NotFoundError`; the
+  server answered it with zeros
+- A read, list or scan in a namespace that was never created raises
+  `NoNamespaceError`; the server answered it as a missing key or an empty
+  page. A write still creates the namespace
