@@ -83,7 +83,6 @@ class StreamOperations:
             namespace,
             stream.encode("utf-8"),
             value,
-            allow_not_found=True,
         )
 
         return parse_stream_append_response(response.data)
@@ -156,7 +155,6 @@ class StreamOperations:
             stream.encode("utf-8"),
             b"",
             builder.build(),
-            allow_not_found=True,
         )
 
         return parse_stream_read_response(response.data)
@@ -187,7 +185,6 @@ class StreamOperations:
             namespace,
             stream.encode("utf-8"),
             b"",
-            allow_not_found=True,
         )
 
         return parse_stream_info_response(response.data)
@@ -296,7 +293,6 @@ class StreamOperations:
             namespace,
             stream.encode("utf-8"),
             value,
-            allow_not_found=True,
         )
 
     async def group_leave(
@@ -327,7 +323,6 @@ class StreamOperations:
             namespace,
             stream.encode("utf-8"),
             value,
-            allow_not_found=True,
         )
 
     async def group_read(
@@ -385,7 +380,6 @@ class StreamOperations:
             stream.encode("utf-8"),
             value,
             builder.build(),
-            allow_not_found=True,
         )
 
         return parse_stream_read_response(response.data)
@@ -415,7 +409,6 @@ class StreamOperations:
             namespace,
             stream.encode("utf-8"),
             value,
-            allow_not_found=True,
         )
 
         return parse_pending_entries(response.data)
@@ -461,7 +454,6 @@ class StreamOperations:
             namespace,
             stream.encode("utf-8"),
             value,
-            allow_not_found=True,
         )
 
         # Response = <records blob> + [next_ts:u64][next_seq:u64] trailer.

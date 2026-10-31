@@ -24,6 +24,10 @@ The server's op table hash is now `0xa8de7758afa69427` (`TABLE_HASH`).
 
 ### Changed
 
+- A `NOT_FOUND` answer to `stream.append`, `read`, `info`, `group_join`,
+  `group_leave`, `group_read`, `group_pending`, `group_claim` or
+  `workflow.history` raises `NotFoundError`; the refusal's body was parsed as
+  the answer (`workflow.history` of a missing run returned it as the history)
 - `action.list` returns the page's action names (`ActionListResult.names`)
   and the next page's cursor; it returned an empty list whatever the server
   answered

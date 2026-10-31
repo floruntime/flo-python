@@ -297,7 +297,6 @@ class WorkflowOperations:
             namespace,
             run_id.encode("utf-8"),
             value,
-            allow_not_found=True,
         )
 
         return resp.data
