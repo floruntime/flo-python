@@ -469,3 +469,81 @@ async def test_a_worker_resends_an_await_whose_answer_was_lost_with_the_same_key
     first, again, after = (key(p) for p in awaits[:3])
     assert first and first == again
     assert after and after != first
+
+
+async def test_a_refused_await_is_resent_with_its_key_and_an_answered_one_is_not() -> None:
+    # Unavailable with ran unknown may have given this worker the task, and
+    # isn't retried by the client: the worker's next await must carry the
+    # same key to get it back. Once an await is answered, the key is new.
+    awaits: list[bytes] = []
+    writers: list[asyncio.StreamWriter] = []
+    may_have_run = _refusal(Reason.LEADER_UNKNOWN, Ran.UNKNOWN, b"may have been given")
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        writers.append(writer)
+        try:
+            while True:
+                header = await reader.readexactly(HEADER_SIZE)
+                _, n, rid, _, op, *_ = struct.unpack(REQUEST_HEADER_FORMAT, header)
+                payload = await reader.readexactly(n)
+                if op == OpCode.ACTION_AWAIT:
+                    awaits.append(payload)
+                    if len(awaits) == 1:
+                        writer.write(_frame(rid, StatusCode.UNAVAILABLE, may_have_run))
+                    elif len(awaits) == 2:
+                        writer.write(_frame(rid, StatusCode.OK, NO_TASK))
+                    continue
+                answer = b"\x00" if op == OpCode.WORKER_HEARTBEAT else b""
+                writer.write(_frame(rid, StatusCode.OK, answer))
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    client = FloClient(f"127.0.0.1:{port}", timeout_ms=1000, retry=RetryPolicy(max_attempts=1))
+    worker = client.new_action_worker(block_ms=100)
+
+    async def noop(_ctx: object) -> bytes:
+        return b""
+
+    worker.register_action("charge", noop)
+    run = asyncio.create_task(worker.start())
+    try:
+        for _ in range(500):
+            if len(awaits) >= 3:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        worker.stop()
+        await asyncio.wait_for(run, timeout=10)
+        server.close()
+        for w in writers:
+            w.close()
+        await server.wait_closed()
+    assert len(awaits) >= 3
+    first, again, after = (p[-32:] for p in awaits[:3])
+    assert first == again
+    assert after != first
+
+
+async def test_auto_touch_counts_from_when_the_task_arrived() -> None:
+    worker = FloClient("127.0.0.1:1").new_action_worker()
+    loop = asyncio.get_running_loop()
+    touched: list[float] = []
+
+    async def touch(_task: object) -> int:
+        touched.append(loop.time())
+        return 0
+
+    worker._touch_task = touch  # type: ignore[method-assign]
+    stop = asyncio.Event()
+    # A 600 ms lease touches every 100 ms; this task arrived 90 ms ago.
+    task = dataclasses.replace(TASK, lease_ms=600)
+    started = loop.time()
+    touching = asyncio.create_task(worker._keep_touching(task, stop, started - 0.09))
+    await asyncio.sleep(0.15)
+    stop.set()
+    await asyncio.wait_for(touching, 1)
+    assert len(touched) == 2
+    assert touched[0] - started < 0.05  # due 10 ms in, not 100 ms
+    assert 0.07 < touched[1] - touched[0] < 0.13

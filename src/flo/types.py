@@ -1135,8 +1135,8 @@ class ActionRegisterOptions:
     namespace: str | None = None
     # The lease: how long a worker holds a run without completing, failing
     # or touching it before it's taken back. The server takes 5000 to
-    # 43200000 ms; 0 is its default, 300000.
-    timeout_ms: int = 30000
+    # 43200000 ms; 0, the default here, takes the server's, 300000.
+    timeout_ms: int = 0
     # Attempts in all, counting the first.
     max_attempts: int = 3
     owner: str | None = None

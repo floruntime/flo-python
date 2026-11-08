@@ -501,9 +501,11 @@ class FloClient:
             action_timeout: Timeout for action handlers in seconds.
             block_ms: Long-poll wait per await in milliseconds, at most 300000.
                 0 means the 30000 default.
-            auto_touch: Touch each task every quarter of its lease while its
-                handler runs. Off by default: a handler that runs past the
-                lease without touching is taken back and run again.
+            auto_touch: Touch each task every sixth of its lease while its
+                handler runs, counted from its arrival. Off by default: a
+                handler that runs past the lease without touching is taken
+                back and run again. A hold ends 12 h after its delivery
+                whatever the touches.
 
         Returns:
             A new ActionWorker instance ready to register actions and start.

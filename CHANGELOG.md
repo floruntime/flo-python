@@ -62,10 +62,21 @@ The server's op table hash is now `0x7eb599c24442118b` (`TABLE_HASH`).
   and definition after the reason
 - `workflow.list_definitions` reads each entry's `enabled` byte; it misread
   every entry after the first
-- A handler cancelled because the worker stops is failed with
-  `abandoned=True`: handed back untried, with no attempt spent
-- `auto_touch` touches every quarter of the task's own lease (`lease_ms`),
-  not every third of the registered timeout
+- A handler that raises, `asyncio.CancelledError` included, or runs past
+  `action_timeout` fails the run with retry, so its attempts run out; only
+  `NonRetryableError` fails it at once (a timeout failed it at once). A task
+  is handed back untried (`abandoned=True`) only when the worker is stopping
+  or the task running the handler is cancelled from outside. `stop()`
+  cancels no handler: they finish and their results are sent
+- `auto_touch` touches every sixth of the task's own lease (`lease_ms`), at
+  least 100 ms apart, counted from when the task arrived; it touched every
+  third of the registered timeout from the handler's start. A hold ends 12 h
+  after its delivery whatever the touches
+- `ActionRegisterOptions.timeout_ms` defaults to 0, which takes the server's
+  300 s lease (it sent 30 s)
+- The action worker resends an await refused without an answer (unavailable
+  with `ran` unknown, say) with the same `request_key`; a new key follows
+  only an answered await
 - The KV transaction docs give the server's defaults, 64 ops and 256 KiB,
   both operator settings; a condition, `cas_version` or `incr` inside a
   transaction is decided at commit

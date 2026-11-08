@@ -169,9 +169,9 @@ async def test_the_touch_pace_follows_the_tasks_lease_not_the_registered_timeout
 
 @pytest.mark.parametrize(
     ("lease_ms", "interval_s"),
-    [(400, 0.1), (30000, 7.5), (100, 0.1), (43_200_000, 10_800.0)],
+    [(400, 0.1), (30000, 5.0), (100, 0.1), (43_200_000, 7_200.0)],
 )
-def test_touch_pace_is_a_quarter_of_the_lease(lease_ms: int, interval_s: float) -> None:
+def test_touch_pace_is_a_sixth_of_the_lease(lease_ms: int, interval_s: float) -> None:
     assert _touch_pace(lease_ms) == interval_s
 
 

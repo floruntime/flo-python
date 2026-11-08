@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from flo import FloClient
+from flo import FloClient, NonRetryableError
 from flo.types import HEADER_SIZE, OpCode, Ran, StatusCode, TaskAssignment
 from flo.wire import REQUEST_HEADER_FORMAT
 from flo.worker import ActionContext, StreamContext
@@ -245,7 +245,7 @@ async def _run_with_timeout(fake: FakeActionServer, handler: Any) -> None:
         await server.wait_closed()
 
 
-async def test_a_handler_timeout_fails_for_good() -> None:
+async def test_a_handler_past_its_timeout_fails_with_retry() -> None:
     fake = FakeActionServer()
 
     async def slow(ctx: ActionContext) -> bytes:
@@ -255,7 +255,18 @@ async def test_a_handler_timeout_fails_for_good() -> None:
     await _run_with_timeout(fake, slow)
     assert fake.ops() == [OpCode.ACTION_FAIL]
     frame = fake.results[0][1]
-    assert frame.endswith(fail_tail("Action timed out", retry=False))
+    assert frame.endswith(fail_tail("Action timed out", retry=True))
+
+
+async def test_only_a_non_retryable_error_fails_the_run_at_once() -> None:
+    fake = FakeActionServer()
+
+    async def gives_up(ctx: ActionContext) -> bytes:
+        raise NonRetryableError("bad input")
+
+    await _run_with_timeout(fake, gives_up)
+    assert fake.ops() == [OpCode.ACTION_FAIL]
+    assert fake.results[0][1].endswith(fail_tail("bad input", retry=False))
 
 
 async def test_a_timeout_error_raised_by_the_handler_is_an_ordinary_failure() -> None:
@@ -297,6 +308,36 @@ async def test_a_cancelled_task_is_handed_back_and_the_cancellation_kept() -> No
     with pytest.raises(asyncio.CancelledError):
         await run
     assert fails == [("Action cancelled", True, True)]
+    assert worker._semaphore.locked() is False
+
+
+@pytest.mark.parametrize("stopping", [False, True])
+async def test_a_handler_that_raises_cancelled_fails_with_retry_unless_stopping(
+    stopping: bool,
+) -> None:
+    # The handler's own CancelledError (stop() cancels no handler) is a
+    # failure that spends an attempt, so a run can't come back forever.
+    fails: list[tuple[str, bool, bool]] = []
+
+    class Results:
+        async def fail(self, wid: str, task: TaskAssignment, message: str, opts: Any) -> None:
+            fails.append((message, opts.retry, opts.abandoned))
+
+    class ResultClient:
+        worker = Results()
+
+    worker = FloClient("127.0.0.1:1").new_action_worker()
+
+    async def cancels(ctx: ActionContext) -> bytes:
+        raise asyncio.CancelledError()
+
+    worker.register_action(ACTION, cancels)
+    worker._result_client = ResultClient()  # type: ignore[assignment]
+    worker._semaphore = asyncio.Semaphore(0)
+    if stopping:
+        worker.stop()
+    await worker._execute_task(TASK)
+    assert fails == [("Action cancelled", True, stopping)]
     assert worker._semaphore.locked() is False
 
 

@@ -536,11 +536,13 @@ async def run_worker():
 asyncio.run(run_worker())
 ```
 
-The worker registers each action with the server when it starts, with exactly the options given (when none, this SDK's defaults: a 30 s lease, 3 attempts). Registering replaces the action's settings, so workers that register one action with different options leave it with whichever registered last.
+The worker registers each action with the server when it starts, with exactly the options given (when none: the server's 300 s lease and 3 attempts). Registering replaces the action's settings, so workers that register one action with different options leave it with whichever registered last.
 
-A run whose handler goes past its lease without touching it is taken back and run again, by this worker or another. `auto_touch=True` touches each task every quarter of its lease while the handler runs; it's off by default. Without it, call `await ctx.touch()` from long handlers. The worker also stops any handler after its own `action_timeout` (300 s by default) whatever the action's `timeout_ms`, so raise it for actions that run longer.
+A run whose handler goes past its lease without touching it is taken back and run again, by this worker or another. `auto_touch=True` touches each task every sixth of its lease, counted from when the task arrived, while the handler runs; it's off by default. A hold ends 12 h after its delivery whatever the touches. Without it, call `await ctx.touch()` from long handlers. The worker also stops any handler after its own `action_timeout` (300 s by default) whatever the action's `timeout_ms`, and fails the run with retry, so raise it for actions that run longer.
 
-Delivery is at-least-once: a result lost to a dropped connection is resent, and one that never arrives lets the lease run out, so a handler may see the same task or record again. A handler cancelled because the worker stops is handed back untried, spending no attempt. `worker.stop()` waits for running handlers, and their results are still sent.
+Delivery is at-least-once: a result lost to a dropped connection is resent, and one that never arrives lets the lease run out, so a handler may see the same task or record again. A handler that raises (`asyncio.CancelledError` included) or runs past `action_timeout` fails the run with retry, so it runs again until its attempts are spent; raise `NonRetryableError` to fail it for good.
+
+`worker.stop()` takes no new tasks and doesn't cancel running handlers: they finish (up to `action_timeout`), their results are sent, and the worker deregisters before `start()` returns.
 
 Both workers register in the worker registry and heartbeat every 30 s, reporting the handlers they are running. One the server removed after missed heartbeats registers again, with the same options, when its next heartbeat is answered not found.
 
