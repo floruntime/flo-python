@@ -3,9 +3,17 @@
 Transactions are pinned to a single partition, chosen by the routing key
 passed to ``begin``; every op inside the transaction is routed by it.
 
-Caps (server-enforced):
-    * 256 ops per transaction
-    * 1 MiB total payload across buffered writes
+Caps (server-enforced, both operator settings: ``[kv] max_txn_ops`` and
+``[kv] max_txn_bytes``; past either, an op is refused with TXN_TOO_LARGE):
+    * 64 ops per transaction by default
+    * 256 KiB of keys and values across buffered writes by default
+
+A ``condition``, ``cas_version`` or ``incr`` inside a transaction is decided
+when the transaction commits, not when the op is buffered. A condition or
+cas_version that doesn't hold (CONDITION_FAILED, CAS_MISMATCH), an incr of a
+non-counter or past its range (WRONG_TYPE, OUT_OF_RANGE), or an expire of a
+missing key refuses the commit, naming the op, and nothing in the
+transaction applies.
 
 The following operations are NOT supported inside a transaction and raise
 :class:`TxnUnsupportedOpError` without a server round-trip: ``scan``,

@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from flo import (
+    ActionListEntry,
     ActionListOptions,
     FloClient,
     ProcessingListOptions,
@@ -70,7 +71,7 @@ async def test_processing_list_pages_by_the_cursor_it_returns(
     pages = [
         struct.pack("<I", 1)
         + job(b"etl")
-        + struct.pack("<q", 5)
+        + struct.pack("<qIQ", 5, 64, 1200)  # created_at, batch_size, records_processed
         + b"\x01"
         + struct.pack("<H", len(cursor))
         + cursor,
@@ -87,7 +88,7 @@ async def test_processing_list_pages_by_the_cursor_it_returns(
     monkeypatch.setattr(client, "_send_and_check", fake_send)
 
     page = await client.processing.list(ProcessingListOptions(limit=1))
-    assert [e.name for e in page.jobs] == ["etl"]
+    assert [(e.name, e.batch_size, e.records_processed) for e in page.jobs] == [("etl", 64, 1200)]
     assert (page.cursor, page.has_more) == (cursor, True)
     page = await client.processing.list(ProcessingListOptions(limit=1, cursor=page.cursor))
     assert (page.jobs, page.cursor, page.has_more) == ([], None, False)
@@ -102,11 +103,12 @@ async def test_workflow_list_definitions(sent: tuple[FloClient, list[Call]]) -> 
 
 def _definition_page(defs: list[tuple[bytes, bytes, int]], cursor: bytes | None) -> bytes:
     """workflow.list_definitions' answer: [count:u32]([name_len:u16][name]
-    [version_len:u16][version][created_at:i64])*[has_more:u8][cursor_len:u16][cursor]."""
+    [version_len:u16][version][created_at:i64][enabled:u8])*[has_more:u8]
+    [cursor_len:u16][cursor]. A definition created at an odd time is disabled."""
     out = struct.pack("<I", len(defs))
     for name, version, created_at in defs:
         out += struct.pack("<H", len(name)) + name + struct.pack("<H", len(version)) + version
-        out += struct.pack("<q", created_at)
+        out += struct.pack("<qB", created_at, created_at % 2 == 0)
     cursor = cursor or b""
     return out + bytes([1 if cursor else 0]) + struct.pack("<H", len(cursor)) + cursor
 
@@ -134,13 +136,15 @@ async def test_workflow_list_definitions_pages_by_the_cursor_it_returns(
 
     page = await client.workflow.list_definitions(WorkflowListDefinitionsOptions(limit=3))
     assert page.definitions == [
-        WorkflowDefinitionEntry(name="order", version="1.0.0", created_at=5)
+        WorkflowDefinitionEntry(name="order", version="1.0.0", created_at=5, enabled=False)
     ]
     assert (page.cursor, page.has_more) == (cursor, True)
     page = await client.workflow.list_definitions(
         WorkflowListDefinitionsOptions(limit=3, cursor=page.cursor)
     )
-    assert [(e.name, e.version) for e in page.definitions] == [("refund", "2.1.0")]
+    assert [(e.name, e.version, e.enabled) for e in page.definitions] == [
+        ("refund", "2.1.0", False)
+    ]
     assert (page.cursor, page.has_more) == (None, False)
     assert values == [struct.pack("<I", 3), struct.pack("<I", 3) + cursor]
 
@@ -150,12 +154,28 @@ async def test_workflow_list_definitions_pages_by_the_cursor_it_returns(
     [
         _definition_page([(b"a", b"1", 0)], None)[:-1],  # cut short
         _definition_page([(b"a", b"1", 0)], None) + b"\x00",  # a byte left over
+        # enabled isn't a flag
+        struct.pack("<IH", 1, 1)
+        + b"a"
+        + struct.pack("<H", 1)
+        + b"1"
+        + struct.pack("<qB", 0, 2)
+        + b"\x00"
+        + struct.pack("<H", 0),
         struct.pack("<I", 0) + b"\x01" + struct.pack("<H", 0),  # more, but no cursor
         struct.pack("<I", 0) + b"\x02" + struct.pack("<H", 0),  # has_more isn't a flag
         struct.pack("<I", 0) + b"\x00" + struct.pack("<H", 1) + b"c",  # last page, yet a cursor
         struct.pack("<I", 1025),  # more than a page holds
     ],
-    ids=["short", "trailing", "more-without-cursor", "bad-flag", "cursor-on-last-page", "too-many"],
+    ids=[
+        "short",
+        "trailing",
+        "bad-enabled",
+        "more-without-cursor",
+        "bad-flag",
+        "cursor-on-last-page",
+        "too-many",
+    ],
 )
 def test_workflow_list_definitions_answer_is_refused_when_malformed(data: bytes) -> None:
     with pytest.raises(IncompleteResponseError):
@@ -170,6 +190,12 @@ async def test_action_list(sent: tuple[FloClient, list[Call]]) -> None:
     assert_paging(calls[1], OpCode.ACTION_LIST, 5, b"\x01\x80\x05\x00\x00\x00")
 
 
+def _action_value(version: int = 1, owner: bytes = b"", timeout_ms: int = 300000) -> bytes:
+    """An action's list value: [version:u32][owner_len:u16][owner][timeout_ms:u64]
+    [max_attempts:u32][created_at_ms:i64]."""
+    return struct.pack("<IH", version, len(owner)) + owner + struct.pack("<QIq", timeout_ms, 3, 77)
+
+
 def _action_page(
     names: list[bytes], cursor: bytes | None, values: list[bytes] | None = None
 ) -> bytes:
@@ -177,7 +203,7 @@ def _action_page(
     [has_more:u8][cursor_len:u16][cursor]."""
     out = struct.pack("<I", len(names))
     for i, name in enumerate(names):
-        value = values[i] if values else b""
+        value = values[i] if values else _action_value()
         out += struct.pack("<H", len(name)) + name + struct.pack("<I", len(value)) + value
     cursor = cursor or b""
     return out + bytes([1 if cursor else 0]) + struct.pack("<H", len(cursor)) + cursor
@@ -190,8 +216,7 @@ async def test_action_list_pages_by_the_cursor_it_returns(
     cursor = b"\x01\x80\x02\x00\x00\x00"
     pages = [
         _action_page([b"resize", b"thumbnail"], cursor),
-        # A single-shard server sends each action's type, version and enabled flag.
-        _action_page([b"upload"], None, [b"\x00\x01\x00\x00\x00\x01"]),
+        _action_page([b"upload"], None, [_action_value(4, b"media", 60000)]),
     ]
     values: list[bytes] = []
 
@@ -207,6 +232,16 @@ async def test_action_list_pages_by_the_cursor_it_returns(
     assert (page.names, page.cursor, page.has_more) == (["resize", "thumbnail"], cursor, True)
     page = await client.action.list(ActionListOptions(limit=2, cursor=page.cursor))
     assert (page.names, page.cursor, page.has_more) == (["upload"], None, False)
+    assert page.actions == [
+        ActionListEntry(
+            name="upload",
+            version=4,
+            owner="media",
+            timeout_ms=60000,
+            max_attempts=3,
+            created_at_ms=77,
+        )
+    ]
     assert values == [struct.pack("<I", 2), struct.pack("<I", 2) + cursor]
 
 
@@ -218,9 +253,20 @@ async def test_action_list_pages_by_the_cursor_it_returns(
         struct.pack("<I", 0) + b"\x01" + struct.pack("<H", 0),  # more, but no cursor
         struct.pack("<I", 0) + b"\x00" + struct.pack("<H", 1) + b"c",  # last page, yet a cursor
         _action_page([b"\xff"], None),  # a name that isn't UTF-8
+        _action_page([b"a"], None, [_action_value() + b"\x00"]),  # a value too long
+        _action_page([b"a"], None, [_action_value()[:-1]]),  # a value cut short
         struct.pack("<I", 1025),  # more than a page holds
     ],
-    ids=["short", "trailing", "more-without-cursor", "cursor-on-last-page", "bad-utf8", "too-many"],
+    ids=[
+        "short",
+        "trailing",
+        "more-without-cursor",
+        "cursor-on-last-page",
+        "bad-utf8",
+        "long-value",
+        "short-value",
+        "too-many",
+    ],
 )
 def test_action_list_answer_is_refused_when_malformed(data: bytes) -> None:
     with pytest.raises(IncompleteResponseError):

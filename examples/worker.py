@@ -75,7 +75,7 @@ async def process_order(ctx: ActionContext) -> bytes:
     )
 
     # Simulate a long-running order processing task
-    # For long tasks, periodically call Touch to extend the lease
+    # For long tasks, touch at least every half lease to keep it
     items = [OrderItem(**item) for item in req.items]
 
     for i, item in enumerate(items):
@@ -90,7 +90,7 @@ async def process_order(ctx: ActionContext) -> bytes:
         # This is critical for long-running tasks
         if (i + 1) % 3 == 0:
             try:
-                await ctx.touch(30000)
+                await ctx.touch()
                 logger.info(f"  Extended lease for order {req.order_id}")
             except Exception as e:
                 logger.warning(f"Warning: failed to extend lease: {e}")
@@ -142,7 +142,7 @@ async def generate_report(ctx: ActionContext) -> bytes:
 
         # Extend lease periodically
         if step == 2:
-            await ctx.touch(30000)
+            await ctx.touch()
 
     return ctx.to_bytes({
         "report_type": report_type,

@@ -11,7 +11,6 @@ from typing import Any
 
 import google_crc32c
 
-from . import types as types
 from .exceptions import (
     BlockTooLongError,
     IncompleteResponseError,
@@ -791,21 +790,21 @@ def parse_pending_entries(data: bytes) -> list[PendingEntry]:
 def serialize_action_register_value(
     action_type: int,
     timeout_ms: int,
-    max_retries: int,
+    max_attempts: int,
     owner: str | None = None,
 ) -> bytes:
     """Serialize action register value.
 
-    Format: [action_type:u8][timeout_ms:u32][max_retries:u32][owner_len:u16][owner]
+    Format: [action_type:u8][timeout_ms:u32][max_attempts:u32][owner_len:u16][owner]
     """
-    for name, value in (("timeout_ms", timeout_ms), ("max_retries", max_retries)):
+    for name, value in (("timeout_ms", timeout_ms), ("max_attempts", max_attempts)):
         if not 0 <= value < 2**32:
             raise ValueError(f"{name} must be in [0, 2**32), not {value}")
     owner_bytes = (owner or "").encode("utf-8")
     if len(owner_bytes) > 0xFFFF:
         raise ValueError("owner is longer than 65535 bytes")
     return (
-        struct.pack("<BIIH", action_type & 0xFF, timeout_ms, max_retries, len(owner_bytes))
+        struct.pack("<BIIH", action_type & 0xFF, timeout_ms, max_attempts, len(owner_bytes))
         + owner_bytes
     )
 
@@ -893,170 +892,3 @@ def serialize_worker_register_value(
         result.append(0)
 
     return bytes(result)
-
-
-def serialize_worker_await_value(task_types: list[str]) -> bytes:
-    """Serialize worker await value.
-
-    Format: [count:u32][task_type_len:u16][task_type]...
-    """
-    result = bytearray()
-
-    # count
-    result.extend(struct.pack("<I", len(task_types)))
-
-    # task types
-    for tt in task_types:
-        tt_bytes = tt.encode("utf-8")
-        result.extend(struct.pack("<H", len(tt_bytes)))
-        result.extend(tt_bytes)
-
-    return bytes(result)
-
-
-def serialize_worker_touch_value(action_name: str, task_id: str, extend_ms: int = 30000) -> bytes:
-    """Serialize worker touch value.
-
-    Format: [action_name_len:u16][action_name][task_id_len:u16][task_id][extend_ms:u32]
-    """
-    action_bytes = action_name.encode("utf-8")
-    task_id_bytes = task_id.encode("utf-8")
-
-    result = bytearray()
-    result.extend(struct.pack("<H", len(action_bytes)))
-    result.extend(action_bytes)
-    result.extend(struct.pack("<H", len(task_id_bytes)))
-    result.extend(task_id_bytes)
-    result.extend(struct.pack("<I", extend_ms))
-
-    return bytes(result)
-
-
-def serialize_worker_complete_value(
-    action_name: str, task_id: str, result_data: bytes, outcome: str = "success"
-) -> bytes:
-    """Serialize worker complete value.
-
-    Format: [action_name_len:u16][action_name][task_id_len:u16][task_id]
-            [outcome_len:u16][outcome][result_len:u16][result]
-    """
-    action_bytes = action_name.encode("utf-8")
-    task_id_bytes = task_id.encode("utf-8")
-    outcome_bytes = outcome.encode("utf-8")
-
-    result = bytearray()
-    result.extend(struct.pack("<H", len(action_bytes)))
-    result.extend(action_bytes)
-    result.extend(struct.pack("<H", len(task_id_bytes)))
-    result.extend(task_id_bytes)
-    result.extend(struct.pack("<H", len(outcome_bytes)))
-    result.extend(outcome_bytes)
-    result.extend(struct.pack("<H", len(result_data)))
-    result.extend(result_data)
-
-    return bytes(result)
-
-
-def serialize_worker_fail_value(
-    action_name: str, task_id: str, error_message: str, retry: bool = True
-) -> bytes:
-    """Serialize worker fail value.
-
-    Format: [action_name_len:u16][action_name][task_id_len:u16][task_id][retry:u8][error_message...]
-    """
-    action_bytes = action_name.encode("utf-8")
-    task_id_bytes = task_id.encode("utf-8")
-    error_bytes = error_message.encode("utf-8")
-
-    result = bytearray()
-    result.extend(struct.pack("<H", len(action_bytes)))
-    result.extend(action_bytes)
-    result.extend(struct.pack("<H", len(task_id_bytes)))
-    result.extend(task_id_bytes)
-    result.extend(struct.pack("<B", 1 if retry else 0))
-    result.extend(error_bytes)
-
-    return bytes(result)
-
-
-def parse_task_assignment(data: bytes) -> "types.TaskAssignment":
-    """Parse task assignment from server response.
-
-    Format: [task_id_len:u16][task_id][task_type_len:u16][task_type]
-            [created_at:i64][attempt:u32]
-            [has_caller:u8]([run_id_len:u16][run_id][wf_name_len:u16][wf_name])?
-            [payload...]
-    """
-    if len(data) < 10:
-        raise ValueError("Incomplete task assignment response")
-
-    pos = 0
-
-    # task_id
-    task_id_len = struct.unpack_from("<H", data, pos)[0]
-    pos += 2
-    if pos + task_id_len > len(data):
-        raise ValueError("Incomplete task assignment: missing task_id")
-    task_id = data[pos : pos + task_id_len].decode("utf-8")
-    pos += task_id_len
-
-    # task_type
-    if pos + 2 > len(data):
-        raise ValueError("Incomplete task assignment: missing task_type length")
-    task_type_len = struct.unpack_from("<H", data, pos)[0]
-    pos += 2
-    if pos + task_type_len > len(data):
-        raise ValueError("Incomplete task assignment: missing task_type")
-    task_type = data[pos : pos + task_type_len].decode("utf-8")
-    pos += task_type_len
-
-    # created_at
-    if pos + 8 > len(data):
-        raise ValueError("Incomplete task assignment: missing created_at")
-    created_at = struct.unpack_from("<q", data, pos)[0]
-    pos += 8
-
-    # attempt
-    if pos + 4 > len(data):
-        raise ValueError("Incomplete task assignment: missing attempt")
-    attempt = struct.unpack_from("<I", data, pos)[0]
-    pos += 4
-
-    # caller block: [has_caller:u8][run_id_len:u16][run_id][wf_name_len:u16][wf_name]
-    if pos + 1 > len(data):
-        raise ValueError("Incomplete task assignment: missing has_caller")
-    has_caller = data[pos]
-    pos += 1
-    caller_run_id = ""
-    caller_workflow_name = ""
-    if has_caller == 1:
-        if pos + 2 > len(data):
-            raise ValueError("Incomplete task assignment: missing caller_run_id length")
-        crid_len = struct.unpack_from("<H", data, pos)[0]
-        pos += 2
-        if pos + crid_len > len(data):
-            raise ValueError("Incomplete task assignment: missing caller_run_id")
-        caller_run_id = data[pos : pos + crid_len].decode("utf-8")
-        pos += crid_len
-
-        if pos + 2 > len(data):
-            raise ValueError("Incomplete task assignment: missing caller_workflow_name length")
-        cwf_len = struct.unpack_from("<H", data, pos)[0]
-        pos += 2
-        if pos + cwf_len > len(data):
-            raise ValueError("Incomplete task assignment: missing caller_workflow_name")
-        caller_workflow_name = data[pos : pos + cwf_len].decode("utf-8")
-        pos += cwf_len
-
-    # payload (rest of data)
-    payload = data[pos:]
-
-    return types.TaskAssignment(
-        task_id=task_id,
-        task_type=task_type,
-        payload=payload,
-        created_at=created_at,
-        attempt=attempt,
-        caller_run_id=caller_run_id,
-        caller_workflow_name=caller_workflow_name,
-    )

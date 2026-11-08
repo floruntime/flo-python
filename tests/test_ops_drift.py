@@ -43,3 +43,12 @@ def test_status_codes_match_the_server(ops: dict[str, Any]) -> None:
 
 def test_reasons_match_the_server(ops: dict[str, Any]) -> None:
     assert _sdk(Reason) == _server(ops["reasons"])
+
+
+def test_every_table_op_has_its_code_here(ops: dict[str, Any]) -> None:
+    # The table's ops carry typed bodies: each must be an op code this SDK
+    # knows, at the server's code.
+    from flo.types import OpCode
+
+    missing = {e["name"]: hex(e["code"]) for e in ops["ops"] if e["code"] not in set(OpCode)}
+    assert missing == {}

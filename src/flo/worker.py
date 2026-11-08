@@ -54,9 +54,10 @@ from .types import (
     StreamRecord,
     TaskAssignment,
     WorkerAwaitOptions,
+    WorkerCompleteOptions,
+    WorkerFailOptions,
     WorkerRegisterOptions,
     WorkerStatus,
-    WorkerTouchOptions,
     WorkerType,
 )
 from .wire import _validate_block_ms
@@ -139,11 +140,11 @@ _Report = tuple[str, Callable[[FloClient], Awaitable[None]], bool]
 # result, so neither can hang on a server that is gone.
 _STOP_RECONNECT_S = 2.0
 
-# auto_touch never touches more often than this, whatever the timeout.
+# auto_touch never touches more often than this, whatever the lease.
 _MIN_TOUCH_INTERVAL_MS = 100
 
-# The longest lease a touch may ask for; the server refuses more.
-_MAX_TOUCH_EXTEND_MS = 3_600_000
+# The longest error a fail carries; the server refuses more.
+_MAX_FAIL_ERROR = 65_535
 
 # How often a worker heartbeats. The server refuses work to a worker silent
 # past its heartbeat timeout (90 s by default) and later removes it.
@@ -425,13 +426,20 @@ class _RegisteredWorker:
             logger.warning(f"{what} failed: {e}")
 
 
-def _touch_pace(timeout_ms: int) -> tuple[float, int]:
-    """How often (in seconds) to touch a run of an action with timeout_ms,
-    and the lease each touch asks for: the timeout, at most an hour, touched
-    every third of that (at least _MIN_TOUCH_INTERVAL_MS apart) so two can
-    fail in a row."""
-    extend_ms = min(timeout_ms, _MAX_TOUCH_EXTEND_MS)
-    return max(extend_ms / 3, _MIN_TOUCH_INTERVAL_MS) / 1000, extend_ms
+def _touch_pace(lease_ms: int) -> float:
+    """How often (in seconds) to touch a task with lease_ms: every sixth of
+    the lease, at least _MIN_TOUCH_INTERVAL_MS apart. A touch extends only
+    once half the lease or less is left, so two can be lost in a row with a
+    sixth of the lease still to spare."""
+    return max(lease_ms / 6, _MIN_TOUCH_INTERVAL_MS) / 1000
+
+
+def _error_text(message: str) -> bytes:
+    """A fail's error, cut to what the server takes, on a character boundary."""
+    raw = message.encode("utf-8")
+    if len(raw) <= _MAX_FAIL_ERROR:
+        return raw
+    return raw[:_MAX_FAIL_ERROR].decode("utf-8", errors="ignore").encode("utf-8")
 
 
 # Touch refusals that mean the run moved on: touching again can't help.
@@ -528,8 +536,9 @@ class ActionWorkerOptions:
     concurrency: int = 10
     action_timeout: float = 300.0  # 5 minutes
     block_ms: int = _DEFAULT_WORKER_BLOCK_MS
-    # Touch each run every third of its action's timeout while the handler
-    # runs, so a long handler isn't taken back and run again elsewhere.
+    # Touch each task every sixth of its lease while the handler runs, so a
+    # long handler isn't taken back and run again elsewhere. A hold is capped
+    # at 12 h from its delivery whatever the touches.
     auto_touch: bool = False
 
     def __post_init__(self) -> None:
@@ -544,14 +553,40 @@ class ActionContext:
     parsing input and formatting output.
     """
 
-    task_id: str
-    action_name: str
-    payload: bytes
-    attempt: int
-    created_at: int
-    namespace: str
+    task: TaskAssignment
     _worker: "ActionWorker" = field(repr=False)
     _cancel_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+
+    @property
+    def task_id(self) -> str:
+        """The task's id, ``run:deliveries:term:index:action``."""
+        return self.task.task_id
+
+    @property
+    def run_id(self) -> str:
+        return self.task.run
+
+    @property
+    def action_name(self) -> str:
+        return self.task.action
+
+    @property
+    def payload(self) -> bytes:
+        return self.task.input
+
+    @property
+    def attempt(self) -> int:
+        """The run's failures so far, plus one."""
+        return self.task.attempt
+
+    @property
+    def created_at(self) -> int:
+        """When the run was invoked, in Unix ms."""
+        return self.task.created_at_ms
+
+    @property
+    def namespace(self) -> str:
+        return self.task.namespace
 
     def input(self) -> bytes:
         """Get the raw input bytes."""
@@ -582,15 +617,15 @@ class ActionContext:
         """Serialize a value to JSON bytes."""
         return json.dumps(value).encode("utf-8")
 
-    async def touch(self, extend_ms: int = 30000) -> None:
-        """Extend the lease on this task.
+    async def touch(self) -> int:
+        """Keep this task: with half its lease or less left, the lease runs a
+        full lease from now. Call it at least every half lease from a long
+        handler.
 
-        Use this for long-running tasks to prevent timeout.
-
-        Args:
-            extend_ms: How long to extend the lease in milliseconds.
+        Returns:
+            When the lease runs out without another touch, in Unix ms.
         """
-        await self._worker._touch_task(self.action_name, self.task_id, extend_ms)
+        return await self._worker._touch_task(self.task)
 
     @property
     def cancelled(self) -> bool:
@@ -657,9 +692,11 @@ class ActionWorker(_RegisteredWorker):
             action_timeout: Timeout for action handlers in seconds.
             block_ms: Long-poll wait per await in milliseconds, at most 300000.
                 0 means the 30000 default.
-            auto_touch: Touch each run every third of its action's timeout
-                while its handler runs. Off by default: a handler that runs
-                past the timeout without touching is taken back and run again.
+            auto_touch: Touch each task every sixth of its lease while its
+                handler runs, counted from its arrival. Off by default: a
+                handler that runs past the lease without touching is taken
+                back and run again. A hold ends 12 h after its delivery
+                whatever the touches.
         """
         self._parent_client = parent_client
         self.config = ActionWorkerOptions(
@@ -730,8 +767,8 @@ class ActionWorker(_RegisteredWorker):
         """Register an action handler.
 
         The worker registers the action with the server when it starts, with
-        exactly these options (the server's defaults when none: a 30 s
-        timeout, 3 attempts). Registering replaces the action's settings, so
+        exactly these options (when none: the server's 300 s lease and 3
+        attempts). Registering replaces the action's settings, so
         workers registering one action with different options leave it with
         whichever registered last. The options' namespace is ignored: the
         action goes in the worker's.
@@ -886,6 +923,10 @@ class ActionWorker(_RegisteredWorker):
         backoff = _EmptyPollBackoff(self.config.block_ms, leave)
         failed = _worker_backoff()
         halted = _halted_backoff()
+        # Kept until an await is answered: one sent again after a lost answer
+        # or a refusal gets the task the first one may have taken, rather than
+        # leaving it leased to this worker until its lease runs out.
+        request_key: bytes | None = None
         while not leave.is_set():
             # Whether this pass holds a slot: exactly one place releases it.
             held = False
@@ -895,13 +936,15 @@ class ActionWorker(_RegisteredWorker):
                     break
                 held = True
 
-                # Await task from server
                 started = loop.time()
+                if request_key is None:
+                    request_key = secrets.token_hex(16).encode()
                 result = await self._client.worker.await_task(
                     self.config.worker_id,
                     action_names,
-                    WorkerAwaitOptions(block_ms=self.config.block_ms),
+                    WorkerAwaitOptions(block_ms=self.config.block_ms, request_key=request_key),
                 )
+                request_key = None
                 reconnect_pause = 0.0
                 failed.reset()
                 halted.reset()
@@ -916,7 +959,7 @@ class ActionWorker(_RegisteredWorker):
 
                 # Execute task in background; it releases the slot.
                 held = False
-                task = asyncio.create_task(self._execute_task(result.task))
+                task = asyncio.create_task(self._execute_task(result.task, loop.time()))
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)
 
@@ -927,6 +970,9 @@ class ActionWorker(_RegisteredWorker):
             except Exception as e:
                 if held:
                     self._semaphore.release()
+                # The key stays: a refusal may still have given this worker
+                # the task (unavailable with ran unknown, say), and only the
+                # same key gets it back.
                 reason = e.reason if isinstance(e, ServerError) else None
                 if reason == Reason.WORKER_DRAINING:
                     # The server drained this worker: take no more work, and
@@ -1002,14 +1048,15 @@ class ActionWorker(_RegisteredWorker):
             await self._result_client.reconnect()
             self._result_generation += 1
 
-    async def _execute_task(self, task: TaskAssignment) -> None:
-        """Run a task's handler, then report its outcome."""
+    async def _execute_task(self, task: TaskAssignment, arrived: float | None = None) -> None:
+        """Run a task's handler, then report its outcome. ``arrived`` is the
+        loop time the task came in, which auto_touch counts from."""
         rc = self._result_client
         assert rc is not None
         try:
             self._running_handlers += 1
             try:
-                op, send, cancelled = await self._run_handler(task)
+                op, send, cancelled = await self._run_handler(task, arrived)
             finally:
                 self._running_handlers -= 1
             # Reporting stays outside the handler's error handling: a complete
@@ -1022,7 +1069,7 @@ class ActionWorker(_RegisteredWorker):
                 self._leave_event,
             )
             if sent and op == "complete":
-                logger.info(f"Action completed: {task.task_type} (task={task.task_id})")
+                logger.info(f"Action completed: {task.action} (task={task.task_id})")
             if cancelled:
                 raise asyncio.CancelledError()
         except Exception as e:
@@ -1031,64 +1078,50 @@ class ActionWorker(_RegisteredWorker):
             if self._semaphore is not None:
                 self._semaphore.release()
 
-    async def _run_handler(self, task: TaskAssignment) -> "_Report":
+    async def _run_handler(self, task: TaskAssignment, arrived: float | None = None) -> "_Report":
         """Run the task's handler. Its outcome alone decides complete or fail.
 
         Returns the result to send, and whether the handler was cancelled, in
         which case the caller re-raises the cancellation after reporting.
         """
-        from .types import WorkerCompleteOptions, WorkerFailOptions
-
         wid = self.config.worker_id
 
-        def fail(message: str, retry: bool = True, cancelled: bool = False) -> _Report:
-            options = WorkerFailOptions(retry=retry)
-            return (
-                "fail",
-                lambda c: c.worker.fail(wid, task.task_type, task.task_id, message, options),
-                cancelled,
-            )
+        def fail(
+            message: str, retry: bool = True, cancelled: bool = False, abandoned: bool = False
+        ) -> _Report:
+            error = _error_text(message).decode("utf-8")
+            options = WorkerFailOptions(retry=retry, abandoned=abandoned)
+            return ("fail", lambda c: c.worker.fail(wid, task, error, options), cancelled)
 
         def complete(data: bytes, options: WorkerCompleteOptions | None = None) -> _Report:
-            return (
-                "complete",
-                lambda c: c.worker.complete(wid, task.task_type, task.task_id, data, options),
-                False,
-            )
+            return ("complete", lambda c: c.worker.complete(wid, task, data, options), False)
 
         logger.info(
-            f"Executing action: {task.task_type} (task={task.task_id}, attempt={task.attempt})"
+            f"Executing action: {task.action} (task={task.task_id}, attempt={task.attempt})"
         )
-        handler = self._handlers.get(task.task_type)
+        handler = self._handlers.get(task.action)
         if handler is None:
-            logger.error(f"No handler registered for action: {task.task_type}")
-            return fail(f"No handler for: {task.task_type}")
+            logger.error(f"No handler registered for action: {task.action}")
+            return fail(f"No handler for: {task.action}")
 
-        ctx = ActionContext(
-            task_id=task.task_id,
-            action_name=task.task_type,
-            payload=task.payload,
-            attempt=task.attempt,
-            created_at=task.created_at,
-            namespace=self._parent_client.namespace,
-            _worker=self,
-        )
+        ctx = ActionContext(task=task, _worker=self)
         # Not wait_for: a TimeoutError the handler raises itself would look
         # the same as the deadline passing. Only the deadline is final.
         run = asyncio.ensure_future(handler(ctx))
-        timeout_ms = self._action_options[task.task_type].timeout_ms
         stop_touching = asyncio.Event()
         touching = (
-            asyncio.ensure_future(self._keep_touching(task, timeout_ms, stop_touching))
-            if self.config.auto_touch and timeout_ms > 0
+            asyncio.ensure_future(self._keep_touching(task, stop_touching, arrived))
+            if self.config.auto_touch
             else None
         )
         try:
             await asyncio.wait({run}, timeout=self.config.action_timeout)
         except asyncio.CancelledError:
+            # This task was cancelled from outside, not by its handler: hand
+            # the run back untried, so no attempt is spent.
             run.cancel()
-            logger.warning(f"Action cancelled: {task.task_type}")
-            return fail("Action cancelled", cancelled=True)
+            logger.warning(f"Action cancelled: {task.action}")
+            return fail("Action cancelled", cancelled=True, abandoned=True)
         finally:
             if touching is not None:
                 # Let a touch in flight finish: cancelling it mid-request
@@ -1100,15 +1133,20 @@ class ActionWorker(_RegisteredWorker):
             run.cancel()
             with contextlib.suppress(BaseException):
                 await run
-            logger.error(f"Action timed out: {task.task_type}")
-            return fail("Action timed out", retry=False)
+            # A failure like any other: the run goes again while attempts
+            # are left. Only NonRetryableError fails it at once.
+            logger.error(f"Action timed out: {task.action}")
+            return fail("Action timed out")
         try:
             result = run.result()
         except asyncio.CancelledError:
-            logger.warning(f"Action cancelled: {task.task_type}")
-            return fail("Action cancelled", cancelled=True)
+            # The handler raised it, or awaited something cancelled elsewhere:
+            # a failure like any other, so attempts run out, unless the worker
+            # is stopping.
+            logger.warning(f"Action cancelled: {task.action}")
+            return fail("Action cancelled", abandoned=self._stop_event.is_set())
         except Exception as exc:
-            logger.error(f"Action failed: {task.task_type} - {exc!r}")
+            logger.error(f"Action failed: {task.action} - {exc!r}")
             message = str(exc) or type(exc).__name__
             return fail(message, retry=not isinstance(exc, NonRetryableError))
 
@@ -1118,8 +1156,8 @@ class ActionWorker(_RegisteredWorker):
             return complete(json.dumps(result).encode("utf-8"))
         return complete(result if isinstance(result, bytes) else b"")
 
-    async def _touch_task(self, action_name: str, task_id: str, extend_ms: int) -> None:
-        """Extend lease on a task (internal method).
+    async def _touch_task(self, task: TaskAssignment) -> int:
+        """Touch a task (internal method).
 
         On the result connection: the poll connection may be held by a
         blocking await for up to block_ms, longer than a lease can wait.
@@ -1127,35 +1165,39 @@ class ActionWorker(_RegisteredWorker):
         client = self._result_client or self._client
         if client is None:
             raise RuntimeError("Worker not connected")
-        await client.worker.touch(
-            self.config.worker_id,
-            action_name,
-            task_id,
-            WorkerTouchOptions(extend_ms=extend_ms),
-        )
+        return await client.worker.touch(self.config.worker_id, task)
 
     async def _keep_touching(
-        self, task: TaskAssignment, timeout_ms: int, stop: asyncio.Event
+        self, task: TaskAssignment, stop: asyncio.Event, arrived: float | None = None
     ) -> None:
-        """Touch a run at _touch_pace(timeout_ms) until stop is set.
+        """Touch a task every _touch_pace(task.lease_ms), counted from when it
+        arrived (the lease runs from its delivery, not from the handler's
+        start), until stop is set.
 
-        Each touch asks for this worker's timeout (at most an hour), so the
-        lease covers it even if another worker's registration shortened the
-        action's. Conflict, not_found or bad_request means the run moved on
-        (finished, cancelled, taken back) and touching stops; any other
-        refusal, an overloaded leader say, is tried again next interval, and
-        a lost connection is reconnected for it.
+        Conflict (a stale report: the run moved on), not_found or
+        bad_request stops touching; any other refusal, an overloaded leader
+        say, is tried again next interval, and a lost connection is
+        reconnected for it.
         """
-        interval_s, extend_ms = _touch_pace(timeout_ms)
+        loop = asyncio.get_running_loop()
+        interval_s = _touch_pace(task.lease_ms)
+        due = (loop.time() if arrived is None else arrived) + interval_s
         while True:
+            # Checked first: a wait_for with no time left times out before
+            # the wait it wraps has run, however long stop has been set.
+            if stop.is_set():
+                return
             try:
-                await asyncio.wait_for(stop.wait(), interval_s)
+                await asyncio.wait_for(stop.wait(), max(due - loop.time(), 0.0))
                 return
             except asyncio.TimeoutError:
                 pass
+            # A touch that ran long skips the times it missed.
+            while due <= loop.time():
+                due += interval_s
             seen = self._result_generation
             try:
-                await self._touch_task(task.task_type, task.task_id, extend_ms)
+                await self._touch_task(task)
             except ServerError as e:
                 if e.status_code in _TOUCH_FINAL:
                     logger.warning(f"Touch for task {task.task_id} was refused, stopping: {e}")
@@ -1171,9 +1213,10 @@ class ActionWorker(_RegisteredWorker):
         """Signal the worker to stop.
 
         Ends the polling loop, interrupting a blocking Await or a reconnect,
-        and a drain's wait. Running handlers finish and their results are
-        sent before start() returns. A stop before start() ends that run at
-        once.
+        and a drain's wait. Takes no new tasks; running handlers are not
+        cancelled: they finish (up to action_timeout) and their results are
+        sent before start() returns, then the worker deregisters. A stop
+        before start() ends that run at once.
         """
         logger.info("Stopping worker...")
         self._signal_stop()

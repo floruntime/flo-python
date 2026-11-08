@@ -7,6 +7,11 @@ Uses StreamID-native positioning (timestamp_ms + sequence).
 import struct
 from typing import TYPE_CHECKING
 
+from .kv_body import (
+    decode_group_list_answer,
+    decode_group_members_answer,
+    encode_group_members_body,
+)
 from .types import (
     OpCode,
     OptionTag,
@@ -17,6 +22,8 @@ from .types import (
     StreamDeleteOptions,
     StreamGroupAckOptions,
     StreamGroupJoinOptions,
+    StreamGroupListResult,
+    StreamGroupMembersResult,
     StreamGroupNackOptions,
     StreamGroupReadOptions,
     StreamID,
@@ -565,3 +572,32 @@ class StreamOperations:
             stream.encode("utf-8"),
             value,
         )
+
+    async def group_list(self, stream: str, namespace: str | None = None) -> StreamGroupListResult:
+        """A stream's consumer groups: members, pending entries, settings and
+        the last record delivered. Read on the leader; members and pending
+        start again with a new leader."""
+        response = await self._client._send_and_check(
+            OpCode.STREAM_GROUP_LIST,
+            self._client.get_namespace(namespace),
+            stream.encode("utf-8"),
+            b"",
+        )
+        return decode_group_list_answer(response.data)
+
+    async def group_members(
+        self, stream: str, group: str, namespace: str | None = None
+    ) -> StreamGroupMembersResult:
+        """A consumer group's members: each one's state, pending entries, and
+        when it joined and was last delivered to. Read on the leader.
+
+        Raises:
+            NotFoundError: The stream has no such group.
+        """
+        response = await self._client._send_and_check(
+            OpCode.STREAM_GROUP_MEMBERS,
+            self._client.get_namespace(namespace),
+            stream.encode("utf-8"),
+            encode_group_members_body(group),
+        )
+        return decode_group_members_answer(response.data)

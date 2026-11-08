@@ -2,6 +2,7 @@
 fake server."""
 
 import asyncio
+import dataclasses
 import struct
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from flo import ActionContext, FloClient
 from flo.types import HEADER_SIZE, MAGIC, TABLE_HASH, VERSION, OpCode, StatusCode
 from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32c
 from flo.worker import ActionWorker, StreamContext, StreamWorker, _EmptyPollBackoff
+
+from .test_result_resend import NO_TASK, TASK, task_answer
 
 POLL_OPS = (OpCode.ACTION_AWAIT, OpCode.STREAM_GROUP_READ)
 
@@ -50,14 +53,7 @@ def _one_record() -> bytes:
 
 
 def _one_task() -> bytes:
-    return (
-        struct.pack("<H", 2)
-        + b"t1"  # task id
-        + struct.pack("<H", 1)
-        + b"a"  # task type
-        + struct.pack("<qI", 0, 1)  # created_at, attempt
-        + bytes([0])  # no caller
-    )
+    return task_answer(dataclasses.replace(TASK, action="a", input=b""))
 
 
 class FakeServer:
@@ -88,7 +84,8 @@ class FakeServer:
                 self.poll_times.append(loop.time())
                 delay, record = self.script.pop(0) if self.script else (0.0, False)
                 body = _one_task() if op_code == OpCode.ACTION_AWAIT else _one_record()
-                data = body if record else b""
+                empty = NO_TASK if op_code == OpCode.ACTION_AWAIT else b""
+                data = body if record else empty
 
                 def answer(rid: int = request_id, body: bytes = data) -> None:
                     self.answer_times.append(loop.time())

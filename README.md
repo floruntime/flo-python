@@ -189,6 +189,14 @@ async with await client.kv.begin("user:123") as txn:
     print(result.commit_index, result.op_count)
 ```
 
+A transaction holds at most 64 ops and 256 KiB of keys and values by default;
+both are operator settings (`[kv] max_txn_ops`, `[kv] max_txn_bytes`). A
+`condition`, `cas_version` or `incr` inside it is decided at `commit()`, not
+when the op is buffered: one that fails refuses the commit, and nothing in the
+transaction applies. Outside a transaction a failed `cas_version` or
+`condition` raises the same conflict as always, though it is decided as the
+write applies, so it still costs a commit.
+
 ## Queue Operations
 
 ### Enqueue
@@ -228,14 +236,26 @@ while queues are at-most-once they do nothing useful: a dequeued message is
 already acknowledged, so ack and nack have no effect on it, nack does not
 retry it, and messages don't reach the DLQ in normal use.
 
+`queue.dlq_list` reads a page of dead letters, oldest first (`limit` 1..100):
+
+```python
+from flo import DlqListOptions
+
+page = await client.queue.dlq_list("tasks", DlqListOptions(limit=100))
+print(f"{page.total} dead letters")
+while page.has_more:
+    page = await client.queue.dlq_list("tasks", DlqListOptions(after=page.last_seq))
+```
+
 ### Peek
 
 ```python
-# Peek at messages without removing them
+# The next ready messages (1..100, default 20), in dequeue order, without
+# taking them; each shows up to 4 KiB of its payload (msg.size is its length)
 result = await client.queue.peek("tasks", 5)
 for msg in result.messages:
     print(f"Message {msg.seq}: {msg.payload}")
-# Messages remain visible to other consumers
+print("more follow" if result.more else "that's all")
 ```
 
 ## Stream Operations
@@ -325,6 +345,10 @@ result = await client.stream.group_read(
     "events", "processors", "worker-1",
     StreamGroupReadOptions(count=10, block_ms=30000)
 )
+
+# A stream's groups, and a group's members, as the leader sees them
+groups = await client.stream.group_list("events")
+members = await client.stream.group_members("events", "processors")
 ```
 
 ## Action Operations
@@ -340,9 +364,13 @@ from flo import ActionRegisterOptions, ActionType
 await client.action.register(
     "process-image",
     ActionType.USER,
-    ActionRegisterOptions(timeout_ms=60000, max_retries=3)
+    ActionRegisterOptions(timeout_ms=60000, max_attempts=3)
 )
 ```
+
+`timeout_ms` is the lease: how long a worker holds a run without completing,
+failing or touching it. The server takes 5000 to 43200000 ms (0 is its
+default, 300000).
 
 ### Invoke an Action
 
@@ -373,6 +401,12 @@ if status.output is not None:
     print(f"Output: {status.output!r}")
 if status.error_message is not None:
     print(f"Error: {status.error_message}")
+if status.outcome is not None:  # None for success
+    print(f"Outcome: {status.outcome}")
+
+# An action's definition, its runs by status and its completed runs' latency
+info = await client.action.info("process-image")
+print(info.ready, info.running, info.completed, info.latency_p95_ms)
 ```
 
 ### List and Delete Actions
@@ -384,8 +418,8 @@ from flo import ActionListOptions
 opts = ActionListOptions(limit=100)
 while True:
     page = await client.action.list(opts)
-    for name in page.names:
-        print(name)
+    for action in page.actions:
+        print(action.name, action.version, action.timeout_ms)
     if page.cursor is None:
         break
     opts = ActionListOptions(limit=100, cursor=page.cursor)
@@ -442,42 +476,42 @@ The server allows at most 1024 processes per worker and refuses a registration p
 
 ### Await and Process Tasks
 
-```python
-from flo import WorkerAwaitOptions
+A task is one delivery of a run. Its `run`, `deliveries`, `term` and `index`
+name the delivery, and every report on it (complete, fail, touch) names them
+back; a report for a delivery the run has moved on from raises
+`StaleReportError`. A report resent after it applied answers ok.
 
-# Wait for a task (blocking)
+```python
+from flo import WorkerAwaitOptions, WorkerFailOptions
+
+# Wait up to 30 s for a run of either action; the same request_key on a
+# retried await gets the task the first one took
 result = await client.worker.await_task(
     "worker-1",
     ["process-image", "resize-image"],
-    WorkerAwaitOptions(block_ms=30000)  # Wait up to 30s
+    WorkerAwaitOptions(block_ms=30000, request_key=b"poll-1"),
 )
 
 if result.task:
     task = result.task
-    print(f"Got task: {task.task_id} for action: {task.action_name}")
+    print(f"Got task {task.task_id}, attempt {task.attempt}, lease {task.lease_ms} ms")
 
     try:
-        # Process the task
         output = process(task.input)
-
-        # Complete successfully
-        await client.worker.complete("worker-1", task.task_id, output)
+        await client.worker.complete("worker-1", task, output)
     except Exception as e:
-        # Fail the task (will be retried)
-        await client.worker.fail("worker-1", task.task_id, str(e))
+        # Ready again after delay_ms while attempts are left; retry=False
+        # fails the run now, abandoned=True hands it back with no attempt spent
+        await client.worker.fail("worker-1", task, str(e), WorkerFailOptions(delay_ms=1000))
 ```
 
-### Extend Task Lease
+### Keep a Task
 
 ```python
-from flo import WorkerTouchOptions
-
-# For long-running tasks, extend the lease periodically
-await client.worker.touch(
-    "worker-1",
-    task.task_id,
-    WorkerTouchOptions(extend_ms=30000)
-)
+# With half its lease or less left, a touch runs the lease a full lease from
+# now (up to 12 h from its delivery); with more left it changes nothing.
+# Touch at least every half lease.
+expires_at_ms = await client.worker.touch("worker-1", task)
 ```
 
 ### Worker Lifecycle Example
@@ -502,11 +536,13 @@ async def run_worker():
 asyncio.run(run_worker())
 ```
 
-The worker registers each action with the server when it starts, with exactly the options given (the server's defaults when none: a 30 s timeout, 3 attempts). Registering replaces the action's settings, so workers that register one action with different options leave it with whichever registered last.
+The worker registers each action with the server when it starts, with exactly the options given (when none: the server's 300 s lease and 3 attempts). Registering replaces the action's settings, so workers that register one action with different options leave it with whichever registered last.
 
-A run whose handler goes past the action's `timeout_ms` without touching it is taken back and run again, by this worker or another. `auto_touch=True` touches each run every third of its action's timeout while the handler runs; it's off by default. Without it, call `await ctx.touch()` from long handlers. The worker also stops any handler after its own `action_timeout` (300 s by default) whatever the action's `timeout_ms`, so raise it for actions that run longer.
+A run whose handler goes past its lease without touching it is taken back and run again, by this worker or another. `auto_touch=True` touches each task every sixth of its lease, counted from when the task arrived, while the handler runs; it's off by default. A hold ends 12 h after its delivery whatever the touches. Without it, call `await ctx.touch()` from long handlers. The worker also stops any handler after its own `action_timeout` (300 s by default) whatever the action's `timeout_ms`, and fails the run with retry, so raise it for actions that run longer.
 
-Delivery is at-least-once: a result lost to a dropped connection is resent, and one that never arrives lets the lease run out, so a handler may see the same task or record again. `worker.stop()` waits for running handlers, and their results are still sent.
+Delivery is at-least-once: a result lost to a dropped connection is resent, and one that never arrives lets the lease run out, so a handler may see the same task or record again. A handler that raises (`asyncio.CancelledError` included) or runs past `action_timeout` fails the run with retry, so it runs again until its attempts are spent; raise `NonRetryableError` to fail it for good.
+
+`worker.stop()` takes no new tasks and doesn't cancel running handlers: they finish (up to `action_timeout`), their results are sent, and the worker deregisters before `start()` returns.
 
 Both workers register in the worker registry and heartbeat every 30 s, reporting the handlers they are running. One the server removed after missed heartbeats registers again, with the same options, when its next heartbeat is answered not found.
 
@@ -598,7 +634,8 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 | `NotFoundError` | Key or resource not found |
 | `NoNamespaceError` | Status `NO_NAMESPACE` (14), not a `NotFoundError`: a read, list or scan in a namespace that was never created (a write creates it) |
 | `BadRequestError` | Invalid request parameters |
-| `ConflictError` | CAS version mismatch |
+| `ConflictError` | CAS version mismatch, a failed condition, and the like (the reason says which) |
+| `StaleReportError` | A `ConflictError` with reason `STALE_REPORT`: an action complete, fail or touch for a delivery the run has moved on from (the message says how) |
 | `UnauthorizedError` | Authentication failed |
 | `OverloadedError` | Server is overloaded, and the client's retries ran out |
 | `UnavailableError` | No leader, or the shard isn't taking writes or is offline, and the client's retries ran out (the message says why, and whether an operator must act first) |
@@ -615,8 +652,9 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 When the server refuses a request as `overloaded` or `unavailable` and says it
 didn't run it (`error.ran == Ran.NO`), the client sends it again itself, as a
 new request, after a jittered wait. Because the server never ran it, this is
-safe for writes too. Any other refusal, or one that may have run, comes
-straight back.
+safe for writes too. That covers a leader that isn't ready yet (reason
+`LEADER_UNKNOWN`), including a node catching up after a restart. Any other
+refusal, or one that may have run, comes straight back.
 
 Two refusals from a halted shard are never retried, and come back after one
 attempt for the caller to decide:

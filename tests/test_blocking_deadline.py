@@ -282,13 +282,12 @@ async def _noop(ctx: Any) -> Any:
     [(None, 30000), (0, 0), (1500, 1500)],
 )
 def test_action_await_wait(block_ms: int | None, expected: int) -> None:
-    from flo.types import OpCode, OptionTag
-    from flo.wire import OptionsBuilder
+    from flo.kv_body import encode_await_body
+    from flo.types import OpCode
 
-    builder = OptionsBuilder()
-    if block_ms is not None:
-        builder.add_u32(OptionTag.BLOCK_MS, block_ms)
-    assert FloClient._server_wait_ms(OpCode.ACTION_AWAIT, b"", builder.build()) == expected
+    # Two actions ahead of block_ms, so it is read past the list.
+    body = encode_await_body(["a", "bcd"], block_ms, b"rk")
+    assert FloClient._server_wait_ms(OpCode.ACTION_AWAIT, body, b"") == expected
 
 
 def test_kv_get_waits_its_wait_ms() -> None:
@@ -368,7 +367,8 @@ async def test_action_worker_reconnects_at_once_after_a_poll_got_through(
                     REQUEST_HEADER_FORMAT, header
                 )
                 await reader.readexactly(payload_len)
-                writer.write(_response(request_id, b""))
+                no_task = b"\x00" if op_code == OpCode.ACTION_AWAIT else b""
+                writer.write(_response(request_id, no_task))
                 if op_code == OpCode.ACTION_AWAIT:
                     await writer.drain()
                     break

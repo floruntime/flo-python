@@ -18,7 +18,7 @@ VERSION: int = 0x03
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0xC751512225A42D04
+TABLE_HASH: int = 0x7EB599C24442118B
 # Response header flag: a halted shard answered a read from the state just
 # before the entry it halted at. The read succeeded.
 RESPONSE_STALE: int = 0x01
@@ -81,6 +81,8 @@ class Reason(IntEnum):
     SHARD_HALTED = 29
     # The op is served only on a node's admin socket.
     ADMIN_ONLY = 30
+    # A processing job that still runs can't be removed: stop or cancel it first.
+    JOB_RUNNING = 31
 
 
 class Ran(IntEnum):
@@ -187,6 +189,8 @@ class OpCode(IntEnum):
     STREAM_GROUP_TOUCH = 0x15A
     STREAM_GROUP_INFO = 0x15B
     STREAM_GROUP_DELETE = 0x15C
+    STREAM_GROUP_LIST = 0x15D
+    STREAM_GROUP_MEMBERS = 0x15E
 
     # ── Queues (0x170 – 0x19F) ──
     QUEUE_ENQUEUE = 0x170
@@ -197,8 +201,8 @@ class OpCode(IntEnum):
     QUEUE_DLQ_DELETE = 0x177
     QUEUE_DLQ_REQUEUE = 0x178
     QUEUE_STATS = 0x17B
-    QUEUE_PEEK = 0x17C
     QUEUE_PURGE = 0x17F
+    QUEUE_PEEK = 0x180
     QUEUE_LIST = 0x198
 
     # ── Time-Series (0x1A0 – 0x1BF) ──
@@ -209,6 +213,7 @@ class OpCode(IntEnum):
     TS_LIST = 0x1A4
     TS_DELETE = 0x1A5
     TS_RETENTION = 0x1A6
+    TS_INFO = 0x1A7
 
     # ── Actions (0x300 – 0x31F) ──
     ACTION_REGISTER = 0x300
@@ -217,10 +222,11 @@ class OpCode(IntEnum):
     ACTION_LIST = 0x303
     ACTION_LIST_RUNS = 0x304
     ACTION_DELETE = 0x305
-    ACTION_AWAIT = 0x306
-    ACTION_COMPLETE = 0x307
-    ACTION_FAIL = 0x308
-    ACTION_TOUCH = 0x309
+    ACTION_AWAIT = 0x30A
+    ACTION_COMPLETE = 0x30B
+    ACTION_FAIL = 0x30C
+    ACTION_TOUCH = 0x30D
+    ACTION_INFO = 0x30F
 
     # ── Workers (0x320 – 0x33F) ──
     WORKER_REGISTER = 0x320
@@ -249,6 +255,7 @@ class OpCode(IntEnum):
     PROCESSING_CANCEL = 0x362
     PROCESSING_STATUS = 0x363
     PROCESSING_LIST = 0x364
+    PROCESSING_REMOVE = 0x365
 
 
 class StatusCode(IntEnum):
@@ -530,6 +537,53 @@ class DequeueResult:
     messages: list[Message]
 
 
+@dataclass
+class PeekedMessage:
+    """A ready message as a peek shows it, without taking it. ``payload`` is
+    at most its first 4 KiB; ``size`` is its whole length."""
+
+    seq: int
+    priority: int
+    attempts: int
+    enqueued_at_ms: int
+    size: int
+    payload: bytes
+
+
+@dataclass
+class PeekResult:
+    """A queue's next ready messages, in the order a dequeue takes them.
+    ``more`` says more may follow."""
+
+    messages: list[PeekedMessage]
+    more: bool
+
+
+@dataclass
+class DeadLetter:
+    """A message in a queue's dead letter queue. ``payload`` is at most its
+    first 4 KiB; ``size`` is its whole length."""
+
+    seq: int
+    size: int
+    payload: bytes
+    enqueued_at_ms: int
+    attempts: int
+    priority: int
+    moved_at_ms: int
+
+
+@dataclass
+class DlqPage:
+    """A page of dead letters, oldest first. ``total`` counts them all; with
+    ``has_more``, ask again with ``after=last_seq``."""
+
+    messages: list[DeadLetter]
+    total: int
+    has_more: bool
+    last_seq: int
+
+
 # =============================================================================
 # Stream Types
 # =============================================================================
@@ -628,6 +682,56 @@ class StreamInfo:
     first_id: StreamID = None  # type: ignore[assignment]
     last_id: StreamID = None  # type: ignore[assignment]
     partition_count: int = 1
+
+
+@dataclass
+class StreamGroupEntry:
+    """A consumer group, as a group list shows it. ``members`` and ``pending``
+    are the leader's, and start again with a new leader."""
+
+    name: str
+    members: int
+    pending: int
+    created_at_ms: int
+    ack_timeout_ms: int
+    max_deliver: int
+    last_delivered_ms: int
+    last_delivered_seq: int
+
+
+@dataclass
+class StreamGroupListResult:
+    """A stream's consumer groups. ``more`` says it has more than fit."""
+
+    groups: list[StreamGroupEntry]
+    more: bool
+
+
+class GroupMemberState(IntEnum):
+    """A consumer group member's state."""
+
+    ACTIVE = 0
+    LEAVING = 1
+
+
+@dataclass
+class StreamGroupMember:
+    """A consumer group member. ``last_active_ms`` is None until it is
+    delivered to."""
+
+    id: str
+    state: GroupMemberState
+    pending: int
+    joined_at_ms: int
+    last_active_ms: int | None
+
+
+@dataclass
+class StreamGroupMembersResult:
+    """A consumer group's members. ``more`` says it has more than fit."""
+
+    members: list[StreamGroupMember]
+    more: bool
 
 
 # =============================================================================
@@ -794,9 +898,12 @@ class NackOptions:
 
 @dataclass
 class DlqListOptions:
-    """Options for DLQ list operations."""
+    """Options for DLQ list operations: at most ``limit`` (1..100) dead
+    letters after the one whose seq is ``after`` (None starts at the oldest)."""
 
     namespace: str | None = None
+    limit: int = 100
+    after: int | None = None
 
 
 @dataclass
@@ -947,6 +1054,8 @@ class ActionRunStatus:
     # The worker holding the run, or that last held it; None until one takes
     # it. Only the leader learns of a take at once.
     worker_id: str | None = None
+    # The outcome a completed run's worker named; None for success.
+    outcome: str | None = None
 
 
 @dataclass
@@ -957,16 +1066,60 @@ class ActionInvokeResult:
 
 
 @dataclass
-class ActionListResult:
-    """A page of registered action names. ``cursor`` gives the next page; None
-    on the last."""
+class ActionListEntry:
+    """A registered action, as an action list shows it. ``timeout_ms`` is its
+    lease; ``version`` counts its registrations."""
 
-    names: list[str]
+    name: str
+    version: int
+    owner: str
+    timeout_ms: int
+    max_attempts: int
+    created_at_ms: int
+
+
+@dataclass
+class ActionListResult:
+    """A page of registered actions. ``cursor`` gives the next page; None on
+    the last."""
+
+    actions: list[ActionListEntry]
     cursor: bytes | None = None
+
+    @property
+    def names(self) -> list[str]:
+        return [a.name for a in self.actions]
 
     @property
     def has_more(self) -> bool:
         return self.cursor is not None
+
+
+@dataclass
+class ActionInfo:
+    """An action's definition, its runs by status and how long completed runs
+    took. ``ready`` is counted up to 100,000 (``ready_capped`` past that).
+    With ``too_many_runs`` (its shard holds more than 10,000 of the
+    namespace's runs) the other counts and the latency are None; the latency
+    is None too until a run completes."""
+
+    owner: str
+    version: int
+    timeout_ms: int
+    max_attempts: int
+    created_at_ms: int
+    ready: int
+    ready_capped: bool
+    too_many_runs: bool
+    running: int | None = None
+    completed: int | None = None
+    failed: int | None = None
+    timed_out: int | None = None
+    latency_count: int | None = None
+    latency_avg_ms: int | None = None
+    latency_p50_ms: int | None = None
+    latency_p95_ms: int | None = None
+    latency_max_ms: int | None = None
 
 
 # =============================================================================
@@ -980,16 +1133,17 @@ class ActionRegisterOptions:
     the settings it had: the last registration wins."""
 
     namespace: str | None = None
-    # How long a run may go without its worker completing, failing or
-    # touching it before it's taken back; 0 means never.
-    timeout_ms: int = 30000
+    # The lease: how long a worker holds a run without completing, failing
+    # or touching it before it's taken back. The server takes 5000 to
+    # 43200000 ms; 0, the default here, takes the server's, 300000.
+    timeout_ms: int = 0
     # Attempts in all, counting the first.
-    max_retries: int = 3
+    max_attempts: int = 3
     owner: str | None = None
 
     def __post_init__(self) -> None:
         # Both go on the wire as u32.
-        for name in ("timeout_ms", "max_retries"):
+        for name in ("timeout_ms", "max_attempts"):
             value = getattr(self, name)
             if not 0 <= value < 2**32:
                 raise ValueError(f"{name} must be in [0, 2**32), not {value}")
@@ -1035,17 +1189,34 @@ class ActionDeleteOptions:
 # =============================================================================
 
 
-@dataclass
+@dataclass(frozen=True)
 class TaskAssignment:
-    """A task assigned to a worker."""
+    """A task: one delivery of a run to one worker.
 
-    task_id: str
-    task_type: str
-    payload: bytes
-    created_at: int
+    ``run``, ``deliveries``, ``term`` and ``index`` name the delivery, and a
+    complete, fail or touch names it back, with the action; a report naming
+    any other delivery of the run is refused as stale. ``attempt`` is the
+    run's failures so far, plus one; ``lease_ms`` how long the worker holds it
+    without a touch.
+    """
+
+    run: str
+    namespace: str
+    deliveries: int
+    term: int
+    index: int
+    action: str
+    created_at_ms: int
     attempt: int
-    caller_run_id: str = ""
-    caller_workflow_name: str = ""
+    lease_ms: int
+    input: bytes
+    caller_run: str | None = None
+    caller_workflow: str | None = None
+
+    @property
+    def task_id(self) -> str:
+        """The task's id as the CLI prints it: ``run:deliveries:term:index:action``."""
+        return f"{self.run}:{self.deliveries}:{self.term}:{self.index}:{self.action}"
 
 
 @dataclass
@@ -1145,30 +1316,29 @@ class WorkerAwaitOptions:
 
     namespace: str | None = None
     block_ms: int | None = None  # Block waiting for task (None = 30000, 0 = don't wait, max 300000)
-
-
-@dataclass
-class WorkerTouchOptions:
-    """Options for extending task lease."""
-
-    namespace: str | None = None
-    extend_ms: int = 30000
+    # Up to 64 bytes: an await sent again with the same key gets the task the
+    # first one got, while its lease runs, so a lost answer loses no task.
+    request_key: bytes | None = None
 
 
 @dataclass
 class WorkerCompleteOptions:
     """Options for completing a task."""
 
-    namespace: str | None = None
-    outcome: str = "success"
+    # The outcome a workflow step follows; "" is success.
+    outcome: str = ""
 
 
 @dataclass
 class WorkerFailOptions:
     """Options for failing a task."""
 
-    namespace: str | None = None
-    retry: bool = True  # Whether to retry the task
+    # Run it again while attempts are left; False fails the run now.
+    retry: bool = True
+    # Hand it back untried: no failure is counted.
+    abandoned: bool = False
+    # How long before it is ready again, at most a day.
+    delay_ms: int = 0
 
 
 @dataclass
@@ -1308,6 +1478,7 @@ class WorkflowDefinitionEntry:
     name: str
     version: str
     created_at: int
+    enabled: bool
 
 
 @dataclass
@@ -1393,10 +1564,31 @@ class ProcessingCancelOptions:
 
 
 @dataclass
+class ProcessingRemoveOptions:
+    """Options for removing a processing job."""
+
+    namespace: str | None = None
+
+
+@dataclass
 class ProcessingSyncOptions:
     """Options for declarative processing sync."""
 
     namespace: str | None = None
+
+
+@dataclass
+class ProcessingRuntime:
+    """A job's pipelines on the node that answered, summed. None of it is
+    replicated: it starts again with the node or a new leader."""
+
+    running: bool
+    records_in: int
+    records_out: int
+    watermark_ms: int
+    tick_avg_us: int
+    tick_max_us: int
+    uptime_ms: int  # Since the earliest of them started
 
 
 @dataclass
@@ -1409,7 +1601,11 @@ class ProcessingStatusResult:
     batch_size: int
     records_processed: int
     created_at: int
-    failure_reason: str | None = None  # Why the job failed; None unless status is "failed"
+    # Why a failed job failed, or why a running one is held on this node;
+    # None otherwise.
+    failure_reason: str | None
+    runtime: ProcessingRuntime
+    yaml: bytes  # The submitted definition
 
 
 @dataclass
@@ -1420,6 +1616,8 @@ class ProcessingListEntry:
     job_id: str
     status: str
     created_at: int
+    batch_size: int
+    records_processed: int
 
 
 @dataclass
