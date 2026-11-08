@@ -18,6 +18,8 @@ from .types import (
     ProcessingListEntry,
     ProcessingListOptions,
     ProcessingListResult,
+    ProcessingRemoveOptions,
+    ProcessingRuntime,
     ProcessingStatusOptions,
     ProcessingStatusResult,
     ProcessingStopOptions,
@@ -139,6 +141,26 @@ class ProcessingOperations:
             b"",
         )
 
+    async def remove(self, job_id: str, options: ProcessingRemoveOptions | None = None) -> None:
+        """Remove a stopped, cancelled or failed job, freeing its slot.
+
+        Raises:
+            ConflictError: The job still runs (reason JOB_RUNNING): stop or
+                cancel it first.
+            NotFoundError: No such job.
+        """
+        opts = options or ProcessingRemoveOptions()
+        resp = await self._client._send_and_check(
+            OpCode.PROCESSING_REMOVE,
+            self._client.get_namespace(opts.namespace),
+            job_id.encode("utf-8"),
+            b"",
+        )
+        if resp.data:
+            raise IncompleteResponseError(
+                f"processing.remove answer has {len(resp.data)} bytes left over"
+            )
+
     # =========================================================================
     # Declarative Sync
     # =========================================================================
@@ -186,7 +208,11 @@ def _parse_processing_status(data: bytes) -> ProcessingStatusResult:
 
     Wire format: [job_id_len:u16][job_id][name_len:u16][name][status:u8]
                  [batch_size:u32][records_processed:u64][created_at:i64]
-                 [reason_len:u16][reason]  (reason is empty unless the job failed)
+                 [reason_len:u16][reason]
+                 [running:u8][records_in:u64][records_out:u64][watermark_ms:i64]
+                 [tick_avg_us:u64][tick_max_us:u64][uptime_ms:u64]
+                 [yaml_len:u32][yaml]
+    The reason is a failed job's, why a running one is held here, or empty.
     """
     pos = 0
 
@@ -217,9 +243,17 @@ def _parse_processing_status(data: bytes) -> ProcessingStatusResult:
 
     batch_size, records_processed, created_at = struct.unpack("<IQq", take(20))
     reason = read_str()
+    running = take(1)[0]
+    if running > 1:
+        raise IncompleteResponseError(f"processing.status answer has a running of {running}")
+    records_in, records_out, watermark_ms, tick_avg_us, tick_max_us, uptime_ms = struct.unpack(
+        "<QQqQQQ", take(48)
+    )
+    (yaml_len,) = struct.unpack("<I", take(4))
+    yaml = take(yaml_len)
     if pos != len(data):
         raise IncompleteResponseError(
-            f"processing.status answer has {len(data) - pos} bytes after the reason"
+            f"processing.status answer has {len(data) - pos} bytes after the definition"
         )
 
     return ProcessingStatusResult(
@@ -230,6 +264,16 @@ def _parse_processing_status(data: bytes) -> ProcessingStatusResult:
         records_processed=records_processed,
         created_at=created_at,
         failure_reason=reason or None,
+        runtime=ProcessingRuntime(
+            running=running == 1,
+            records_in=records_in,
+            records_out=records_out,
+            watermark_ms=watermark_ms,
+            tick_avg_us=tick_avg_us,
+            tick_max_us=tick_max_us,
+            uptime_ms=uptime_ms,
+        ),
+        yaml=yaml,
     )
 
 
@@ -238,8 +282,8 @@ def _parse_processing_list(data: bytes) -> tuple[list[ProcessingListEntry], byte
     the next page's cursor, None on the last page.
 
     Wire format: [count:u32]([name_len:u16][name][job_id_len:u16][job_id]
-                 [status_len:u16][status][created_at:i64])*
-                 [has_more:u8][cursor_len:u16][cursor]
+                 [status_len:u16][status][created_at:i64][batch_size:u32]
+                 [records_processed:u64])*[has_more:u8][cursor_len:u16][cursor]
     A failed job's status reads "FAILED: <reason>".
     """
     pos = 0
@@ -270,9 +314,16 @@ def _parse_processing_list(data: bytes) -> tuple[list[ProcessingListEntry], byte
         name = read_str()
         job_id = read_str()
         status = read_str()
-        (created_at,) = struct.unpack("<q", take(8))
+        created_at, batch_size, records_processed = struct.unpack("<qIQ", take(20))
         entries.append(
-            ProcessingListEntry(name=name, job_id=job_id, status=status, created_at=created_at)
+            ProcessingListEntry(
+                name=name,
+                job_id=job_id,
+                status=status,
+                created_at=created_at,
+                batch_size=batch_size,
+                records_processed=records_processed,
+            )
         )
 
     has_more = take(1)[0]

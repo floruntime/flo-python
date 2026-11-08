@@ -22,9 +22,9 @@ from flo.exceptions import ConflictError
 
 LIMIT = 3
 
-# Every run waits for a signal no test sends, so it stays live. (A run of an
-# action no one registered can fail at once, when the action would be on the
-# run's own shard.)
+# Every run waits for a signal no test sends, so it stays live. (A step whose
+# action no one registered would wait too, but only up to the server's
+# missing-action wait, ten minutes by default.)
 WORKFLOW_YAML = """\
 kind: Workflow
 name: {name}

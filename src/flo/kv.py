@@ -230,6 +230,8 @@ class KVOperations:
 
         A ``cas_version`` that isn't the key's, or a ``condition`` that doesn't
         hold, raises a conflict with reason CAS_MISMATCH or CONDITION_FAILED.
+        Both are decided as the write applies, so a refused one still costs a
+        commit.
 
         Example:
             res = await client.kv.put("user:123", b"John Doe")
@@ -248,7 +250,8 @@ class KVOperations:
         """Delete a key and return whether it existed.
 
         Deleting a missing key is not an error. A ``cas_version`` that isn't
-        the key's raises a conflict with reason CAS_MISMATCH.
+        the key's raises a conflict with reason CAS_MISMATCH, decided as the
+        delete applies.
 
         Example:
             existed = await client.kv.delete("user:123")

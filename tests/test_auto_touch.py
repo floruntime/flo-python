@@ -2,6 +2,7 @@
 auto_touch renews a running task's lease on the result connection."""
 
 import asyncio
+import dataclasses
 import struct
 
 import pytest
@@ -11,8 +12,11 @@ from flo.types import HEADER_SIZE, ActionType, OpCode, Ran, StatusCode
 from flo.wire import REQUEST_HEADER_FORMAT, serialize_action_register_value
 from flo.worker import ActionContext, _touch_pace
 
-from .test_result_resend import ACTION, TASK_ID, _task, _until
+from .test_result_resend import ACTION, TASK, _until, delivery_tail, task_answer
 from .test_retry import _frame, _refusal
+
+# A touch's answer: the lease's expiry.
+_EXPIRES = struct.pack("<q", 1_700_000_000_000)
 
 
 class FakeServer:
@@ -20,7 +24,13 @@ class FakeServer:
     unanswered, as a long poll holds its connection. Records each request
     as (connection number, op, payload)."""
 
-    def __init__(self, refuse_touch: StatusCode | None = None, touch_delay: float = 0.0) -> None:
+    def __init__(
+        self,
+        refuse_touch: StatusCode | None = None,
+        touch_delay: float = 0.0,
+        lease_ms: int = 400,
+    ) -> None:
+        self.task = dataclasses.replace(TASK, lease_ms=lease_ms)
         self.refuse_touch = refuse_touch
         self.touch_delay = touch_delay
         self.requests: list[tuple[int, int, bytes]] = []
@@ -42,22 +52,25 @@ class FakeServer:
                 if op == OpCode.ACTION_AWAIT:
                     if not self.delivered:
                         self.delivered = True
-                        writer.write(_frame(request_id, StatusCode.OK, _task()))
+                        writer.write(_frame(request_id, StatusCode.OK, task_answer(self.task)))
                     continue  # parked: a touch behind it would never be answered
                 if op == OpCode.ACTION_TOUCH and self.refuse_touch is not None:
                     writer.write(_refusal(request_id, self.refuse_touch, Ran.NO))
                     continue
                 if op == OpCode.ACTION_TOUCH and self.touch_delay:
                     asyncio.get_running_loop().call_later(
-                        self.touch_delay, writer.write, _frame(request_id, StatusCode.OK, b"")
+                        self.touch_delay, writer.write, _frame(request_id, StatusCode.OK, _EXPIRES)
                     )
                     continue
-                writer.write(_frame(request_id, StatusCode.OK, b""))
+                answer = _EXPIRES if op == OpCode.ACTION_TOUCH else b""
+                writer.write(_frame(request_id, StatusCode.OK, answer))
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
 
 
-async def _run(fake: FakeServer, *, auto_touch: bool, timeout_ms: int, handler_s: float) -> None:
+async def _run(
+    fake: FakeServer, *, auto_touch: bool, handler_s: float, timeout_ms: int = 600000
+) -> None:
     server = await asyncio.start_server(fake.handle, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     client = FloClient(f"127.0.0.1:{port}", retry=RetryPolicy(max_attempts=1))
@@ -86,7 +99,7 @@ async def test_a_worker_registers_its_action_with_the_options_it_was_given() -> 
     fake = FakeServer()
     await _run(fake, auto_touch=False, timeout_ms=600000, handler_s=0)
     want = serialize_action_register_value(ActionType.USER, 600000, 3, "payments")
-    # [type][timeout_ms][max_retries][owner_len][owner], as the server parses it.
+    # [type][timeout_ms][max_attempts][owner_len][owner], as the server parses it.
     assert want == bytes.fromhex("00c0270900030000000800") + b"payments"
     [(_, _, payload)] = fake.of(OpCode.ACTION_REGISTER)
     assert struct.pack("<I", len(want)) + want in payload
@@ -94,15 +107,16 @@ async def test_a_worker_registers_its_action_with_the_options_it_was_given() -> 
 
 async def test_auto_touch_renews_the_lease_on_the_result_connection_while_it_runs() -> None:
     fake = FakeServer()
-    # A 300 ms timeout touches every 100 ms: a 450 ms handler gets about four.
-    await _run(fake, auto_touch=True, timeout_ms=300, handler_s=0.45)
+    # A 400 ms lease touches every 100 ms: a 450 ms handler gets about four.
+    await _run(fake, auto_touch=True, handler_s=0.45)
     touches = fake.of(OpCode.ACTION_TOUCH)
     assert 2 <= len(touches) <= 5
     poll_conn = fake.of(OpCode.ACTION_AWAIT)[0][0]
     for conn, _, payload in touches:
         assert conn != poll_conn
-        # extend_ms: this worker's own timeout.
-        assert TASK_ID.encode() + struct.pack("<I", 300) in payload
+        # Keyed by the run, naming the delivery, with no extend length.
+        assert TASK.run.encode() in payload
+        assert payload.endswith(delivery_tail(fake.task))
     # None after the result.
     complete_at = fake.requests.index(fake.of(OpCode.ACTION_COMPLETE)[0])
     assert all(fake.requests.index(t) < complete_at for t in touches)
@@ -110,7 +124,7 @@ async def test_auto_touch_renews_the_lease_on_the_result_connection_while_it_run
 
 async def test_without_auto_touch_nothing_is_touched() -> None:
     fake = FakeServer()
-    await _run(fake, auto_touch=False, timeout_ms=300, handler_s=0.45)
+    await _run(fake, auto_touch=False, handler_s=0.45)
     assert fake.of(OpCode.ACTION_TOUCH) == []
 
 
@@ -119,13 +133,13 @@ async def test_a_touch_refused_because_the_run_moved_on_stops_the_touching(
     status: StatusCode,
 ) -> None:
     fake = FakeServer(refuse_touch=status)
-    await _run(fake, auto_touch=True, timeout_ms=300, handler_s=0.45)
+    await _run(fake, auto_touch=True, handler_s=0.45)
     assert len(fake.of(OpCode.ACTION_TOUCH)) == 1
 
 
 async def test_a_touch_refused_as_overloaded_is_tried_again() -> None:
     fake = FakeServer(refuse_touch=StatusCode.OVERLOADED)
-    await _run(fake, auto_touch=True, timeout_ms=300, handler_s=0.45)
+    await _run(fake, auto_touch=True, handler_s=0.45)
     assert len(fake.of(OpCode.ACTION_TOUCH)) >= 2
 
 
@@ -133,41 +147,40 @@ async def test_a_touch_in_flight_when_the_handler_ends_keeps_the_result_connecti
     # The first touch goes at 100 ms and is answered at 250 ms; the handler
     # ends at 150 ms, with it in flight.
     fake = FakeServer(touch_delay=0.15)
-    await _run(fake, auto_touch=True, timeout_ms=300, handler_s=0.15)
+    await _run(fake, auto_touch=True, handler_s=0.15)
     assert len(fake.of(OpCode.ACTION_TOUCH)) == 1
     assert len(fake.of(OpCode.ACTION_COMPLETE)) == 1
     assert len(fake.writers) == 2  # the poll and result connections, never redialed
 
 
-@pytest.mark.parametrize("field", ["timeout_ms", "max_retries"])
+@pytest.mark.parametrize("field", ["timeout_ms", "max_attempts"])
 @pytest.mark.parametrize("value", [-1, 2**32])
 def test_register_options_outside_u32_are_refused(field: str, value: int) -> None:
     with pytest.raises(ValueError, match=field):
         ActionRegisterOptions(**{field: value})
 
 
-async def test_an_action_that_never_times_out_is_not_touched() -> None:
-    fake = FakeServer()
-    await _run(fake, auto_touch=True, timeout_ms=0, handler_s=0.3)
-    assert fake.of(OpCode.ACTION_TOUCH) == []
+async def test_the_touch_pace_follows_the_tasks_lease_not_the_registered_timeout() -> None:
+    # Registered with 600 s, delivered with a 400 ms lease: touched within it.
+    fake = FakeServer(lease_ms=400)
+    await _run(fake, auto_touch=True, handler_s=0.3)
+    assert len(fake.of(OpCode.ACTION_TOUCH)) >= 2
 
 
 @pytest.mark.parametrize(
-    ("timeout_ms", "interval_s", "extend_ms"),
-    [(300, 0.1, 300), (30000, 10.0, 30000), (60, 0.1, 60), (4 * 3_600_000, 1200.0, 3_600_000)],
+    ("lease_ms", "interval_s"),
+    [(400, 0.1), (30000, 7.5), (100, 0.1), (43_200_000, 10_800.0)],
 )
-def test_touch_pace_is_a_third_of_the_lease_it_asks_for(
-    timeout_ms: int, interval_s: float, extend_ms: int
-) -> None:
-    assert _touch_pace(timeout_ms) == (interval_s, extend_ms)
+def test_touch_pace_is_a_quarter_of_the_lease(lease_ms: int, interval_s: float) -> None:
+    assert _touch_pace(lease_ms) == interval_s
 
 
 @pytest.mark.parametrize(
-    ("timeout_ms", "max_retries", "owner"),
+    ("timeout_ms", "max_attempts", "owner"),
     [(-1, 3, None), (30000, 2**32, None), (30000, 3, "x" * 65536)],
 )
 def test_the_register_encoder_refuses_what_its_fields_cant_hold(
-    timeout_ms: int, max_retries: int, owner: str | None
+    timeout_ms: int, max_attempts: int, owner: str | None
 ) -> None:
     with pytest.raises(ValueError):
-        serialize_action_register_value(ActionType.USER, timeout_ms, max_retries, owner)
+        serialize_action_register_value(ActionType.USER, timeout_ms, max_attempts, owner)

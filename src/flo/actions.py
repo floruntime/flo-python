@@ -10,15 +10,24 @@ For a higher-level API, see `Worker` in worker.py.
 from typing import TYPE_CHECKING
 
 from .kv_body import (
+    decode_action_info_answer,
     decode_action_invoke_answer,
     decode_action_list_answer,
     decode_action_status_answer,
+    decode_await_answer,
+    decode_empty_answer,
+    decode_touch_answer,
     decode_worker_info_answer,
     decode_worker_list_answer,
+    encode_await_body,
+    encode_complete_body,
+    encode_fail_body,
+    encode_touch_body,
     encode_worker_list_body,
 )
 from .types import (
     ActionDeleteOptions,
+    ActionInfo,
     ActionInvokeOptions,
     ActionInvokeResult,
     ActionListOptions,
@@ -28,7 +37,7 @@ from .types import (
     ActionStatusOptions,
     ActionType,
     OpCode,
-    OptionTag,
+    TaskAssignment,
     WorkerAwaitOptions,
     WorkerAwaitResult,
     WorkerCompleteOptions,
@@ -38,19 +47,12 @@ from .types import (
     WorkerListResult,
     WorkerRegisterOptions,
     WorkerStatus,
-    WorkerTouchOptions,
 )
 from .wire import (
-    OptionsBuilder,
-    parse_task_assignment,
     serialize_action_invoke_value,
     serialize_action_list_value,
     serialize_action_register_value,
-    serialize_worker_await_value,
-    serialize_worker_complete_value,
-    serialize_worker_fail_value,
     serialize_worker_register_value,
-    serialize_worker_touch_value,
 )
 
 if TYPE_CHECKING:
@@ -86,7 +88,7 @@ class ActionOperations:
         value = serialize_action_register_value(
             action_type=action_type,
             timeout_ms=opts.timeout_ms,
-            max_retries=opts.max_retries,
+            max_attempts=opts.max_attempts,
             owner=opts.owner,
         )
 
@@ -180,8 +182,23 @@ class ActionOperations:
             serialize_action_list_value(limit=opts.limit, cursor=opts.cursor),
         )
 
-        names, cursor = decode_action_list_answer(response.data)
-        return ActionListResult(names=names, cursor=cursor)
+        actions, cursor = decode_action_list_answer(response.data)
+        return ActionListResult(actions=actions, cursor=cursor)
+
+    async def info(self, name: str, namespace: str | None = None) -> ActionInfo:
+        """An action's definition, its runs by status and how long its
+        completed runs took.
+
+        Raises:
+            NotFoundError: No action has that name.
+        """
+        response = await self._client._send_and_check(
+            OpCode.ACTION_INFO,
+            self._client.get_namespace(namespace),
+            name.encode("utf-8"),
+            b"",
+        )
+        return decode_action_info_answer(response.data)
 
     async def delete(
         self,
@@ -306,128 +323,94 @@ class WorkerOperations:
     async def await_task(
         self,
         worker_id: str,
-        task_types: list[str],
+        actions: list[str],
         options: WorkerAwaitOptions | None = None,
     ) -> WorkerAwaitResult:
-        """Wait for a task assignment.
-
-        Args:
-            worker_id: Worker identifier.
-            task_types: Task types to listen for.
-            options: Optional await options (block_ms).
+        """Wait up to ``block_ms`` for a run of one of ``actions`` (the first
+        tried first), and take it.
 
         Returns:
-            WorkerAwaitResult with task if available.
+            WorkerAwaitResult whose task is None if no run was ready in time.
         """
         opts = options or WorkerAwaitOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = serialize_worker_await_value(task_types)
-
-        options_builder = OptionsBuilder()
-        if opts.block_ms is not None:
-            options_builder.add_u32(OptionTag.BLOCK_MS, opts.block_ms)
-
         response = await self._client._send_and_check(
             OpCode.ACTION_AWAIT,
-            namespace,
+            self._client.get_namespace(opts.namespace),
             worker_id.encode("utf-8"),
-            value,
-            options_builder.build(),
+            encode_await_body(actions, opts.block_ms, opts.request_key),
         )
+        return WorkerAwaitResult(task=decode_await_answer(response.data))
 
-        # Parse task assignment response - if empty, no task available
-        if not response.data:
-            return WorkerAwaitResult(task=None)
+    async def touch(self, worker_id: str, task: TaskAssignment) -> int:
+        """Keep a task. With half its lease or less left, its lease runs a
+        full lease from now (up to 12 h from its delivery); with more left,
+        nothing changes. Touch at least every half lease.
 
-        # Parse task assignment
-        task = parse_task_assignment(response.data)
-        return WorkerAwaitResult(task=task)
+        Returns:
+            When the lease runs out without another touch, in Unix ms.
 
-    async def touch(
-        self,
-        worker_id: str,
-        action_name: str,
-        task_id: str,
-        options: WorkerTouchOptions | None = None,
-    ) -> None:
-        """Extend task lease (heartbeat).
-
-        Args:
-            worker_id: Worker identifier.
-            action_name: Action name for routing.
-            task_id: Task identifier to extend.
-            options: Optional touch options (extend_ms).
+        Raises:
+            StaleReportError: The run moved on from this delivery.
         """
-        opts = options or WorkerTouchOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = serialize_worker_touch_value(action_name, task_id, opts.extend_ms)
-
-        await self._client._send_and_check(
+        response = await self._client._send_and_check(
             OpCode.ACTION_TOUCH,
-            namespace,
-            worker_id.encode("utf-8"),
-            value,
+            task.namespace,
+            task.run.encode("utf-8"),
+            encode_touch_body(worker_id, task),
         )
+        return decode_touch_answer(response.data)
 
     async def complete(
         self,
         worker_id: str,
-        action_name: str,
-        task_id: str,
-        result: bytes,
+        task: TaskAssignment,
+        result: bytes = b"",
         options: WorkerCompleteOptions | None = None,
     ) -> None:
-        """Complete a task successfully.
+        """Complete a task: its run is done, with this result.
 
-        Args:
-            worker_id: Worker identifier.
-            action_name: Action name for routing.
-            task_id: Task identifier to complete.
-            result: Result data from the task.
-            options: Optional complete options.
+        Sending it again after it applied answers ok, so a report whose
+        answer was lost can be resent unchanged.
+
+        Raises:
+            StaleReportError: The run moved on from this delivery, or was
+                completed with another result.
         """
         opts = options or WorkerCompleteOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = serialize_worker_complete_value(action_name, task_id, result, opts.outcome)
-
-        await self._client._send_and_check(
+        response = await self._client._send_and_check(
             OpCode.ACTION_COMPLETE,
-            namespace,
-            worker_id.encode("utf-8"),
-            value,
+            task.namespace,
+            task.run.encode("utf-8"),
+            encode_complete_body(worker_id, task, opts.outcome, result),
         )
+        decode_empty_answer("action.complete", response.data)
 
     async def fail(
         self,
         worker_id: str,
-        action_name: str,
-        task_id: str,
-        error_message: str,
+        task: TaskAssignment,
+        error: str = "",
         options: WorkerFailOptions | None = None,
     ) -> None:
-        """Fail a task.
+        """Fail a task: its run is ready again after ``delay_ms``, unless its
+        attempts are spent or ``retry`` is False. With ``abandoned`` it is
+        handed back untried, and no failure is counted.
 
-        Args:
-            worker_id: Worker identifier.
-            action_name: Action name for routing.
-            task_id: Task identifier that failed.
-            error_message: Error message describing the failure.
-            options: Optional fail options (retry flag).
+        Sending it again after it applied answers ok.
+
+        Raises:
+            StaleReportError: The run moved on from this delivery.
         """
         opts = options or WorkerFailOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = serialize_worker_fail_value(action_name, task_id, error_message, opts.retry)
-
-        await self._client._send_and_check(
+        response = await self._client._send_and_check(
             OpCode.ACTION_FAIL,
-            namespace,
-            worker_id.encode("utf-8"),
-            value,
+            task.namespace,
+            task.run.encode("utf-8"),
+            encode_fail_body(
+                worker_id, task, error.encode("utf-8"), opts.retry, opts.abandoned, opts.delay_ms
+            ),
         )
+        decode_empty_answer("action.fail", response.data)
 
     async def list(
         self,

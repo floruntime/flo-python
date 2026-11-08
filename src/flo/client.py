@@ -19,6 +19,7 @@ from .exceptions import (
     UnexpectedEofError,
     raise_for_status,
 )
+from .kv_body import await_block_ms
 from .retry import DEFAULT_RETRY_POLICY, RetryPolicy, _policy_backoff, _refused_unrun
 from .types import _DEFAULT_WORKER_BLOCK_MS, HEADER_SIZE, OpCode, OptionTag, StatusCode
 from .wire import (
@@ -33,8 +34,6 @@ if TYPE_CHECKING:
     from .worker import ActionWorker, StreamRecordHandler, StreamWorker
 
 logger = logging.getLogger("flo")
-
-_SERVER_AWAIT_DEFAULT_MS = 30_000
 
 
 class FloClient:
@@ -283,15 +282,12 @@ class FloClient:
             if len(value) >= 9 and value[0] == 1:
                 return int.from_bytes(value[1:9], "little")
             return 0
-        waits = {
-            opt.tag: opt.as_u32() or 0
-            for opt in OptionsIterator(options)
-            if opt.tag == OptionTag.BLOCK_MS
-        }
         if op_code == OpCode.ACTION_AWAIT:
-            # An await that names no block_ms waits the server's default.
-            waits.setdefault(OptionTag.BLOCK_MS, _SERVER_AWAIT_DEFAULT_MS)
-        return max(waits.values(), default=0)
+            return await_block_ms(value)
+        waits = [
+            opt.as_u32() or 0 for opt in OptionsIterator(options) if opt.tag == OptionTag.BLOCK_MS
+        ]
+        return max(waits, default=0)
 
     async def _send_request(
         self,
@@ -505,9 +501,9 @@ class FloClient:
             action_timeout: Timeout for action handlers in seconds.
             block_ms: Long-poll wait per await in milliseconds, at most 300000.
                 0 means the 30000 default.
-            auto_touch: Touch each run every third of its action's timeout
-                while its handler runs. Off by default: a handler that runs
-                past the timeout without touching is taken back and run again.
+            auto_touch: Touch each task every quarter of its lease while its
+                handler runs. Off by default: a handler that runs past the
+                lease without touching is taken back and run again.
 
         Returns:
             A new ActionWorker instance ready to register actions and start.

@@ -214,6 +214,16 @@ class ConflictError(ServerError):
         super().__init__(message, StatusCode.CONFLICT)
 
 
+class StaleReportError(ConflictError):
+    """An action complete, fail or touch for a delivery the run has moved on
+    from (reason STALE_REPORT): its lease expired, it was delivered again,
+    another worker holds it, or it finished. The message says which. It ran
+    nothing, and sending it again is refused the same way."""
+
+    def __init__(self, message: str = "stale report"):
+        super().__init__(message)
+
+
 class UnauthorizedError(ServerError):
     """Authentication required or failed."""
 
@@ -311,6 +321,8 @@ def raise_for_status(status: StatusCode, data: bytes = b"") -> None:
         with contextlib.suppress(UnicodeDecodeError, ValueError):
             message = data[3:].decode("utf-8")
     error = _error_for(status, message)
+    if status == StatusCode.CONFLICT and reason == Reason.STALE_REPORT:
+        error = StaleReportError(message)
     error.reason = reason
     error.ran = ran
     raise error

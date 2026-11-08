@@ -18,7 +18,7 @@ from flo.types import HEADER_SIZE, OpCode, Ran, Reason, StatusCode, WorkerStatus
 from flo.wire import REQUEST_HEADER_FORMAT
 from flo.worker import ActionContext, ActionWorker, StreamContext, StreamWorker
 
-from .test_result_resend import ACTION, _task, _until
+from .test_result_resend import ACTION, NO_TASK, _task, _until
 from .test_retry import _frame
 from .test_stream_worker_ack import _records
 
@@ -128,7 +128,7 @@ class Registry:
                         continue
                     if answer is None:
                         await asyncio.sleep(0.02)
-                        answer = b"" if op == OpCode.ACTION_AWAIT else _records(0)
+                        answer = NO_TASK if op == OpCode.ACTION_AWAIT else _records(0)
                     assert isinstance(answer, bytes)
                     writer.write(_frame(request_id, StatusCode.OK, answer))
                     continue

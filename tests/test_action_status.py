@@ -8,7 +8,8 @@ from flo.exceptions import IncompleteResponseError
 from flo.kv_body import decode_action_invoke_answer, decode_action_status_answer
 from flo.types import RunStatus
 
-# A completed run: started, completed, attempt 2, output "ok", no error.
+# A completed run: started, completed, attempt 2, output "ok", no error, no
+# worker, no outcome (success).
 COMPLETED = (
     bytes([2])
     + struct.pack("<q", 100)
@@ -20,6 +21,7 @@ COMPLETED = (
     + b"\x01"
     + struct.pack("<H", 2)
     + b"ok"
+    + b"\x00"
     + b"\x00"
     + b"\x00"
 )
@@ -34,12 +36,25 @@ def test_a_completed_runs_status_carries_its_times_attempt_and_output() -> None:
         110,
         120,
     )
-    assert (s.attempt, s.output, s.error_message, s.worker_id) == (2, b"ok", None, None)
+    assert (s.attempt, s.output, s.error_message, s.worker_id, s.outcome) == (
+        2,
+        b"ok",
+        None,
+        None,
+        None,
+    )
+
+
+def test_a_status_carries_the_outcome_a_worker_named() -> None:
+    s = decode_action_status_answer(
+        "run-1", COMPLETED[:-1] + b"\x01" + struct.pack("<H", 8) + b"approved"
+    )
+    assert s.outcome == "approved"
 
 
 def test_a_status_names_the_worker_that_holds_the_run() -> None:
     s = decode_action_status_answer(
-        "run-1", COMPLETED[:-1] + b"\x01" + struct.pack("<H", 4) + b"w-17"
+        "run-1", COMPLETED[:-2] + b"\x01" + struct.pack("<H", 4) + b"w-17" + b"\x00"
     )
     assert s.worker_id == "w-17"
 
@@ -54,6 +69,7 @@ def test_a_failed_runs_status_carries_its_error_and_no_output() -> None:
         + b"\x01"
         + struct.pack("<H", 4)
         + b"boom"
+        + b"\x00"
         + b"\x00"
     )
     s = decode_action_status_answer("run-1", data)

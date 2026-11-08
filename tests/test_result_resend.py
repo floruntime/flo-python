@@ -11,32 +11,78 @@ from typing import Any
 import pytest
 
 from flo import FloClient
-from flo.types import HEADER_SIZE, OpCode, Ran, StatusCode
-from flo.wire import (
-    REQUEST_HEADER_FORMAT,
-    parse_task_assignment,
-    serialize_worker_complete_value,
-    serialize_worker_fail_value,
-)
+from flo.types import HEADER_SIZE, OpCode, Ran, StatusCode, TaskAssignment
+from flo.wire import REQUEST_HEADER_FORMAT
 from flo.worker import ActionContext, StreamContext
 
 from .test_retry import _frame, _refusal
 from .test_stream_worker_ack import _one_record, _response
 
-TASK_ID = "task-42"
 ACTION = "charge"
+TASK = TaskAssignment(
+    run="act-42",
+    namespace="default",
+    deliveries=1,
+    term=3,
+    index=40,
+    action=ACTION,
+    created_at_ms=1000,
+    attempt=1,
+    lease_ms=5000,
+    input=b"{}",
+)
+TASK_ID = TASK.task_id
+# An await answered with no task.
+NO_TASK = b"\x00"
+
+
+def _str16(s: str) -> bytes:
+    return struct.pack("<H", len(s.encode())) + s.encode()
+
+
+def task_answer(t: TaskAssignment = TASK) -> bytes:
+    """An await's answer holding t, as the server codes it."""
+
+    def opt(v: str | None) -> bytes:
+        return b"\x00" if v is None else b"\x01" + _str16(v)
+
+    return (
+        b"\x01"
+        + _str16(t.run)
+        + bytes([len(t.namespace)])
+        + t.namespace.encode()
+        + struct.pack("<IQQ", t.deliveries, t.term, t.index)
+        + _str16(t.action)
+        + struct.pack("<qIQ", t.created_at_ms, t.attempt, t.lease_ms)
+        + opt(t.caller_run)
+        + opt(t.caller_workflow)
+        + struct.pack("<I", len(t.input))
+        + t.input
+    )
 
 
 def _task() -> bytes:
-    tid, ttype = TASK_ID.encode(), ACTION.encode()
+    return task_answer(TASK)
+
+
+def delivery_tail(t: TaskAssignment = TASK) -> bytes:
+    """The deliveries, term and index a report names, after its worker id."""
+    return struct.pack("<IQQ", t.deliveries, t.term, t.index)
+
+
+def complete_tail(outcome: str, result: bytes, t: TaskAssignment = TASK) -> bytes:
+    """How a complete of t ends: the delivery, outcome and result."""
+    return delivery_tail(t) + b"\x01" + _str16(outcome) + b"\x01" + _str16(result.decode())
+
+
+def fail_tail(error: str, retry: bool, abandoned: bool = False, t: TaskAssignment = TASK) -> bytes:
+    """How a fail of t ends: the delivery, retry, abandoned, delay_ms and error."""
     return (
-        struct.pack("<H", len(tid))
-        + tid
-        + struct.pack("<H", len(ttype))
-        + ttype
-        + struct.pack("<qI", 1000, 1)  # created_at, attempt
-        + bytes([0])  # no caller
-        + b"{}"
+        delivery_tail(t)
+        + bytes([1, retry, 1, abandoned, 1])
+        + struct.pack("<Q", 0)
+        + b"\x01"
+        + _str16(error)
     )
 
 
@@ -69,7 +115,7 @@ class FakeActionServer:
                         writer.write(_frame(request_id, StatusCode.OK, _task()))
                     else:
                         await asyncio.sleep(0.05)
-                        writer.write(_frame(request_id, StatusCode.OK, b""))
+                        writer.write(_frame(request_id, StatusCode.OK, NO_TASK))
                     continue
                 if op_code in (OpCode.ACTION_COMPLETE, OpCode.ACTION_FAIL):
                     action = self.reply(len(self.results))
@@ -179,7 +225,7 @@ async def test_stop_lets_a_running_handler_finish_and_completes_it() -> None:
     await _run_action(fake, slow, started.is_set, settle=0.0)
     assert fake.ops() == [OpCode.ACTION_COMPLETE]
     frame = fake.results[0][1]
-    assert serialize_worker_complete_value(ACTION, TASK_ID, b"done", "success") in frame
+    assert frame.endswith(complete_tail("", b"done"))
 
 
 async def _run_with_timeout(fake: FakeActionServer, handler: Any) -> None:
@@ -209,7 +255,7 @@ async def test_a_handler_timeout_fails_for_good() -> None:
     await _run_with_timeout(fake, slow)
     assert fake.ops() == [OpCode.ACTION_FAIL]
     frame = fake.results[0][1]
-    assert serialize_worker_fail_value(ACTION, TASK_ID, "Action timed out", False) in frame
+    assert frame.endswith(fail_tail("Action timed out", retry=False))
 
 
 async def test_a_timeout_error_raised_by_the_handler_is_an_ordinary_failure() -> None:
@@ -221,15 +267,15 @@ async def test_a_timeout_error_raised_by_the_handler_is_an_ordinary_failure() ->
     await _run_with_timeout(fake, raises)
     assert fake.ops() == [OpCode.ACTION_FAIL]
     frame = fake.results[0][1]
-    assert serialize_worker_fail_value(ACTION, TASK_ID, "upstream call timed out", True) in frame
+    assert frame.endswith(fail_tail("upstream call timed out", retry=True))
 
 
-async def test_a_cancelled_task_is_failed_and_the_cancellation_kept() -> None:
-    fails: list[tuple[str, bool]] = []
+async def test_a_cancelled_task_is_handed_back_and_the_cancellation_kept() -> None:
+    fails: list[tuple[str, bool, bool]] = []
 
     class Results:
-        async def fail(self, wid: str, action: str, tid: str, message: str, opts: Any) -> None:
-            fails.append((message, opts.retry))
+        async def fail(self, wid: str, task: TaskAssignment, message: str, opts: Any) -> None:
+            fails.append((message, opts.retry, opts.abandoned))
 
     class ResultClient:
         worker = Results()
@@ -245,13 +291,12 @@ async def test_a_cancelled_task_is_failed_and_the_cancellation_kept() -> None:
     worker.register_action(ACTION, forever)
     worker._result_client = ResultClient()  # type: ignore[assignment]
     worker._semaphore = asyncio.Semaphore(0)
-    task = parse_task_assignment(_task())
-    run = asyncio.create_task(worker._execute_task(task))
+    run = asyncio.create_task(worker._execute_task(TASK))
     await asyncio.wait_for(started.wait(), timeout=1)
     run.cancel()
     with pytest.raises(asyncio.CancelledError):
         await run
-    assert fails == [("Action cancelled", True)]
+    assert fails == [("Action cancelled", True, True)]
     assert worker._semaphore.locked() is False
 
 

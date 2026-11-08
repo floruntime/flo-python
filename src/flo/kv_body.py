@@ -1,4 +1,6 @@
-"""KV ops, action.status and worker.list, as table ops.
+"""The ops on the server's op table: KV, the action reports and reads,
+worker.list and worker.info, stream group reads, queue.peek and
+processing.remove.
 
 The request is ``[namespace][key][body]``, the body coded by the op's
 schema, field by field in order. An optional field is a presence byte then
@@ -13,19 +15,30 @@ from typing import TypeVar
 
 from .exceptions import BlockTooLongError, IncompleteResponseError, ValidationError
 from .types import (
+    MAX_BLOCK_MS,
     MAX_KV_VALUE_SIZE,
     MAX_WAIT_MS,
+    ActionInfo,
+    ActionListEntry,
     ActionRunStatus,
     Condition,
     ExistsResult,
     GetOptions,
     GetResult,
+    GroupMemberState,
     MGetEntry,
     OpCode,
+    PeekedMessage,
+    PeekResult,
     ProcessKind,
     PutOptions,
     PutResult,
     RunStatus,
+    StreamGroupEntry,
+    StreamGroupListResult,
+    StreamGroupMember,
+    StreamGroupMembersResult,
+    TaskAssignment,
     VersionEntry,
     WaitFor,
     WorkerDetails,
@@ -52,6 +65,15 @@ MAX_WORKER_LIST = 1024
 MAX_ACTION_LIST = 1024
 MAX_WORKER_PROCESSES = 1024
 _MAX_WORKER_ID = 4096
+MAX_AWAIT_ACTIONS = 64
+MAX_ACTION_NAME = 256
+MAX_REQUEST_KEY = 64
+MAX_OUTCOME = 256
+# A run's result and error each have a u16 length.
+MAX_RESULT = 65_535
+MAX_ERROR = 65_535
+MAX_FAIL_DELAY_MS = 86_400_000
+MAX_PEEK = 100
 # The longest TTL whose nanoseconds fit a u64.
 MAX_TTL_MS = 18_446_744_073_709
 _U64_MAX = (1 << 64) - 1
@@ -76,8 +98,18 @@ _TABLE_OPS = frozenset(
         OpCode.KV_EXPIRE,
         OpCode.KV_EXISTS,
         OpCode.ACTION_STATUS,
+        OpCode.ACTION_AWAIT,
+        OpCode.ACTION_COMPLETE,
+        OpCode.ACTION_FAIL,
+        OpCode.ACTION_TOUCH,
+        OpCode.ACTION_INFO,
         OpCode.WORKER_LIST,
         OpCode.WORKER_INFO,
+        OpCode.STREAM_GROUP_LIST,
+        OpCode.STREAM_GROUP_MEMBERS,
+        OpCode.QUEUE_PEEK,
+        OpCode.TS_INFO,
+        OpCode.PROCESSING_REMOVE,
     }
 )
 
@@ -280,6 +312,127 @@ def encode_txn_body(txn: int) -> bytes:
     return _u64("txn", txn)
 
 
+def _u32(name: str, v: int) -> bytes:
+    if not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= 0xFFFFFFFF:
+        raise ValidationError(f"{name} must be a u32, got {v!r}")
+    return struct.pack("<I", v)
+
+
+def _bytes8(name: str, b: bytes, most: int) -> bytes:
+    if len(b) > most:
+        raise ValidationError(f"{name} is {len(b)} bytes, at most {most}")
+    return bytes([len(b)]) + bytes(b)
+
+
+def _flag(v: bool) -> bytes:
+    return b"\x01" if v else b"\x00"
+
+
+# The server's wait for an await that names no block_ms.
+AWAIT_DEFAULT_BLOCK_MS = 30_000
+
+
+def encode_await_body(
+    actions: Sequence[str], block_ms: int | None, request_key: bytes | None
+) -> bytes:
+    """action.await's request: actions (the first tried first), block_ms
+    (None is the server's default), request_key."""
+    if not 1 <= len(actions) <= MAX_AWAIT_ACTIONS:
+        raise ValidationError(f"an await names 1..{MAX_AWAIT_ACTIONS} actions, got {len(actions)}")
+    if block_ms is not None:
+        if not isinstance(block_ms, int) or isinstance(block_ms, bool) or block_ms < 0:
+            raise ValidationError(f"block_ms must be a whole number of ms, got {block_ms!r}")
+        if block_ms > MAX_BLOCK_MS:
+            raise BlockTooLongError(
+                f"a wait (block_ms) is at most {MAX_BLOCK_MS} ms (5 minutes), got {block_ms}"
+            )
+    names = b"".join(_bytes16("action name", a.encode("utf-8"), MAX_ACTION_NAME) for a in actions)
+    key = (
+        b"\x00"
+        if request_key is None
+        else b"\x01" + _bytes8("request key", request_key, MAX_REQUEST_KEY)
+    )
+    wait = b"\x00" if block_ms is None else b"\x01" + struct.pack("<Q", block_ms)
+    return bytes([len(actions)]) + names + wait + key
+
+
+def await_block_ms(body: bytes) -> int:
+    """How long an await body asks the server to wait: its block_ms, after
+    the actions list."""
+    at = 1
+    for _ in range(body[0] if body else 0):
+        at += 2 + int.from_bytes(body[at : at + 2], "little")
+    if len(body) >= at + 9 and body[at] == 1:
+        return int.from_bytes(body[at + 1 : at + 9], "little")
+    return AWAIT_DEFAULT_BLOCK_MS
+
+
+def _delivery(worker: str, task: TaskAssignment) -> bytes:
+    """A report's delivery fields: action, worker, deliveries, term, index."""
+    return (
+        _bytes16("action name", task.action.encode("utf-8"), MAX_ACTION_NAME)
+        + _bytes16("worker id", worker.encode("utf-8"), _MAX_WORKER_ID)
+        + _u32("deliveries", task.deliveries)
+        + _u64("term", task.term)
+        + _u64("index", task.index)
+    )
+
+
+def encode_complete_body(worker: str, task: TaskAssignment, outcome: str, result: bytes) -> bytes:
+    """action.complete's request: the delivery, outcome ("" is success), result."""
+    return (
+        _delivery(worker, task)
+        + b"\x01"
+        + _bytes16("outcome", outcome.encode("utf-8"), MAX_OUTCOME)
+        + b"\x01"
+        + _bytes16("result", result, MAX_RESULT)
+    )
+
+
+def encode_fail_body(
+    worker: str,
+    task: TaskAssignment,
+    error: bytes,
+    retry: bool,
+    abandoned: bool,
+    delay_ms: int,
+) -> bytes:
+    """action.fail's request: the delivery, retry, abandoned, delay_ms, error."""
+    if (
+        not isinstance(delay_ms, int)
+        or isinstance(delay_ms, bool)
+        or not 0 <= delay_ms <= MAX_FAIL_DELAY_MS
+    ):
+        raise ValidationError(f"delay_ms must be 0..{MAX_FAIL_DELAY_MS}, got {delay_ms!r}")
+    return (
+        _delivery(worker, task)
+        + b"\x01"
+        + _flag(retry)
+        + b"\x01"
+        + _flag(abandoned)
+        + b"\x01"
+        + struct.pack("<Q", delay_ms)
+        + b"\x01"
+        + _bytes16("error", error, MAX_ERROR)
+    )
+
+
+def encode_touch_body(worker: str, task: TaskAssignment) -> bytes:
+    """action.touch's request: the delivery, and nothing else; the server
+    extends by the run's own lease."""
+    return _delivery(worker, task)
+
+
+def encode_group_members_body(group: str) -> bytes:
+    """stream.group.members's request: group."""
+    return _bytes16("group", group.encode("utf-8"), _MAX_ROUTING_KEY)
+
+
+def encode_peek_body(limit: int) -> bytes:
+    """queue.peek's request: limit, 1..100."""
+    return _limit("peek limit", limit, MAX_PEEK)
+
+
 # ── Answers ───────────────────────────────────────────────────────────────
 
 
@@ -479,9 +632,16 @@ def decode_txn_commit_answer(data: bytes) -> tuple[int, int]:
     return commit_index, ops
 
 
+def _text(a: _Answer, op: str, raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise IncompleteResponseError(f"{op} answer has a field that isn't UTF-8") from e
+
+
 def decode_action_status_answer(run_id: str, data: bytes) -> ActionRunStatus:
     """action.status's answer: status, created_at, started_at?, completed_at?,
-    attempt, output?, error_message?, worker_id?, with u16 lengths."""
+    attempt, output?, error_message?, worker_id?, outcome?, with u16 lengths."""
     a = _Answer("action.status", data)
     code = a.u8()
     try:
@@ -497,6 +657,7 @@ def decode_action_status_answer(run_id: str, data: bytes) -> ActionRunStatus:
     output = a.bytes16() if a.present() else None
     error = a.bytes16() if a.present() else None
     worker_id = a.bytes16() if a.present() else None
+    outcome = a.bytes16() if a.present() else None
     a.done()
     return ActionRunStatus(
         run_id=run_id,
@@ -508,7 +669,150 @@ def decode_action_status_answer(run_id: str, data: bytes) -> ActionRunStatus:
         output=output,
         error_message=error.decode("utf-8", errors="replace") if error is not None else None,
         worker_id=worker_id.decode("utf-8", errors="replace") if worker_id is not None else None,
+        outcome=outcome.decode("utf-8", errors="replace") if outcome is not None else None,
     )
+
+
+def decode_await_answer(data: bytes) -> TaskAssignment | None:
+    """action.await's answer: the task, None if no run was ready in time."""
+    op = "action.await"
+    a = _Answer(op, data)
+    if not a.present():
+        a.done()
+        return None
+    run = _text(a, op, a.bytes16())
+    namespace = _text(a, op, a.bytes8())
+    deliveries, term, index = a.u32(), a.u64(), a.u64()
+    action = _text(a, op, a.bytes16())
+    created_at_ms, attempt, lease_ms = a.i64(), a.u32(), a.u64()
+    caller_run = _text(a, op, a.bytes16()) if a.present() else None
+    caller_workflow = _text(a, op, a.bytes16()) if a.present() else None
+    task_input = a.bytes32()
+    a.done()
+    return TaskAssignment(
+        run=run,
+        namespace=namespace,
+        deliveries=deliveries,
+        term=term,
+        index=index,
+        action=action,
+        created_at_ms=created_at_ms,
+        attempt=attempt,
+        lease_ms=lease_ms,
+        input=task_input,
+        caller_run=caller_run,
+        caller_workflow=caller_workflow,
+    )
+
+
+def decode_touch_answer(data: bytes) -> int:
+    """action.touch's answer: expires_at_ms, when the lease runs out without
+    another touch."""
+    a = _Answer("action.touch", data)
+    expires_at_ms = a.i64()
+    a.done()
+    return expires_at_ms
+
+
+def decode_action_info_answer(data: bytes) -> ActionInfo:
+    """action.info's answer: the definition, ready counts, then the optional
+    run counts and latency."""
+    op = "action.info"
+    a = _Answer(op, data)
+    owner = _text(a, op, a.bytes16())
+    version, timeout_ms, max_attempts = a.u32(), a.u64(), a.u32()
+    created_at_ms, ready = a.i64(), a.u64()
+    ready_capped, too_many_runs = a.flag(), a.flag()
+    rest = [a.u64() if a.present() else None for _ in range(9)]
+    a.done()
+    return ActionInfo(
+        owner=owner,
+        version=version,
+        timeout_ms=timeout_ms,
+        max_attempts=max_attempts,
+        created_at_ms=created_at_ms,
+        ready=ready,
+        ready_capped=ready_capped,
+        too_many_runs=too_many_runs,
+        running=rest[0],
+        completed=rest[1],
+        failed=rest[2],
+        timed_out=rest[3],
+        latency_count=rest[4],
+        latency_avg_ms=rest[5],
+        latency_p50_ms=rest[6],
+        latency_p95_ms=rest[7],
+        latency_max_ms=rest[8],
+    )
+
+
+def decode_group_list_answer(data: bytes) -> StreamGroupListResult:
+    """stream.group.list's answer: groups, then whether more didn't fit."""
+    op = "stream.group.list"
+    a = _Answer(op, data)
+    groups = [
+        StreamGroupEntry(
+            name=_text(a, op, a.bytes16()),
+            members=a.u32(),
+            pending=a.u64(),
+            created_at_ms=a.i64(),
+            ack_timeout_ms=a.u32(),
+            max_deliver=a.u8(),
+            last_delivered_ms=a.u64(),
+            last_delivered_seq=a.u64(),
+        )
+        for _ in range(a.u16())
+    ]
+    more = a.flag()
+    a.done()
+    return StreamGroupListResult(groups=groups, more=more)
+
+
+def decode_group_members_answer(data: bytes) -> StreamGroupMembersResult:
+    """stream.group.members's answer: members, then whether more didn't fit."""
+    op = "stream.group.members"
+    a = _Answer(op, data)
+    members = []
+    for _ in range(a.u16()):
+        member_id = _text(a, op, a.bytes16())
+        code = a.u8()
+        try:
+            state = GroupMemberState(code)
+        except ValueError:
+            raise IncompleteResponseError(f"{op} answer has an unknown state {code}") from None
+        pending, joined_at_ms = a.u32(), a.i64()
+        last_active_ms = a.i64() if a.present() else None
+        members.append(
+            StreamGroupMember(
+                id=member_id,
+                state=state,
+                pending=pending,
+                joined_at_ms=joined_at_ms,
+                last_active_ms=last_active_ms,
+            )
+        )
+    more = a.flag()
+    a.done()
+    return StreamGroupMembersResult(members=members, more=more)
+
+
+def decode_peek_answer(data: bytes) -> PeekResult:
+    """queue.peek's answer: the next ready messages, then whether more may follow."""
+    a = _Answer("queue.peek", data)
+    messages = [
+        PeekedMessage(
+            seq=a.u64(),
+            priority=a.u32(),
+            attempts=a.u32(),
+            enqueued_at_ms=a.i64(),
+            size=a.u32(),
+            payload=a.bytes16(),
+        )
+        for _ in range(a.u8())
+    ]
+    more = a.flag()
+    a.done()
+    return PeekResult(messages=messages, more=more)
 
 
 def decode_action_invoke_answer(data: bytes) -> str:
@@ -524,22 +828,32 @@ def decode_action_invoke_answer(data: bytes) -> str:
     return run_id.decode("utf-8")
 
 
-def decode_action_list_answer(data: bytes) -> tuple[list[str], bytes | None]:
+def decode_action_list_answer(data: bytes) -> tuple[list[ActionListEntry], bytes | None]:
     """action.list's answer: [count:u32]([name_len:u16][name][value_len:u32][value])*
-    [has_more:u8][cursor_len:u16][cursor]. Returns the names and the next
-    page's cursor, None on the last page; the values aren't read."""
+    [has_more:u8][cursor_len:u16][cursor], each value
+    [version:u32][owner_len:u16][owner][timeout_ms:u64][max_attempts:u32]
+    [created_at_ms:i64]. Returns the actions and the next page's cursor,
+    None on the last page."""
     op = "action.list"
     a = _Answer(op, data)
     count = a.u32()
     if count > MAX_ACTION_LIST:
         raise IncompleteResponseError(f"{op} answer lists {count} actions")
-    names = []
+    actions = []
     for _ in range(count):
-        try:
-            names.append(a.bytes16().decode("utf-8"))
-        except UnicodeDecodeError as e:
-            raise IncompleteResponseError(f"{op} answer has a name that isn't UTF-8") from e
-        a.bytes32()
+        name = _text(a, op, a.bytes16())
+        v = _Answer(op, a.bytes32())
+        actions.append(
+            ActionListEntry(
+                name=name,
+                version=v.u32(),
+                owner=_text(v, op, v.bytes16()),
+                timeout_ms=v.u64(),
+                max_attempts=v.u32(),
+                created_at_ms=v.i64(),
+            )
+        )
+        v.done()
     has_more = a.flag()
     cursor = a.bytes16()
     a.done()
@@ -547,7 +861,7 @@ def decode_action_list_answer(data: bytes) -> tuple[list[str], bytes | None]:
         raise IncompleteResponseError(f"{op} answer has more pages but no cursor")
     if not has_more and cursor:
         raise IncompleteResponseError(f"{op} answer has a cursor on its last page")
-    return names, cursor if has_more else None
+    return actions, cursor if has_more else None
 
 
 _E = TypeVar("_E", WorkerType, WorkerStatus, ProcessKind)

@@ -531,7 +531,7 @@ def _parse_definition_list(
     """The page's definitions and the next page's cursor, None on the last page.
 
     Wire format: [count:u32]([name_len:u16][name][version_len:u16][version]
-                 [created_at:i64])*[has_more:u8][cursor_len:u16][cursor]
+                 [created_at:i64][enabled:u8])*[has_more:u8][cursor_len:u16][cursor]
     """
     pos = 0
 
@@ -559,8 +559,16 @@ def _parse_definition_list(
     for _ in range(count):
         name = read_str()
         version = read_str()
-        (created_at,) = struct.unpack("<q", take(8))
-        entries.append(WorkflowDefinitionEntry(name=name, version=version, created_at=created_at))
+        created_at, enabled = struct.unpack("<qB", take(9))
+        if enabled > 1:
+            raise IncompleteResponseError(
+                f"workflow.list_definitions answer has an enabled of {enabled}"
+            )
+        entries.append(
+            WorkflowDefinitionEntry(
+                name=name, version=version, created_at=created_at, enabled=enabled == 1
+            )
+        )
 
     has_more = take(1)[0]
     if has_more > 1:
