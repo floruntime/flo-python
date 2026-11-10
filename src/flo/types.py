@@ -18,9 +18,10 @@ VERSION: int = 0x03
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0x7EB599C24442118B
-# Response header flag: a halted shard answered a read from the state just
-# before the entry it halted at. The read succeeded.
+TABLE_HASH: int = 0x19075DF8E1ED5F75
+# Response header flag: a shard that can't apply its next entry (halted at
+# it, or blocked reading it from disk) answered a read from its state just
+# before that entry. The read succeeded.
 RESPONSE_STALE: int = 0x01
 
 
@@ -194,15 +195,16 @@ class OpCode(IntEnum):
 
     # ── Queues (0x170 – 0x19F) ──
     QUEUE_ENQUEUE = 0x170
-    QUEUE_DEQUEUE = 0x171
-    QUEUE_COMPLETE = 0x172
-    QUEUE_FAIL = 0x174
     QUEUE_DLQ_LIST = 0x176
     QUEUE_DLQ_DELETE = 0x177
     QUEUE_DLQ_REQUEUE = 0x178
     QUEUE_STATS = 0x17B
     QUEUE_PURGE = 0x17F
     QUEUE_PEEK = 0x180
+    QUEUE_DEQUEUE = 0x181
+    QUEUE_COMPLETE = 0x182
+    QUEUE_FAIL = 0x183
+    QUEUE_TOUCH = 0x184
     QUEUE_LIST = 0x198
 
     # ── Time-Series (0x1A0 – 0x1BF) ──
@@ -334,7 +336,8 @@ class OptionTag(IntEnum):
 
     # Queue Options (0x10 - 0x1F)
     PRIORITY = 0x10  # u8: Message priority (0-255, lower is taken first)
-    COUNT = 0x15  # u32: Number of messages to dequeue
+    DELAY_MS = 0x11  # u64: How long before an enqueued message is ready (at most a day)
+    COUNT = 0x15  # u32: Most records a stream read returns
     BLOCK_MS = 0x17  # u32: Block timeout - wait for data (0=don't wait, max 300000)
 
     # Stream Options (0x20 - 0x2F) - StreamID-native ONLY
@@ -376,7 +379,8 @@ class ScanResult:
 
     names: list[str]
     cursor: bytes | None  # None on the last page
-    # Read from a halted shard's state just before the entry it halted at.
+    # Read from the state before an entry its shard can't apply yet (halted
+    # at it, or blocked reading it from disk).
     stale: bool = False
 
     @property
@@ -402,7 +406,8 @@ class HistoryResult:
 
     versions: list[VersionEntry]
     more: bool
-    # Read from a halted shard's state just before the entry it halted at.
+    # Read from the state before an entry its shard can't apply yet (halted
+    # at it, or blocked reading it from disk).
     stale: bool = False
 
 
@@ -413,7 +418,8 @@ class ExistsResult:
 
     exists: bool
     version: int
-    # Read from a halted shard's state just before the entry it halted at.
+    # Read from the state before an entry its shard can't apply yet (halted
+    # at it, or blocked reading it from disk).
     stale: bool = False
 
     def __bool__(self) -> bool:
@@ -477,7 +483,8 @@ class GetResult:
     version: int
     # When the key's TTL runs out, unix ms; None when it has none.
     expires_at_ms: int | None = None
-    # Read from a halted shard's state just before the entry it halted at.
+    # Read from the state before an entry its shard can't apply yet (halted
+    # at it, or blocked reading it from disk).
     stale: bool = False
 
 
@@ -499,7 +506,8 @@ class GetJsonResult(Generic[T]):
 
     value: Any
     version: int
-    # Read from a halted shard's state just before the entry it halted at.
+    # Read from the state before an entry its shard can't apply yet (halted
+    # at it, or blocked reading it from disk).
     stale: bool = False
 
 
@@ -515,26 +523,82 @@ class MGetEntry:
     value: bytes
     version: int
     found: bool
-    # Read from a halted shard's state just before the entry it halted at.
+    # Read from the state before an entry its shard can't apply yet (halted
+    # at it, or blocked reading it from disk).
     stale: bool = False
 
 
 @dataclass
 class Message:
-    """Queue message."""
+    """A dequeued message. ``deliveries`` counts its deliveries, this one
+    included: above 1, an earlier lease ran out or was failed."""
 
     seq: int
     payload: bytes
-    enqueued_at_ms: int = 0
-    delivery_count: int = 0
     priority: int = 0
+    deliveries: int = 1
+    enqueued_at_ms: int = 0
 
 
 @dataclass
 class DequeueResult:
-    """Result of a queue dequeue operation."""
+    """A dequeue's messages, leased to ``consumer`` until ``expires_at_ms``
+    unless completed, failed or touched. ``term`` and ``index`` name the
+    delivery: a complete, fail or touch names them back (pass this result).
+    ``expires_at_ms`` is 0 when nothing was taken, or with ack."""
 
     messages: list[Message]
+    term: int = 0
+    index: int = 0
+    expires_at_ms: int = 0
+    consumer: str = ""
+
+
+class QueueRefusalReason(IntEnum):
+    """Why a complete, fail or touch didn't apply to a message."""
+
+    # For a complete, already done; otherwise the message is gone.
+    GONE = 0
+    DELIVERED_AGAIN = 1
+    OTHER_HOLDER = 2
+    EXPIRED = 3
+    RELEASED = 4
+    NOT_HELD = 5
+
+
+@dataclass
+class QueueRefusal:
+    """A message a report didn't apply to, why, and the server's words for it."""
+
+    seq: int
+    why: QueueRefusalReason
+    reason: str
+
+
+@dataclass
+class QueueReportResult:
+    """What a complete or fail applied to: ``applied`` messages, and the
+    ``refused`` rest. The report itself succeeded either way."""
+
+    applied: int
+    refused: list[QueueRefusal]
+
+    @property
+    def lost(self) -> list[QueueRefusal]:
+        """For a complete, the refusals that aren't ``GONE`` (which means
+        done): messages whose lease this consumer no longer holds, which go
+        or have gone to another delivery."""
+        return [r for r in self.refused if r.why != QueueRefusalReason.GONE]
+
+
+@dataclass
+class QueueTouchResult:
+    """A touch's new expiry (when the lease runs out without another touch,
+    Unix ms), and what it applied to."""
+
+    expires_at_ms: int
+    applied: int
+    refused: list[QueueRefusal]
 
 
 @dataclass
@@ -613,10 +677,25 @@ class StreamID:
 
 
 class StorageTier(IntEnum):
-    """The tier a stream record was served from; the server sends only these two."""
+    """Where a stream record's payload was read from. A tier this SDK doesn't
+    know decodes to a pseudo-member ``UNKNOWN_<n>``, so a newer server's
+    records still read."""
 
-    HOT = 0  # the in-memory log
-    WARM = 1  # the warm store, after the record left the log
+    HOT = 0  # the hot ring of recent appends
+    WARM = 1  # the warm store of payload copies
+    DISK = 2  # the durable log: a sealed segment, or the writer's buffer
+
+    @classmethod
+    def _missing_(cls, value: object) -> "StorageTier | None":
+        if not isinstance(value, int) or not 0 <= value <= 255:
+            return None
+        member = int.__new__(cls, value)
+        member._name_ = f"UNKNOWN_{value}"
+        member._value_ = value
+        return member
+
+    def __reduce_ex__(self, proto: object) -> tuple[type["StorageTier"], tuple[int]]:
+        return self.__class__, (int(self),)
 
 
 @dataclass
@@ -872,28 +951,44 @@ class EnqueueOptions:
 
     namespace: str | None = None
     priority: int = 0  # 0-255, lower is taken first
+    delay_ms: int = 0  # How long before it's ready, at most a day
 
 
 @dataclass
 class DequeueOptions:
-    """Options for queue dequeue operations."""
+    """Options for queue dequeue operations.
+
+    The messages are leased to ``consumer`` for ``lease_ms`` (5000 to
+    43200000; None is the server's 30 s) and come back once it runs out,
+    unless completed, failed or touched first. With ``ack`` they're completed
+    as they're taken, a one-shot consume: if the leader fails in between,
+    they come back once their lease runs out.
+    """
 
     namespace: str | None = None
     block_ms: int | None = None  # Wait for messages (0 = don't wait, max 300000)
+    consumer: str = ""
+    lease_ms: int | None = None
+    ack: bool = False
 
 
 @dataclass
-class AckOptions:
-    """Options for queue ack operations."""
+class QueueReportOptions:
+    """Options for a queue complete or touch."""
 
     namespace: str | None = None
 
 
 @dataclass
-class NackOptions:
-    """Options for queue nack operations."""
+class QueueFailOptions:
+    """Options for a queue fail: ready again after ``delay_ms`` (at most a
+    day), or dead now with ``dead``, whatever attempts are left. ``error``
+    (at most 1024 bytes) says why."""
 
     namespace: str | None = None
+    delay_ms: int = 0
+    dead: bool = False
+    error: str = ""
 
 
 @dataclass
@@ -904,13 +999,6 @@ class DlqListOptions:
     namespace: str | None = None
     limit: int = 100
     after: int | None = None
-
-
-@dataclass
-class DlqRequeueOptions:
-    """Options for DLQ requeue operations."""
-
-    namespace: str | None = None
 
 
 @dataclass

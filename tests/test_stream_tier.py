@@ -14,14 +14,17 @@ def _one_record(tier: int) -> bytes:
     return struct.pack("<IQqBIBII", 1, 1, 1000, tier, 0, 0, 0, 0)
 
 
-@pytest.mark.parametrize(("byte", "tier"), [(0, StorageTier.HOT), (1, StorageTier.WARM)])
+@pytest.mark.parametrize(
+    ("byte", "tier"), [(0, StorageTier.HOT), (1, StorageTier.WARM), (2, StorageTier.DISK)]
+)
 def test_tier_bytes_read_as_the_server_sends_them(byte: int, tier: StorageTier) -> None:
     assert parse_stream_read_response(_one_record(byte)).records[0].tier == tier
 
 
-def test_an_unknown_tier_refuses_the_answer() -> None:
-    with pytest.raises(IncompleteResponseError):
-        parse_stream_read_response(_one_record(2))
+def test_an_unknown_tier_reads_as_a_pseudo_member_not_an_error() -> None:
+    tier = parse_stream_read_response(_one_record(7)).records[0].tier
+    assert (int(tier), tier.name) == (7, "UNKNOWN_7")
+    assert tier not in (StorageTier.HOT, StorageTier.WARM, StorageTier.DISK)
 
 
 def test_an_answer_short_of_its_record_count_is_refused() -> None:

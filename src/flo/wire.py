@@ -35,8 +35,6 @@ from .types import (
     RESPONSE_STALE,
     TABLE_HASH,
     VERSION,
-    DequeueResult,
-    Message,
     OpCode,
     OptionTag,
     PendingEntry,
@@ -309,8 +307,9 @@ class RawResponse:
     status: StatusCode
     data: bytes
     request_id: int
-    # The RESPONSE_STALE flag: a halted shard answered this read from the
-    # state just before the entry it halted at. Not an error.
+    # The RESPONSE_STALE flag: a halted or read-blocked shard answered this
+    # read from its state just before the entry it couldn't apply. Not an
+    # error.
     stale: bool = False
 
     def is_ok(self) -> bool:
@@ -398,56 +397,6 @@ def parse_response(data: bytes) -> RawResponse:
 # =============================================================================
 
 
-def parse_dequeue_response(data: bytes) -> DequeueResult:
-    """Parse dequeue response data.
-
-    Format: [count:u32][messages...]
-    Message format: [seq:u64][payload_len:u32][payload]
-                    [enqueued_at_ms:i64][delivery_count:u32][priority:u8]
-    """
-    if len(data) < 4:
-        raise IncompleteResponseError("Dequeue response too short")
-
-    offset = 0
-
-    count = struct.unpack("<I", data[offset : offset + 4])[0]
-    offset += 4
-
-    messages: list[Message] = []
-    for _ in range(count):
-        if len(data) < offset + 12:
-            raise IncompleteResponseError("Dequeue response message incomplete")
-
-        seq = struct.unpack("<Q", data[offset : offset + 8])[0]
-        offset += 8
-
-        payload_len = struct.unpack("<I", data[offset : offset + 4])[0]
-        offset += 4
-
-        if len(data) < offset + payload_len:
-            raise IncompleteResponseError("Dequeue response payload incomplete")
-
-        payload = data[offset : offset + payload_len]
-        offset += payload_len
-
-        if len(data) < offset + 13:
-            raise IncompleteResponseError("Dequeue response message incomplete")
-        enqueued_at_ms, delivery_count, priority = struct.unpack("<qIB", data[offset : offset + 13])
-        offset += 13
-
-        messages.append(
-            Message(
-                seq=seq,
-                payload=payload,
-                enqueued_at_ms=enqueued_at_ms,
-                delivery_count=delivery_count,
-                priority=priority,
-            )
-        )
-
-    return DequeueResult(messages=messages)
-
-
 def parse_enqueue_response(data: bytes) -> int:
     """Parse enqueue response data.
 
@@ -458,18 +407,6 @@ def parse_enqueue_response(data: bytes) -> int:
 
     result: int = struct.unpack("<Q", data[:8])[0]
     return result
-
-
-def serialize_seqs(seqs: list[int]) -> bytes:
-    """Serialize sequence numbers for ack/nack.
-
-    Format: [count:u32][seq:u64]*
-    """
-    result = bytearray()
-    result.extend(struct.pack("<I", len(seqs)))
-    for seq in seqs:
-        result.extend(struct.pack("<Q", seq))
-    return bytes(result)
 
 
 # =============================================================================
@@ -526,10 +463,7 @@ def parse_stream_read_response(data: bytes) -> StreamReadResult:
         # Read tier
         if pos + 1 > len(data):
             raise IncompleteResponseError("Stream record: missing tier")
-        try:
-            tier = StorageTier(data[pos])
-        except ValueError:
-            raise IncompleteResponseError(f"Stream record: unknown tier {data[pos]}") from None
+        tier = StorageTier(data[pos])
         pos += 1
 
         # Skip partition

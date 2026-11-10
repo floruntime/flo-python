@@ -204,12 +204,13 @@ class KVOperations:
         Returns ``GetResult(value, version, expires_at_ms)``, or ``None`` if
         the key is not found, also when a wait (``wait_ms``) ends without it.
         ``expires_at_ms`` is when the key's TTL runs out (unix ms), ``None``
-        when it has none. ``stale`` says a halted shard answered.
+        when it has none. ``stale`` says a halted or read-blocked
+        shard answered.
 
         Raises:
             NoNamespaceError: The namespace was never created.
-            StaleNotFoundError: A halted shard had no such key as of the entry
-                it halted at; it may exist since.
+            StaleNotFoundError: A halted or read-blocked shard had no such
+                key as of the entry it couldn't apply; it may exist since.
 
         Example:
             result = await client.kv.get("user:123")

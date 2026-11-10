@@ -19,7 +19,7 @@ from .exceptions import (
     UnexpectedEofError,
     raise_for_status,
 )
-from .kv_body import await_block_ms
+from .kv_body import await_block_ms, dequeue_block_ms
 from .retry import DEFAULT_RETRY_POLICY, RetryPolicy, _policy_backoff, _refused_unrun
 from .types import _DEFAULT_WORKER_BLOCK_MS, HEADER_SIZE, OpCode, OptionTag, StatusCode
 from .wire import (
@@ -284,6 +284,8 @@ class FloClient:
             return 0
         if op_code == OpCode.ACTION_AWAIT:
             return await_block_ms(value)
+        if op_code == OpCode.QUEUE_DEQUEUE:
+            return dequeue_block_ms(value)
         waits = [
             opt.as_u32() or 0 for opt in OptionsIterator(options) if opt.tag == OptionTag.BLOCK_MS
         ]

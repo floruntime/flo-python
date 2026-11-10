@@ -7,23 +7,35 @@ import struct
 from typing import TYPE_CHECKING
 
 from .exceptions import IncompleteResponseError, ValidationError
-from .kv_body import MAX_PEEK, decode_peek_answer, encode_peek_body
+from .kv_body import (
+    MAX_PEEK,
+    decode_dequeue_answer,
+    decode_peek_answer,
+    decode_queue_report_answer,
+    decode_queue_touch_answer,
+    encode_dequeue_body,
+    encode_peek_body,
+    encode_queue_complete_body,
+    encode_queue_fail_body,
+)
 from .types import (
-    AckOptions,
     DeadLetter,
     DequeueOptions,
     DequeueResult,
     DlqListOptions,
     DlqPage,
-    DlqRequeueOptions,
     EnqueueOptions,
-    NackOptions,
+    Message,
     OpCode,
     OptionTag,
     PeekOptions,
     PeekResult,
+    QueueFailOptions,
+    QueueReportOptions,
+    QueueReportResult,
+    QueueTouchResult,
 )
-from .wire import OptionsBuilder, parse_dequeue_response, parse_enqueue_response, serialize_seqs
+from .wire import OptionsBuilder, parse_enqueue_response
 
 # The most dead letters one page lists.
 MAX_DLQ_PAGE = 100
@@ -44,31 +56,36 @@ class QueueOperations:
         payload: bytes,
         options: EnqueueOptions | None = None,
     ) -> int:
-        """Enqueue a message to a queue.
+        """Enqueue a message (at most 64 KiB) to a queue.
 
         Args:
             queue: Queue name.
             payload: Message payload.
-            options: Optional enqueue options (priority).
+            options: Priority (0-255, lower is taken first) and delay_ms (how
+                long before it's ready, at most a day).
 
         Returns:
             Sequence number of the enqueued message.
 
-        Example:
-            # Simple enqueue
-            seq = await client.queue.enqueue("tasks", b'{"task": "process"}')
+        Raises:
+            OverloadedError: The queue is full (its messages or held bytes,
+                ready, leased and dead, are at its caps), or the shard's
+                queues are. The client retries it as any overloaded refusal
+                that didn't run, for about 350 ms, then raises it; consume or
+                purge the queue first.
 
-            # With priority (0-255, lower is taken first; default 0)
+        Example:
+            seq = await client.queue.enqueue("tasks", b'{"task": "process"}')
             seq = await client.queue.enqueue("tasks", payload, EnqueueOptions(priority=10))
         """
         opts = options or EnqueueOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
-        # Build TLV options
         builder = OptionsBuilder()
-
         if opts.priority != 0:
             builder.add_u8(OptionTag.PRIORITY, opts.priority)
+        if opts.delay_ms:
+            builder.add_u64(OptionTag.DELAY_MS, opts.delay_ms)
 
         response = await self._client._send_and_check(
             OpCode.QUEUE_ENQUEUE,
@@ -83,117 +100,113 @@ class QueueOperations:
     async def dequeue(
         self,
         queue: str,
-        count: int,
+        count: int = 1,
         options: DequeueOptions | None = None,
     ) -> DequeueResult:
-        """Dequeue messages from a queue.
+        """Take a queue's next ready messages (1..100), leased to the consumer.
 
-        Queues are currently at-most-once: the server acknowledges each
-        message as it hands it out, so it is not redelivered in normal
-        operation, even if the consumer crashes.
-
-        Args:
-            queue: Queue name.
-            count: Maximum number of messages to dequeue.
-            options: Optional dequeue options (block_ms).
-
-        Returns:
-            DequeueResult containing list of messages.
+        Delivery is at least once: complete each message within its lease
+        (``complete``), fail it, or touch it to keep it; one whose lease runs
+        out is ready again and delivered with ``deliveries`` one higher. A
+        message failed or expired five times is dead. With
+        ``DequeueOptions(ack=True)`` the messages are completed as they're
+        taken.
 
         Example:
-            # Dequeue up to 10 messages
             result = await client.queue.dequeue("tasks", 10)
             for msg in result.messages:
                 process(msg.payload)
+            await client.queue.complete("tasks", result)
 
-            # With long polling (wait up to 30s for messages)
-            result = await client.queue.dequeue(
-                "tasks", 10,
-                DequeueOptions(block_ms=30000)
-            )
+            # Long polling: wait up to 30 s for a message
+            result = await client.queue.dequeue("tasks", 10, DequeueOptions(block_ms=30000))
         """
         opts = options or DequeueOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        # Build TLV options
-        builder = OptionsBuilder()
-        builder.add_u32(OptionTag.COUNT, count)
-
-        if opts.block_ms is not None:
-            builder.add_u32(OptionTag.BLOCK_MS, opts.block_ms)
-
         response = await self._client._send_and_check(
             OpCode.QUEUE_DEQUEUE,
-            namespace,
+            self._client.get_namespace(opts.namespace),
+            queue.encode("utf-8"),
+            encode_dequeue_body(opts.consumer, count, opts.lease_ms, opts.block_ms, opts.ack),
+        )
+        return decode_dequeue_answer(response.data, opts.consumer)
+
+    async def complete(
+        self,
+        queue: str,
+        delivery: DequeueResult,
+        messages: list[Message] | None = None,
+        options: QueueReportOptions | None = None,
+    ) -> QueueReportResult:
+        """Complete dequeued messages, all of the dequeue's unless
+        ``messages`` names some: they leave the queue.
+
+        A message the report doesn't apply to comes back in ``refused`` with
+        why; the call itself succeeds. ``GONE`` means done (completed already,
+        or not in this queue), so ``result.lost`` lists only the messages that
+        go to another delivery. Resending a complete is safe.
+        """
+        opts = options or QueueReportOptions()
+        response = await self._client._send_and_check(
+            OpCode.QUEUE_COMPLETE,
+            self._client.get_namespace(opts.namespace),
+            queue.encode("utf-8"),
+            encode_queue_complete_body(delivery, messages),
+        )
+        return decode_queue_report_answer("queue.complete", response.data)
+
+    async def fail(
+        self,
+        queue: str,
+        delivery: DequeueResult,
+        messages: list[Message] | None = None,
+        options: QueueFailOptions | None = None,
+    ) -> QueueReportResult:
+        """Fail dequeued messages, all of the dequeue's unless ``messages``
+        names some: ready again after ``delay_ms``, or dead once their
+        attempts are spent (or at once with ``dead``). Messages it doesn't
+        apply to come back in ``refused``."""
+        opts = options or QueueFailOptions()
+        response = await self._client._send_and_check(
+            OpCode.QUEUE_FAIL,
+            self._client.get_namespace(opts.namespace),
+            queue.encode("utf-8"),
+            encode_queue_fail_body(
+                delivery, messages, opts.delay_ms, opts.dead, opts.error.encode("utf-8")
+            ),
+        )
+        return decode_queue_report_answer("queue.fail", response.data)
+
+    async def touch(
+        self,
+        queue: str,
+        delivery: DequeueResult,
+        messages: list[Message] | None = None,
+        options: QueueReportOptions | None = None,
+    ) -> QueueTouchResult:
+        """Keep dequeued messages: with half their lease or less left, it
+        runs a full lease from now, up to 12 h from their dequeue; with more
+        left, nothing changes. Touch at least every half lease."""
+        opts = options or QueueReportOptions()
+        response = await self._client._send_and_check(
+            OpCode.QUEUE_TOUCH,
+            self._client.get_namespace(opts.namespace),
+            queue.encode("utf-8"),
+            encode_queue_complete_body(delivery, messages),
+        )
+        return decode_queue_touch_answer(response.data)
+
+    async def purge(self, queue: str, namespace: str | None = None) -> int:
+        """Remove every message of a queue, ready, leased and dead. Returns
+        how many it removed; a queue that doesn't exist answers 0."""
+        response = await self._client._send_and_check(
+            OpCode.QUEUE_PURGE,
+            self._client.get_namespace(namespace),
             queue.encode("utf-8"),
             b"",
-            builder.build(),
         )
-
-        return parse_dequeue_response(response.data)
-
-    async def ack(
-        self,
-        queue: str,
-        seqs: list[int],
-        options: AckOptions | None = None,
-    ) -> None:
-        """Acknowledge messages.
-
-        Queues are currently at-most-once: dequeue already acknowledges each
-        message it hands out, so this has no effect on a dequeued message.
-
-        Args:
-            queue: Queue name.
-            seqs: Sequence numbers of messages to acknowledge.
-            options: Optional ack options.
-        """
-        if not seqs:
-            return
-
-        opts = options or AckOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = serialize_seqs(seqs)
-
-        await self._client._send_and_check(
-            OpCode.QUEUE_COMPLETE,
-            namespace,
-            queue.encode("utf-8"),
-            value,
-        )
-
-    async def nack(
-        self,
-        queue: str,
-        seqs: list[int],
-        options: NackOptions | None = None,
-    ) -> None:
-        """Negatively acknowledge messages.
-
-        Queues are currently at-most-once: dequeue already acknowledges each
-        message it hands out, so this has no effect on a dequeued message and
-        does not retry it.
-
-        Args:
-            queue: Queue name.
-            seqs: Sequence numbers of messages to nack.
-            options: Optional nack options.
-        """
-        if not seqs:
-            return
-
-        opts = options or NackOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = serialize_seqs(seqs)
-
-        await self._client._send_and_check(
-            OpCode.QUEUE_FAIL,
-            namespace,
-            queue.encode("utf-8"),
-            value,
-        )
+        if len(response.data) != 4:
+            raise IncompleteResponseError(f"queue.purge answer is {len(response.data)} bytes")
+        return int(struct.unpack("<I", response.data)[0])
 
     async def dlq_list(
         self,
@@ -202,8 +215,8 @@ class QueueOperations:
     ) -> DlqPage:
         """List a page of the Dead Letter Queue, oldest first.
 
-        Queues are currently at-most-once, so messages don't reach the DLQ in
-        normal use.
+        A message lands here once failed or expired five times, or failed
+        with ``dead``; it stays until the queue is purged.
 
         Args:
             queue: Queue name.
@@ -242,43 +255,6 @@ class QueueOperations:
         )
 
         return parse_dlq_page(response.data)
-
-    async def dlq_requeue(
-        self,
-        queue: str,
-        seqs: list[int],
-        options: DlqRequeueOptions | None = None,
-    ) -> None:
-        """Move messages from DLQ back to the main queue.
-
-        Queues are currently at-most-once, so messages don't reach the DLQ in
-        normal use.
-
-        Args:
-            queue: Queue name.
-            seqs: Sequence numbers of DLQ messages to requeue.
-            options: Optional requeue options.
-
-        Example:
-            # Requeue all DLQ messages
-            result = await client.queue.dlq_list("tasks")
-            seqs = [msg.seq for msg in result.messages]
-            await client.queue.dlq_requeue("tasks", seqs)
-        """
-        if not seqs:
-            return
-
-        opts = options or DlqRequeueOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = serialize_seqs(seqs)
-
-        await self._client._send_and_check(
-            OpCode.QUEUE_DLQ_REQUEUE,
-            namespace,
-            queue.encode("utf-8"),
-            value,
-        )
 
     async def peek(
         self,

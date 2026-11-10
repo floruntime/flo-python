@@ -32,7 +32,7 @@ asyncio.run(main())
 ## Features
 
 - **KV Store**: Versioned key-value storage with MVCC, TTL, and optimistic locking
-- **Queues**: Priority task queues (currently at-most-once: dequeue hands each message out once)
+- **Queues**: Priority task queues, at-least-once: a dequeue leases its messages until they're completed
 - **Streams**: Append-only logs with consumer groups for distributed processing
 - **Actions**: Registered tasks with configurable timeouts and retries
 - **Workers**: Distributed task execution with lease management and heartbeats
@@ -204,37 +204,66 @@ write applies, so it still costs a commit.
 ```python
 from flo import EnqueueOptions
 
-# Simple enqueue
+# Simple enqueue (a message holds at most 64 KiB)
 seq = await client.queue.enqueue("tasks", b'{"task": "process"}')
 
-# With priority (0-255, lower is taken first; default 0)
-seq = await client.queue.enqueue("tasks", payload, EnqueueOptions(priority=10))
+# With priority (0-255, lower is taken first; default 0), ready in 5 s
+seq = await client.queue.enqueue("tasks", payload, EnqueueOptions(priority=10, delay_ms=5000))
 ```
 
-### Dequeue
+A queue holds at most its cap of messages and bytes (ready, leased and dead
+together), and a shard's queues their cap of bytes; both are server settings.
+Past either, an enqueue raises `OverloadedError` (ran `NO`, its message naming
+the queue and its caps). The client retries it like any overloaded refusal
+that didn't run, for about 350 ms, before raising it: consume or purge the
+queue first.
 
-Queues are currently at-most-once: a dequeue acknowledges each message as it
-hands it out. A message is not redelivered in normal operation, even if the
-consumer crashes while handling it, so handle failures in your own code.
+### Dequeue, Complete, Fail, Touch
+
+Delivery is at least once. A dequeue leases its messages to its consumer
+(`DequeueOptions(consumer=..., lease_ms=...)`, 30 s by default) and doesn't
+consume them: complete each message within its lease, or it is ready again and
+delivered once more, with `deliveries` one higher. A message failed or expired
+five times is dead (see the DLQ below). `ack=True` completes the messages as
+they're taken, a one-shot consume that comes back only if the leader fails in
+between.
 
 ```python
-from flo import DequeueOptions
+from flo import DequeueOptions, QueueFailOptions
 
-# Dequeue up to 10 messages
-result = await client.queue.dequeue("tasks", 10)
-for msg in result.messages:
-    print(f"Processing message {msg.seq}: {msg.payload}")
-
-# Long polling (wait up to 30s for messages)
+# Up to 10 messages, waiting up to 30 s for one
 result = await client.queue.dequeue("tasks", 10, DequeueOptions(block_ms=30000))
+done, failed = [], []
+for msg in result.messages:
+    try:
+        process(msg.payload)
+        done.append(msg)
+    except Exception:
+        failed.append(msg)
+
+# Reports name the dequeue (pass its result) and the messages, all of them
+# when none are given; the same consumer must send them.
+if done:
+    report = await client.queue.complete("tasks", result, done)
+    # A message the report didn't apply to is in report.refused; for a
+    # complete, GONE means it was done already, so report.lost has the rest.
+    for r in report.lost:
+        print(f"message {r.seq} went to another delivery: {r.reason}")
+if failed:
+    await client.queue.fail("tasks", result, failed, QueueFailOptions(delay_ms=1000))
+
+# Keep a long job: with half its lease or less left, a touch runs the lease a
+# full lease from now, up to 12 h from the dequeue
+touched = await client.queue.touch("tasks", result)
+
+# One-shot consume
+result = await client.queue.dequeue("tasks", 10, DequeueOptions(ack=True))
 ```
 
-### Ack/Nack and the Dead Letter Queue
+### Dead Letters and Purge
 
-`queue.ack`, `queue.nack`, `queue.dlq_list` and `queue.dlq_requeue` exist, but
-while queues are at-most-once they do nothing useful: a dequeued message is
-already acknowledged, so ack and nack have no effect on it, nack does not
-retry it, and messages don't reach the DLQ in normal use.
+`queue.purge` removes every message of a queue, ready, leased and dead, and
+returns how many.
 
 `queue.dlq_list` reads a page of dead letters, oldest first (`limit` 1..100):
 
@@ -542,7 +571,7 @@ A run whose handler goes past its lease without touching it is taken back and ru
 
 Delivery is at-least-once: a result lost to a dropped connection is resent, and one that never arrives lets the lease run out, so a handler may see the same task or record again. A handler that raises (`asyncio.CancelledError` included) or runs past `action_timeout` fails the run with retry, so it runs again until its attempts are spent; raise `NonRetryableError` to fail it for good.
 
-`worker.stop()` takes no new tasks and doesn't cancel running handlers: they finish (up to `action_timeout`), their results are sent, and the worker deregisters before `start()` returns.
+`worker.stop()` takes no new tasks and doesn't cancel running handlers: they finish (up to `action_timeout`), their results are sent, and the worker deregisters before `start()` returns. While the worker is stopping, a handler's cancellation abandons its run: the run is handed back untried and spends no attempt.
 
 Both workers register in the worker registry and heartbeat every 30 s, reporting the handlers they are running. One the server removed after missed heartbeats registers again, with the same options, when its next heartbeat is answered not found.
 
@@ -639,7 +668,7 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 | `UnauthorizedError` | Authentication failed |
 | `OverloadedError` | Server is overloaded, and the client's retries ran out |
 | `UnavailableError` | No leader, or the shard isn't taking writes or is offline, and the client's retries ran out (the message says why, and whether an operator must act first) |
-| `StaleNotFoundError` | `kv.get` or `kv.json_get` found no key, but a halted shard answered: absent only as of the entry it halted at |
+| `StaleNotFoundError` | `kv.get` or `kv.json_get` found no key, but a halted or read-blocked shard answered: absent only as of the entry it couldn't apply |
 | `OutcomePendingError` | The write committed but hasn't applied: its shard halted at or before it (reason `SHARD_HALTED`, ran `UNKNOWN`; the message says whether it applies when the shard resumes). Never retried |
 | `InternalServerError` | Server internal error; not retryable (may mean committed but not applied) |
 | `GenericServerError` | Any other error status, including one this SDK doesn't know (`status_code` carries it) |
@@ -653,8 +682,15 @@ When the server refuses a request as `overloaded` or `unavailable` and says it
 didn't run it (`error.ran == Ran.NO`), the client sends it again itself, as a
 new request, after a jittered wait. Because the server never ran it, this is
 safe for writes too. That covers a leader that isn't ready yet (reason
-`LEADER_UNKNOWN`), including a node catching up after a restart. Any other
+`LEADER_UNKNOWN`), including a node catching up after a restart, and a
+stream read whose records are still being read back from disk. Any other
 refusal, or one that may have run, comes straight back.
+
+`UnavailableError` with ran `NO` is routine, not a fault: a first read of
+records that left the warm store is answered so while the shard reads them
+back from disk. A group read or claim refused this way claimed and delivered
+nothing, so sending the same one again is safe; the stream worker's read and
+claim loops do so with a backoff, without logging an error.
 
 Two refusals from a halted shard are never retried, and come back after one
 attempt for the caller to decide:
@@ -666,10 +702,11 @@ attempt for the caller to decide:
   a leader change.
 
 A halted shard still answers reads, from its state just before the entry it
-halted at. Such a read succeeds; its result says so with `stale=True` (on
+halted at, and so does one blocked reading its next entry from disk (it holds
+that entry unapplied and retries the read). Such a read succeeds; its result says so with `stale=True` (on
 `GetResult`, `GetJsonResult`, each `MGetEntry`, `ScanResult`, `HistoryResult`,
 `ExistsResult`, and the raw response). It is not an error. A key absent on
-such an answer is absent only as of the halt, so `kv.get` and `kv.json_get`
+such an answer is absent only as of that entry, so `kv.get` and `kv.json_get`
 raise `StaleNotFoundError` (a `NotFoundError` with `stale` True) instead of
 returning `None`; `kv.history` returns an empty page with `stale=True`, and
 `kv.exists` and `kv.mget` entries say `stale` too. A refusal from a halted

@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from flo.types import Reason, StatusCode
+from flo.types import Reason, StatusCode, StorageTier
 
 from .conftest import IN_CI
 
@@ -43,6 +43,10 @@ def test_status_codes_match_the_server(ops: dict[str, Any]) -> None:
 
 def test_reasons_match_the_server(ops: dict[str, Any]) -> None:
     assert _sdk(Reason) == _server(ops["reasons"])
+
+
+def test_storage_tiers_match_the_server(ops: dict[str, Any]) -> None:
+    assert _sdk(StorageTier) == _server(ops["storage_tiers"])
 
 
 def test_every_table_op_has_its_code_here(ops: dict[str, Any]) -> None:

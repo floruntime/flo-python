@@ -100,7 +100,11 @@ async def queue_example(client: FloClient) -> None:
     print(f"  Received {len(result.messages)} messages")
     for msg in result.messages:
         print(f"    seq={msg.seq}: {msg.payload.decode()}")
-    # No ack needed: queues are at-most-once, so dequeue already acknowledged them.
+    # Each message is leased to this consumer until it's completed; one not
+    # completed within its lease (30 s by default) is delivered again.
+    if result.messages:
+        report = await client.queue.complete(queue_name, result)
+        print(f"  Completed {report.applied} messages")
 
 
 async def main() -> None:

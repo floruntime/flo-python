@@ -6,7 +6,7 @@ import struct
 import google_crc32c
 import pytest
 
-from flo.exceptions import IncompleteResponseError, TableMismatchError, ValidationError
+from flo.exceptions import TableMismatchError, ValidationError
 from flo.types import (
     HEADER_SIZE,
     MAGIC,
@@ -23,7 +23,6 @@ from flo.wire import (
     build_stream_batch_value,
     compute_crc32c,
     crc32c,
-    parse_dequeue_response,
     parse_enqueue_response,
     parse_pending_entries,
     parse_response,
@@ -31,7 +30,6 @@ from flo.wire import (
     serialize_group_claim_value,
     serialize_group_pending_value,
     serialize_request,
-    serialize_seqs,
 )
 
 
@@ -172,7 +170,7 @@ class TestSerializeRequest:
         assert request_id == 42
         assert op_code == OpCode.KV_GET
         assert flags == 0
-        assert table_hash == 0x7EB599C24442118B
+        assert table_hash == 0x19075DF8E1ED5F75
 
     def test_table_op_payload_is_namespace_key_body(self) -> None:
         request = serialize_request(
@@ -328,42 +326,6 @@ class TestParseResponse:
         assert parsed.data == b""
 
 
-class TestParseDequeueResponse:
-    """Tests for dequeue response parsing."""
-
-    def test_parse_dequeue_response(self) -> None:
-        # Build dequeue response as the server writes it:
-        # [count:u32] then per message
-        # [seq:u64][payload_len:u32][payload][enqueued_at_ms:i64][delivery_count:u32][priority:u8]
-        data = bytearray()
-        data.extend(struct.pack("<I", 3))
-        for seq, payload, at, deliveries, prio in (
-            (100, b"task1", 1_700_000_000_000, 1, 0),
-            (101, b"t2", 1_700_000_000_005, 2, 7),
-            (102, b"third", 1_700_000_000_009, 3, 255),
-        ):
-            data.extend(struct.pack("<QI", seq, len(payload)))
-            data.extend(payload)
-            data.extend(struct.pack("<qIB", at, deliveries, prio))
-
-        result = parse_dequeue_response(bytes(data))
-
-        got = [
-            (m.seq, m.payload, m.enqueued_at_ms, m.delivery_count, m.priority)
-            for m in result.messages
-        ]
-        assert got == [
-            (100, b"task1", 1_700_000_000_000, 1, 0),
-            (101, b"t2", 1_700_000_000_005, 2, 7),
-            (102, b"third", 1_700_000_000_009, 3, 255),
-        ]
-
-    def test_parse_dequeue_response_refuses_a_cut_trailer(self) -> None:
-        data = struct.pack("<IQI", 1, 1, 1) + b"x" + struct.pack("<q", 0)
-        with pytest.raises(IncompleteResponseError):
-            parse_dequeue_response(data)
-
-
 class TestParseEnqueueResponse:
     """Tests for enqueue response parsing."""
 
@@ -371,31 +333,6 @@ class TestParseEnqueueResponse:
         data = struct.pack("<Q", 12345)
         seq = parse_enqueue_response(data)
         assert seq == 12345
-
-
-class TestSerializeSeqs:
-    """Tests for sequence number serialization."""
-
-    def test_serialize_seqs(self) -> None:
-        seqs = [1, 2, 3]
-        result = serialize_seqs(seqs)
-
-        assert len(result) == 4 + 3 * 8  # count + 3 u64s
-
-        count = struct.unpack("<I", result[0:4])[0]
-        assert count == 3
-
-        seq1 = struct.unpack("<Q", result[4:12])[0]
-        seq2 = struct.unpack("<Q", result[12:20])[0]
-        seq3 = struct.unpack("<Q", result[20:28])[0]
-
-        assert seq1 == 1
-        assert seq2 == 2
-        assert seq3 == 3
-
-    def test_serialize_empty_seqs(self) -> None:
-        result = serialize_seqs([])
-        assert result == struct.pack("<I", 0)
 
 
 class TestBuildStreamBatchValue:
