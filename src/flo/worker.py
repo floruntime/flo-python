@@ -1599,6 +1599,13 @@ class StreamWorker(_RegisteredWorker):
                     d = halted.next()
                     logger.warning(f"Stream read refused, shard halted: {e}; retrying in {d:.3f}s")
                     await _sleep_unless_stopped(leave, d)
+                elif is_refused_unrun(e):
+                    # Routine: a leader not ready yet, or records still being
+                    # read back from disk. The read claimed and delivered
+                    # nothing, so the same read is safe to send again.
+                    d = failed.next()
+                    logger.info(f"Stream read not served yet: {e}; retrying in {d:.3f}s")
+                    await _sleep_unless_stopped(leave, d)
                 else:
                     d = failed.next()
                     logger.error(f"Stream read error: {e}, retrying in {d:.3f}s...")
@@ -1724,6 +1731,7 @@ class StreamWorker(_RegisteredWorker):
         max_pages = 1000  # safety cap: max_pages * batch_size entries
         cursor = StreamID()  # MIN — scan from the start of the PEL
         pages = 0
+        unserved = _worker_backoff()
         while True:
             if self._leave_event.is_set():
                 return
@@ -1737,9 +1745,17 @@ class StreamWorker(_RegisteredWorker):
                     self.config.batch_size,
                 )
             except Exception as e:
+                if is_refused_unrun(e):
+                    # Not served yet (records being read back from disk, a
+                    # leader not ready): claimed nothing, so ask again.
+                    d = unserved.next()
+                    logger.info(f"Pending drain claim not served yet: {e}; retrying in {d:.3f}s")
+                    await _sleep_unless_stopped(self._leave_event, d)
+                    continue
                 # Don't fail the reconnect on a drain error; normal reads resume.
                 logger.warning(f"Pending drain claim failed: {e}")
                 return
+            unserved.reset()
 
             # Same gate as live reads.
             await self._dispatch(result.records)

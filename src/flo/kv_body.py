@@ -1,6 +1,6 @@
 """The ops on the server's op table: KV, the action reports and reads,
-worker.list and worker.info, stream group reads, queue.peek and
-processing.remove.
+worker.list and worker.info, stream group reads, the queue's dequeue,
+reports and peek, and processing.remove.
 
 The request is ``[namespace][key][body]``, the body coded by the op's
 schema, field by field in order. An optional field is a presence byte then
@@ -22,10 +22,12 @@ from .types import (
     ActionListEntry,
     ActionRunStatus,
     Condition,
+    DequeueResult,
     ExistsResult,
     GetOptions,
     GetResult,
     GroupMemberState,
+    Message,
     MGetEntry,
     OpCode,
     PeekedMessage,
@@ -33,6 +35,10 @@ from .types import (
     ProcessKind,
     PutOptions,
     PutResult,
+    QueueRefusal,
+    QueueRefusalReason,
+    QueueReportResult,
+    QueueTouchResult,
     RunStatus,
     StreamGroupEntry,
     StreamGroupListResult,
@@ -74,6 +80,11 @@ MAX_RESULT = 65_535
 MAX_ERROR = 65_535
 MAX_FAIL_DELAY_MS = 86_400_000
 MAX_PEEK = 100
+MAX_DEQUEUE = 100
+MAX_CONSUMER = 4082
+MIN_LEASE_MS = 5_000
+MAX_LEASE_MS = 43_200_000
+MAX_QUEUE_ERROR = 1024
 # The longest TTL whose nanoseconds fit a u64.
 MAX_TTL_MS = 18_446_744_073_709
 _U64_MAX = (1 << 64) - 1
@@ -108,6 +119,10 @@ _TABLE_OPS = frozenset(
         OpCode.STREAM_GROUP_LIST,
         OpCode.STREAM_GROUP_MEMBERS,
         OpCode.QUEUE_PEEK,
+        OpCode.QUEUE_DEQUEUE,
+        OpCode.QUEUE_COMPLETE,
+        OpCode.QUEUE_FAIL,
+        OpCode.QUEUE_TOUCH,
         OpCode.TS_INFO,
         OpCode.PROCESSING_REMOVE,
     }
@@ -426,6 +441,93 @@ def encode_touch_body(worker: str, task: TaskAssignment) -> bytes:
 def encode_group_members_body(group: str) -> bytes:
     """stream.group.members's request: group."""
     return _bytes16("group", group.encode("utf-8"), _MAX_ROUTING_KEY)
+
+
+def encode_dequeue_body(
+    consumer: str, count: int, lease_ms: int | None, block_ms: int | None, ack: bool
+) -> bytes:
+    """queue.dequeue's request: consumer, count, lease_ms, block_ms, ack."""
+    if lease_ms is not None and (
+        not isinstance(lease_ms, int)
+        or isinstance(lease_ms, bool)
+        or not MIN_LEASE_MS <= lease_ms <= MAX_LEASE_MS
+    ):
+        raise ValidationError(f"lease_ms must be {MIN_LEASE_MS}..{MAX_LEASE_MS}, got {lease_ms!r}")
+    wait = 0 if block_ms is None else block_ms
+    if not isinstance(wait, int) or isinstance(wait, bool) or wait < 0:
+        raise ValidationError(f"block_ms must be a whole number of ms, got {block_ms!r}")
+    if wait > MAX_BLOCK_MS:
+        raise BlockTooLongError(
+            f"a wait (block_ms) is at most {MAX_BLOCK_MS} ms (5 minutes), got {wait}"
+        )
+    return (
+        b"\x01"
+        + _bytes16("consumer", consumer.encode("utf-8"), MAX_CONSUMER)
+        + _limit("dequeue count", count, MAX_DEQUEUE)
+        + _opt_u64("lease_ms", lease_ms)
+        + b"\x01"
+        + struct.pack("<Q", wait)
+        + b"\x01"
+        + _flag(ack)
+    )
+
+
+def dequeue_block_ms(body: bytes) -> int:
+    """How long a dequeue body asks the server to wait: its block_ms, after
+    the consumer, count and lease."""
+    at = 3 + int.from_bytes(body[1:3], "little") + 5  # consumer, count
+    at += 9 if body[at : at + 1] == b"\x01" else 1  # lease_ms
+    if len(body) >= at + 9 and body[at] == 1:
+        return int.from_bytes(body[at + 1 : at + 9], "little")
+    return 0
+
+
+def _report(consumer: str, delivery: DequeueResult, messages: Sequence[Message] | None) -> bytes:
+    """A queue report's consumer, the dequeue's token, and its messages by seq
+    and deliveries: all the dequeue's when ``messages`` is None."""
+    picked = delivery.messages if messages is None else messages
+    if not 1 <= len(picked) <= MAX_DEQUEUE:
+        raise ValidationError(f"a report names 1..{MAX_DEQUEUE} messages, got {len(picked)}")
+    return (
+        b"\x01"
+        + _bytes16("consumer", consumer.encode("utf-8"), MAX_CONSUMER)
+        + _u64("term", delivery.term)
+        + _u64("index", delivery.index)
+        + bytes([len(picked)])
+        + b"".join(_u64("seq", m.seq) + _u32("deliveries", m.deliveries) for m in picked)
+    )
+
+
+def encode_queue_complete_body(
+    delivery: DequeueResult, messages: Sequence[Message] | None = None
+) -> bytes:
+    """queue.complete's request (and queue.touch's): the report."""
+    return _report(delivery.consumer, delivery, messages)
+
+
+def encode_queue_fail_body(
+    delivery: DequeueResult,
+    messages: Sequence[Message] | None,
+    delay_ms: int,
+    dead: bool,
+    error: bytes,
+) -> bytes:
+    """queue.fail's request: the report, delay_ms, dead, error."""
+    if (
+        not isinstance(delay_ms, int)
+        or isinstance(delay_ms, bool)
+        or not 0 <= delay_ms <= MAX_FAIL_DELAY_MS
+    ):
+        raise ValidationError(f"delay_ms must be 0..{MAX_FAIL_DELAY_MS}, got {delay_ms!r}")
+    return (
+        _report(delivery.consumer, delivery, messages)
+        + b"\x01"
+        + struct.pack("<Q", delay_ms)
+        + b"\x01"
+        + _flag(dead)
+        + b"\x01"
+        + _bytes16("error", error, MAX_QUEUE_ERROR)
+    )
 
 
 def encode_peek_body(limit: int) -> bytes:
@@ -938,3 +1040,57 @@ def decode_worker_info_answer(data: bytes) -> WorkerDetails:
         )
     a.done()
     return WorkerDetails(worker=worker, metadata=metadata, processes=processes)
+
+
+def decode_dequeue_answer(data: bytes, consumer: str) -> DequeueResult:
+    """queue.dequeue's answer: messages, term, index, expires_at_ms."""
+    a = _Answer("queue.dequeue", data)
+    messages = []
+    for _ in range(a.u8()):
+        seq, priority, deliveries, enqueued_at_ms = a.u64(), a.u32(), a.u32(), a.i64()
+        messages.append(
+            Message(
+                seq=seq,
+                payload=a.bytes32(),
+                priority=priority,
+                deliveries=deliveries,
+                enqueued_at_ms=enqueued_at_ms,
+            )
+        )
+    term, index, expires_at_ms = a.u64(), a.u64(), a.i64()
+    a.done()
+    return DequeueResult(
+        messages=messages, term=term, index=index, expires_at_ms=expires_at_ms, consumer=consumer
+    )
+
+
+def _refusals(a: _Answer, op: str) -> list[QueueRefusal]:
+    refused = []
+    for _ in range(a.u8()):
+        seq = a.u64()
+        code = a.u8()
+        try:
+            why = QueueRefusalReason(code)
+        except ValueError:
+            raise IncompleteResponseError(f"{op} answer has an unknown refusal {code}") from None
+        refused.append(QueueRefusal(seq=seq, why=why, reason=_text(a, op, a.bytes8())))
+    return refused
+
+
+def decode_queue_report_answer(op: str, data: bytes) -> QueueReportResult:
+    """queue.complete's and queue.fail's answer: applied, refused."""
+    a = _Answer(op, data)
+    applied = a.u32()
+    refused = _refusals(a, op)
+    a.done()
+    return QueueReportResult(applied=applied, refused=refused)
+
+
+def decode_queue_touch_answer(data: bytes) -> QueueTouchResult:
+    """queue.touch's answer: expires_at_ms, applied, refused."""
+    op = "queue.touch"
+    a = _Answer(op, data)
+    expires_at_ms, applied = a.i64(), a.u32()
+    refused = _refusals(a, op)
+    a.done()
+    return QueueTouchResult(expires_at_ms=expires_at_ms, applied=applied, refused=refused)

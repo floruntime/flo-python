@@ -9,9 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 The op table hash moves with the server in this release: this SDK talks only
 to the flo it pins, and the pin lands with the release.
-The server's op table hash is now `0x7eb599c24442118b` (`TABLE_HASH`).
+The server's op table hash is now `0x19075df8e1ed5f75` (`TABLE_HASH`).
 
 ### Added
+
+- `queue.complete`, `queue.fail` and `queue.touch` (`QUEUE_COMPLETE`,
+  `QUEUE_FAIL`, `QUEUE_TOUCH`, 0x182-0x184) report on a dequeue's messages:
+  pass the `DequeueResult`, and optionally which of its messages. Each
+  returns what applied and the `refused` rest (`QueueRefusal`: seq,
+  `QueueRefusalReason`, the server's words); for a complete, `GONE` means
+  done, and `QueueReportResult.lost` lists the others
+- `DequeueOptions.consumer`, `lease_ms` (5000 to 43200000; the server's 30 s
+  when None) and `ack` (complete as taken); `DequeueResult` carries the
+  delivery's `term`, `index`, `expires_at_ms` and `consumer`, and each
+  `Message` its `deliveries`
+- `EnqueueOptions.delay_ms`: how long before the message is ready, 0 to
+  86400000 (a day); outside that it raises `ValidationError` before sending
+- `queue.purge(queue, PurgeOptions)`: remove every message of a queue,
+  ready, leased and dead
+- `StorageTier.DISK` (2): a record read back from the durable log. A tier
+  this SDK doesn't know reads as a pseudo-member `UNKNOWN_<n>`, not an error
+- The ops.json drift test checks the storage tiers too
 
 - `action.info(name)` (`ACTION_INFO`, 0x30F): an action's definition, its
   runs by status and its completed runs' latency, as an `ActionInfo`
@@ -52,6 +70,27 @@ The server's op table hash is now `0x7eb599c24442118b` (`TABLE_HASH`).
 
 ### Changed
 
+- Queues are at-least-once: a dequeue leases its messages until they're
+  completed, failed or expired, and one not completed within its lease is
+  delivered again with `deliveries` one higher; five failures or expiries
+  make it dead. `QUEUE_DEQUEUE` is 0x181, a typed op
+- An enqueue past a queue's caps, or its shard's, raises `OverloadedError`
+  (ran `NO`), after the client's usual retries of about 350 ms
+- The stream worker retries an unavailable group read (ran `NO`: records
+  still being read back from disk, or a leader not ready) with a backoff and
+  without logging an error, and its pending drain asks again after an
+  unavailable claim instead of giving up until the next reconnect. Neither
+  claimed or delivered anything, so the same request is safe to resend
+- `retry.is_refused_unrun` excludes a halted shard's refusal (reason
+  `SHARD_HALTED`): that one waits for an operator, not a retry
+- A stream read's `start` is documented as exclusive (the records after it),
+  as the server reads it; the README's stream read examples use the real
+  options
+- `stale` docs: a shard blocked reading its next entry from disk answers
+  reads from before that entry too, as a halted one does
+- The README says that while the worker is stopping, a handler's
+  cancellation abandons its run
+
 - `queue.dlq_list` sends its page (`DlqListOptions.limit`, 1..100, and
   `after`, the seq that ended the last page) in the request value, and
   returns a `DlqPage`: the dead letters, oldest first, with `total`,
@@ -91,6 +130,17 @@ The server's op table hash is now `0x7eb599c24442118b` (`TABLE_HASH`).
   other, and no client API sends it
 
 ### Breaking
+
+- `queue.ack` and `queue.nack` are gone: use `queue.complete` and
+  `queue.fail`, which take the `DequeueResult`. `AckOptions` and
+  `NackOptions` are gone (`QueueReportOptions`, `QueueFailOptions`), and
+  `Message.delivery_count` is now `deliveries`. A consumer that doesn't
+  complete its messages sees them again
+- `queue.dlq_requeue` and `DlqRequeueOptions` are gone: the server refuses
+  every requeue
+- `QUEUE_DEQUEUE`, `QUEUE_COMPLETE` and `QUEUE_FAIL` moved to 0x181-0x183
+  (0x171, 0x172 and 0x174 are retired), and `OptionTag.DELAY_MS` (0x11) is
+  new
 
 - The action ops are the server's typed ops: `ACTION_AWAIT`,
   `ACTION_COMPLETE`, `ACTION_FAIL` and `ACTION_TOUCH` are 0x30A to 0x30D

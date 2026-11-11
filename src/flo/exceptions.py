@@ -166,8 +166,8 @@ class ServerError(FloError):
     reason: Reason = Reason.UNCLASSIFIED
     # Whether the request took effect; unknown unless the server said.
     ran: Ran = Ran.UNKNOWN
-    # A halted shard answered, from its state just before the entry it
-    # halted at.
+    # A shard halted or blocked reading from disk answered, from its state
+    # just before the entry it couldn't apply.
     stale: bool = False
 
     def __init__(self, message: str, status_code: StatusCode):
@@ -183,9 +183,9 @@ class NotFoundError(ServerError):
 
 
 class StaleNotFoundError(NotFoundError):
-    """A halted shard didn't have the key, as of the entry it halted at
-    (``stale`` is True). It may exist since: a write after the halt hasn't
-    applied. kv.get and kv.json_get raise it rather than report the key
+    """A halted or read-blocked shard didn't have the key, as of the entry
+    it couldn't apply (``stale`` is True). It may exist since: a write after
+    that entry hasn't applied. kv.get and kv.json_get raise it rather than report the key
     absent."""
 
     stale = True

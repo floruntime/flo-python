@@ -81,8 +81,14 @@ def _refused_unrun(status: StatusCode, data: bytes) -> bool:
 
 def is_refused_unrun(exc: BaseException) -> bool:
     """Whether exc is a refusal the server says it didn't run, of a kind worth
-    trying again later."""
-    return isinstance(exc, ServerError) and exc.status_code in _RETRYABLE and exc.ran == Ran.NO
+    trying again soon. Not a halted shard's: it takes no writes until an
+    operator repairs it (see is_shard_halted)."""
+    return (
+        isinstance(exc, ServerError)
+        and exc.status_code in _RETRYABLE
+        and exc.ran == Ran.NO
+        and exc.reason != Reason.SHARD_HALTED
+    )
 
 
 def is_shard_halted(exc: BaseException) -> bool:
