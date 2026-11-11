@@ -30,6 +30,7 @@ from .types import (
     OptionTag,
     PeekOptions,
     PeekResult,
+    PurgeOptions,
     QueueFailOptions,
     QueueReportOptions,
     QueueReportResult,
@@ -37,6 +38,8 @@ from .types import (
 )
 from .wire import OptionsBuilder, parse_enqueue_response
 
+# The longest an enqueued message waits before it's ready: a day.
+MAX_ENQUEUE_DELAY_MS = 86_400_000
 # The most dead letters one page lists.
 MAX_DLQ_PAGE = 100
 
@@ -84,6 +87,14 @@ class QueueOperations:
         builder = OptionsBuilder()
         if opts.priority != 0:
             builder.add_u8(OptionTag.PRIORITY, opts.priority)
+        if (
+            not isinstance(opts.delay_ms, int)
+            or isinstance(opts.delay_ms, bool)
+            or not 0 <= opts.delay_ms <= MAX_ENQUEUE_DELAY_MS
+        ):
+            raise ValidationError(
+                f"delay_ms must be 0..{MAX_ENQUEUE_DELAY_MS}, got {opts.delay_ms!r}"
+            )
         if opts.delay_ms:
             builder.add_u64(OptionTag.DELAY_MS, opts.delay_ms)
 
@@ -195,12 +206,13 @@ class QueueOperations:
         )
         return decode_queue_touch_answer(response.data)
 
-    async def purge(self, queue: str, namespace: str | None = None) -> int:
+    async def purge(self, queue: str, options: PurgeOptions | None = None) -> int:
         """Remove every message of a queue, ready, leased and dead. Returns
         how many it removed; a queue that doesn't exist answers 0."""
+        opts = options or PurgeOptions()
         response = await self._client._send_and_check(
             OpCode.QUEUE_PURGE,
-            self._client.get_namespace(namespace),
+            self._client.get_namespace(opts.namespace),
             queue.encode("utf-8"),
             b"",
         )

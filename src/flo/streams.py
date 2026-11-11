@@ -117,7 +117,7 @@ class StreamOperations:
             # Read from tail (latest)
             result = await client.stream.read("events", StreamReadOptions(tail=True, count=10))
 
-            # Read from specific StreamID
+            # Read the records after a StreamID (start is exclusive)
             from flo.types import StreamID
             result = await client.stream.read("events", StreamReadOptions(
                 start=StreamID(timestamp_ms=0, sequence=100), count=10

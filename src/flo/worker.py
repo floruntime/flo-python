@@ -1745,7 +1745,7 @@ class StreamWorker(_RegisteredWorker):
                     self.config.batch_size,
                 )
             except Exception as e:
-                if is_refused_unrun(e) and not is_shard_halted(e):
+                if is_refused_unrun(e):
                     # Not served yet (records being read back from disk, a
                     # leader not ready): claimed nothing, so ask again.
                     d = unserved.next()

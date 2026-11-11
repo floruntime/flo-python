@@ -23,9 +23,10 @@ The server's op table hash is now `0x19075df8e1ed5f75` (`TABLE_HASH`).
   when None) and `ack` (complete as taken); `DequeueResult` carries the
   delivery's `term`, `index`, `expires_at_ms` and `consumer`, and each
   `Message` its `deliveries`
-- `EnqueueOptions.delay_ms`: how long before the message is ready, at most a
-  day
-- `queue.purge`: remove every message of a queue, ready, leased and dead
+- `EnqueueOptions.delay_ms`: how long before the message is ready, 0 to
+  86400000 (a day); outside that it raises `ValidationError` before sending
+- `queue.purge(queue, PurgeOptions)`: remove every message of a queue,
+  ready, leased and dead
 - `StorageTier.DISK` (2): a record read back from the durable log. A tier
   this SDK doesn't know reads as a pseudo-member `UNKNOWN_<n>`, not an error
 - The ops.json drift test checks the storage tiers too
@@ -80,6 +81,11 @@ The server's op table hash is now `0x19075df8e1ed5f75` (`TABLE_HASH`).
   without logging an error, and its pending drain asks again after an
   unavailable claim instead of giving up until the next reconnect. Neither
   claimed or delivered anything, so the same request is safe to resend
+- `retry.is_refused_unrun` excludes a halted shard's refusal (reason
+  `SHARD_HALTED`): that one waits for an operator, not a retry
+- A stream read's `start` is documented as exclusive (the records after it),
+  as the server reads it; the README's stream read examples use the real
+  options
 - `stale` docs: a shard blocked reading its next entry from disk answers
   reads from before that entry too, as a halted one does
 - The README says that while the worker is stopping, a handler's

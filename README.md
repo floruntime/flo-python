@@ -316,36 +316,22 @@ result = await client.stream.append(
 ### Read
 
 ```python
-from flo import StreamReadOptions, StreamStartMode
+from flo import StreamID, StreamReadOptions
 
-# Read from beginning (default)
+# Read from the beginning (default)
 result = await client.stream.read("events")
 for record in result.records:
-    print(f"offset={record.offset} ts={record.timestamp}: {record.payload}")
+    print(f"{record.id.timestamp_ms}-{record.id.sequence}: {record.payload}")
 
-# Read from specific offset
-result = await client.stream.read(
-    "events",
-    StreamReadOptions(start_mode=StreamStartMode.OFFSET, offset=100, count=10)
-)
+# Read the records after one already seen: start is exclusive
+last = result.records[-1].id
+result = await client.stream.read("events", StreamReadOptions(start=last, count=10))
 
-# Read from tail (latest records)
-result = await client.stream.read(
-    "events",
-    StreamReadOptions(start_mode=StreamStartMode.TAIL, count=10)
-)
+# Read from the tail (latest records)
+result = await client.stream.read("events", StreamReadOptions(tail=True, count=10))
 
-# Read from timestamp
-result = await client.stream.read(
-    "events",
-    StreamReadOptions(start_mode=StreamStartMode.TIMESTAMP, timestamp=1699999999000)
-)
-
-# Blocking read (long polling) - wait up to 30s for new records
-result = await client.stream.read(
-    "events",
-    StreamReadOptions(offset=100, block_ms=30000)
-)
+# Blocking read (long polling): wait up to 30 s for records after `last`
+result = await client.stream.read("events", StreamReadOptions(start=last, block_ms=30000))
 ```
 
 ### Consumer Groups

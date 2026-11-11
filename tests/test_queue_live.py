@@ -11,6 +11,7 @@ from flo import (
     EnqueueOptions,
     FloClient,
     PeekOptions,
+    PurgeOptions,
     QueueFailOptions,
     QueueRefusalReason,
     QueueReportOptions,
@@ -52,7 +53,10 @@ async def test_live_a_completed_message_is_gone_and_an_expired_one_comes_back(
     assert [(m.seq, m.payload, m.deliveries) for m in second.messages] == [(msg.seq, b"two", 2)]
     # The first delivery's complete is refused for that message; the second's applies.
     stale = await client.queue.complete("jobs", first, options=QueueReportOptions(namespace=ns))
-    assert stale.applied == 0 and [r.seq for r in stale.lost] == [msg.seq]
+    assert stale.applied == 0
+    assert [(r.seq, r.why) for r in stale.refused] == [
+        (msg.seq, QueueRefusalReason.DELIVERED_AGAIN)
+    ]
     done = await client.queue.complete("jobs", second, options=QueueReportOptions(namespace=ns))
     assert done.applied == 1
 
@@ -83,5 +87,5 @@ async def test_live_touch_fail_ack_and_purge(client: FloClient) -> None:
     acked = await client.queue.dequeue("jobs", 1, DequeueOptions(namespace=ns, ack=True))
     assert len(acked.messages) == 1 and acked.expires_at_ms == 0
 
-    assert await client.queue.purge("jobs", ns) == 2
+    assert await client.queue.purge("jobs", PurgeOptions(namespace=ns)) == 2
     assert (await client.queue.peek("jobs", 10, PeekOptions(namespace=ns))).messages == []

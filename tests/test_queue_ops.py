@@ -351,3 +351,33 @@ async def test_a_pending_drain_asks_again_after_an_unavailable_claim() -> None:
     worker._semaphore = asyncio.Semaphore(1)
     await asyncio.wait_for(worker._drain_pending(), 5)
     assert claims == 3
+
+
+@pytest.mark.parametrize("delay_ms", [-1, 86_400_001, True])
+async def test_an_enqueue_delay_past_a_day_is_refused_before_sending(delay_ms: int) -> None:
+    sent: list[object] = []
+    client = FloClient("127.0.0.1:1")
+
+    async def send(*args: object, **kw: object) -> None:
+        sent.append(args)
+
+    client._send_and_check = send  # type: ignore[method-assign,assignment]
+    with pytest.raises(ValidationError):
+        await client.queue.enqueue("q", b"x", EnqueueOptions(delay_ms=delay_ms))
+    assert sent == []
+
+
+def test_a_halted_shards_refusal_is_not_a_routine_retry() -> None:
+    from flo.retry import is_refused_unrun, is_shard_halted
+
+    def refusal(reason: Reason, ran: Ran = Ran.NO) -> Exception:
+        try:
+            raise_for_status(StatusCode.UNAVAILABLE, _refusal(reason, ran, b"x"))
+        except UnavailableError as e:
+            return e
+        raise AssertionError
+
+    halted = refusal(Reason.SHARD_HALTED)
+    assert is_shard_halted(halted) and not is_refused_unrun(halted)
+    assert is_refused_unrun(refusal(Reason.LEADER_UNKNOWN))
+    assert not is_refused_unrun(refusal(Reason.LEADER_UNKNOWN, Ran.UNKNOWN))

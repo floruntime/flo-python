@@ -343,7 +343,7 @@ class OptionTag(IntEnum):
     # Stream Options (0x20 - 0x2F) - StreamID-native ONLY
     # All stream positioning uses StreamID (timestamp_ms + sequence)
     # 0x20 reserved
-    STREAM_START = 0x21  # [16]u8: Start StreamID for reads (inclusive)
+    STREAM_START = 0x21  # [16]u8: Read records after this StreamID (exclusive)
     STREAM_END = 0x22  # [16]u8: End StreamID for reads (inclusive)
     STREAM_TAIL = 0x23  # void: Flag indicating tail read (start from end)
     PARTITION = 0x24  # u32: Explicit partition index
@@ -973,6 +973,13 @@ class DequeueOptions:
 
 
 @dataclass
+class PurgeOptions:
+    """Options for a queue purge."""
+
+    namespace: str | None = None
+
+
+@dataclass
 class QueueReportOptions:
     """Options for a queue complete or touch."""
 
@@ -1029,7 +1036,7 @@ class StreamReadOptions:
     """
 
     namespace: str | None = None
-    start: Optional["StreamID"] = None  # Start StreamID for reads (inclusive)
+    start: Optional["StreamID"] = None  # Read records after this StreamID (exclusive)
     end: Optional["StreamID"] = None  # End StreamID for reads (inclusive)
     tail: bool = False  # Start from end of stream (mutually exclusive with start)
     partition: int | None = None  # Explicit partition index
