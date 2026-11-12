@@ -263,13 +263,12 @@ class _RegisteredWorker:
 
     async def _while_blocked(self, what: str, call: Callable[[], Awaitable[object]]) -> bool:
         """Run call, asking again while the shard is halted (it resumes once
-        an operator repairs it) or the node is at a limit (until something is
-        deleted or the limit raised), and after a refusal that didn't run or
-        a lost connection: the worker comes up by itself once it clears.
-        False if a stop or drain ended the wait. Anything else is raised."""
+        an operator repairs it), and after a refusal that didn't run or a lost
+        connection: the worker comes up by itself once it clears. False if a
+        stop or drain ended the wait. Anything else is raised, a limit
+        included: the caller of start() decides what to do about one."""
         halted = _halted_backoff()
         failed = _worker_backoff()
-        limits = _LimitNotice()
         while True:
             try:
                 await call()
@@ -278,9 +277,6 @@ class _RegisteredWorker:
                 if is_shard_halted(e):
                     d = halted.next()
                     logger.warning(f"{what} refused, shard halted: {e}; retrying in {d:.3f}s")
-                elif is_limit(e):
-                    d = halted.next()
-                    limits.note(what, e)
                 elif is_refused_unrun(e):
                     d = failed.next()
                     logger.warning(f"{what} refused: {e}; retrying in {d:.3f}s")
@@ -871,6 +867,9 @@ class ActionWorker(_RegisteredWorker):
         Raises:
             ValueError: If no handlers are registered.
             ConnectionError: If connection to server fails.
+            LimitError: Registering was refused at a limit (too many actions,
+                say). start() fails with the limit error; a limit hit while
+                running is logged and backed off.
         """
         if not self._handlers:
             raise ValueError("No action handlers registered")
@@ -1507,6 +1506,9 @@ class StreamWorker(_RegisteredWorker):
         Raises:
             ConflictError: ``ack_timeout_ms`` or ``max_deliver`` is set and
                 the group exists with other settings.
+            LimitError: Registering or setting up the group was refused at a
+                limit. start() fails with the limit error; a limit hit while
+                running is logged and backed off.
         """
         logger.info(
             f"Starting stream worker (stream={self.config.stream}, "

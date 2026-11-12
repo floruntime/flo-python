@@ -275,8 +275,8 @@ class LimitError(ServerError):
 
     Terminal: retrying won't clear it, so the client never retries it. It
     isn't permanent: deleting something, giving the node more room, or
-    raising the setting does. Worker loops log it once per reason and back
-    off until it clears.
+    raising the setting does. For a worker, start() fails with the limit
+    error; a limit hit while running is logged and backed off.
     """
 
     def __init__(self, message: str = StatusCode.LIMIT.message()):

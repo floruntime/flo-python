@@ -326,26 +326,12 @@ async def test_a_limit_is_never_retried() -> None:
         await fake.shut(server)
 
 
-async def test_an_action_worker_at_the_action_limit_waits_and_says_so_once(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    # Registering past the node's actions is refused until one is deleted;
-    # the worker backs off and comes up once it isn't, logging the limit once.
-    monkeypatch.setattr(retry_mod, "_WORKER_INITIAL_BACKOFF_S", 0.01)
-    refused = 4
-    registers = 0
-
+async def test_an_action_worker_start_fails_at_the_action_limit_after_one_request() -> None:
+    # Registering past the node's actions: start() raises, and the caller
+    # decides; it doesn't wait for a delete.
     def reply(_n: int, op: int, rid: int) -> bytes:
-        nonlocal registers
         if op == OpCode.ACTION_REGISTER:
-            registers += 1
-            if registers <= refused:
-                return _limit(rid)
-        if op == OpCode.ACTION_AWAIT:
-            worker.stop()
-            return b""
-        if op == OpCode.WORKER_HEARTBEAT:
-            return _frame(rid, StatusCode.OK, b"\x00")
+            return _limit(rid)
         return _frame(rid, StatusCode.OK, b"")
 
     fake = _Scripted(reply)
@@ -356,14 +342,44 @@ async def test_an_action_worker_at_the_action_limit_waits_and_says_so_once(
         return b"done"
 
     worker.register_action("echo", done)
-    caplog.set_level(logging.WARNING, logger="flo")
     try:
-        await asyncio.wait_for(worker.start(), timeout=10)
+        with pytest.raises(LimitError) as raised:
+            await asyncio.wait_for(worker.start(), timeout=5)
     finally:
         await fake.shut(server)
-    assert registers == refused + 1
-    said = [r for r in caplog.records if "TOO_MANY_ACTIONS" in r.getMessage()]
-    assert len(said) == 1 and said[0].levelno == logging.ERROR
+    assert raised.value.reason == Reason.TOO_MANY_ACTIONS
+    assert fake.ops.count(OpCode.ACTION_REGISTER) == 1
+    assert OpCode.WORKER_REGISTER not in fake.ops and OpCode.ACTION_AWAIT not in fake.ops
+
+
+@pytest.mark.parametrize("refused_op", [OpCode.WORKER_REGISTER, OpCode.STREAM_GROUP_CREATE])
+async def test_a_stream_worker_start_fails_at_a_limit_after_one_request(refused_op: int) -> None:
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        if op == refused_op:
+            return _limit(rid)
+        if op == OpCode.STREAM_GROUP_CREATE:
+            return _frame(rid, StatusCode.OK, b"\x01")
+        if op == OpCode.WORKER_HEARTBEAT:
+            return _frame(rid, StatusCode.OK, b"\x00")
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Scripted(reply)
+    server, addr = await fake.serve()
+
+    async def handler(_ctx: object) -> None:
+        return None
+
+    worker = FloClient(addr, timeout_ms=1000, retry=_FAST).new_stream_worker(
+        stream="s", group="g", handler=handler, block_ms=100, ack_timeout_ms=60_000
+    )
+    try:
+        with pytest.raises(LimitError) as raised:
+            await asyncio.wait_for(worker.start(), timeout=5)
+    finally:
+        await fake.shut(server)
+    assert raised.value.reason == Reason.TOO_MANY_ACTIONS
+    assert fake.ops.count(refused_op) == 1
+    assert OpCode.STREAM_GROUP_READ not in fake.ops
 
 
 async def test_a_stream_worker_at_a_limit_backs_off_without_spinning(

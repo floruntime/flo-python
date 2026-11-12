@@ -730,9 +730,9 @@ without logging an error.
 A `LimitError` is never retried: the node is at one of its limits
 (today, registering past the 10,000 actions a shard holds), and retrying won't
 clear it. It isn't permanent either: deleting something, giving the node more
-room, or raising the setting does. Workers don't stop on one: their
-registration, poll and touch loops log it once per reason, at error, and back
-off (up to 30 s) until it clears.
+room, or raising the setting does. For a worker, start() fails with the limit error; a limit hit while running is logged and backed off.
+The poll and touch loops log it once per reason, at error, and back off (up
+to 30 s) until it clears.
 
 Two refusals from a halted shard are never retried, and come back after one
 attempt for the caller to decide:

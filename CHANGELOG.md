@@ -30,8 +30,8 @@ The server's op table hash is now `0xc688167b51fcc846` (`TABLE_HASH`).
 - `LimitError` for the new status `LIMIT` (15), with reasons
   `MEMORY_BUDGET` (32), `TOO_MANY_ACTIONS` (33),
   `TOO_MANY_WORKFLOW_DEFINITIONS` (34) and `TOO_MANY_WORKFLOW_RUNS` (35).
-  It is never retried; worker loops log it once per reason and back off
-  until it clears
+  It is never retried. For a worker, start() fails with the limit error; a
+  limit hit while running is logged and backed off, once per reason
 - `OptionTag.DEAD` (0x32) and `ERROR_TEXT` (0x33)
 
 - `queue.complete`, `queue.fail` and `queue.touch` (`QUEUE_COMPLETE`,
