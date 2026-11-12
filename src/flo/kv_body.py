@@ -54,18 +54,18 @@ from .types import (
     WorkerType,
 )
 
-# The longest routing key; its length prefix is a u16.
-_MAX_ROUTING_KEY = 4096
+# The longest key an mget names; its length prefix is a u16.
+_MAX_KEY = 4096
 _MAX_JSON_PATH = 1024
-_MAX_JSON_DOCUMENT = 252_819
+_MAX_JSON_DOCUMENT = 256_918
 # A scan's cursor: the shard it stopped on (u16), then the last key it
 # returned; its length prefix is a u16.
 _MAX_SCAN_CURSOR = 2 + 4096
 MAX_SCAN = 1024
 MAX_MGET = 256
 # The most bytes of mget key elements (each [len:u16][key]) in one request:
-# the frame less the count and the longest routing key.
-MAX_MGET_KEYS_BYTES = 253_848
+# the frame less the count.
+MAX_MGET_KEYS_BYTES = 257_947
 MAX_HISTORY = 65
 MAX_WORKER_LIST = 1024
 MAX_ACTION_LIST = 1024
@@ -168,18 +168,12 @@ def _bytes32(name: str, b: bytes, most: int) -> bytes:
     return struct.pack("<I", len(b)) + bytes(b)
 
 
-def _routing_key(k: str | None) -> bytes:
-    if not k:
-        return b"\x00"
-    return b"\x01" + _bytes16("routing key", k.encode("utf-8"), _MAX_ROUTING_KEY)
-
-
 def _path(path: str | None) -> bytes:
     return b"\x01" + _bytes16("JSON path", (path or "$").encode("utf-8"), _MAX_JSON_PATH)
 
 
 def encode_get_body(opts: GetOptions, txn: int | None = None) -> bytes:
-    """kv.get's request: wait_ms, wait_for, routing_key, txn."""
+    """kv.get's request: wait_ms, wait_for, txn."""
     wait_ms = opts.wait_ms
     if not isinstance(wait_ms, int) or isinstance(wait_ms, bool) or wait_ms < 0:
         raise ValidationError(f"wait_ms must be a whole number of ms, got {wait_ms!r}")
@@ -188,18 +182,11 @@ def encode_get_body(opts: GetOptions, txn: int | None = None) -> bytes:
             f"a wait (wait_ms) is at most {MAX_WAIT_MS} ms (5 minutes), got {wait_ms}"
         )
     wait_for = WaitFor(opts.wait_for)
-    return (
-        b"\x01"
-        + struct.pack("<Q", wait_ms)
-        + b"\x01"
-        + bytes([wait_for])
-        + _routing_key(opts.routing_key)
-        + _opt_u64("txn", txn)
-    )
+    return b"\x01" + struct.pack("<Q", wait_ms) + b"\x01" + bytes([wait_for]) + _opt_u64("txn", txn)
 
 
 def encode_set_body(value: bytes, opts: PutOptions, txn: int | None = None) -> bytes:
-    """kv.set's request: value, ttl_ms, condition, cas_version, routing_key, txn."""
+    """kv.set's request: value, ttl_ms, condition, cas_version, txn."""
     if len(value) > MAX_KV_VALUE_SIZE:
         raise ValidationError(f"value is {len(value)} bytes, at most {MAX_KV_VALUE_SIZE}")
     condition = Condition(opts.condition)
@@ -211,16 +198,13 @@ def encode_set_body(value: bytes, opts: PutOptions, txn: int | None = None) -> b
         + b"\x01"
         + bytes([condition])
         + _opt_u64("cas_version", opts.cas_version)
-        + _routing_key(opts.routing_key)
         + _opt_u64("txn", txn)
     )
 
 
-def encode_delete_body(
-    cas_version: int | None, routing_key: str | None, txn: int | None = None
-) -> bytes:
-    """kv.delete's request: cas_version, routing_key, txn."""
-    return _opt_u64("cas_version", cas_version) + _routing_key(routing_key) + _opt_u64("txn", txn)
+def encode_delete_body(cas_version: int | None, txn: int | None = None) -> bytes:
+    """kv.delete's request: cas_version, txn."""
+    return _opt_u64("cas_version", cas_version) + _opt_u64("txn", txn)
 
 
 def encode_scan_body(limit: int, cursor: bytes | None) -> bytes:
@@ -230,23 +214,19 @@ def encode_scan_body(limit: int, cursor: bytes | None) -> bytes:
     )
 
 
-def encode_history_body(limit: int, before_version: int | None, routing_key: str | None) -> bytes:
-    """kv.history's request: limit, before_version, routing_key."""
-    return (
-        _limit("history limit", limit, MAX_HISTORY)
-        + _opt_u64("before_version", before_version)
-        + _routing_key(routing_key)
-    )
+def encode_history_body(limit: int, before_version: int | None) -> bytes:
+    """kv.history's request: limit, before_version."""
+    return _limit("history limit", limit, MAX_HISTORY) + _opt_u64("before_version", before_version)
 
 
-def encode_mget_body(keys: Sequence[bytes], routing_key: str | None = None) -> bytes:
-    """kv.mget's request: keys, routing_key."""
+def encode_mget_body(keys: Sequence[bytes]) -> bytes:
+    """kv.mget's request: keys."""
     if not 1 <= len(keys) <= MAX_MGET:
         raise ValidationError(f"mget takes 1..{MAX_MGET} keys, got {len(keys)}")
-    elements = b"".join(_bytes16("mget key", k, _MAX_ROUTING_KEY) for k in keys)
+    elements = b"".join(_bytes16("mget key", k, _MAX_KEY) for k in keys)
     if len(elements) > MAX_MGET_KEYS_BYTES:
         raise ValidationError(f"mget keys are {len(elements)} bytes, at most {MAX_MGET_KEYS_BYTES}")
-    return struct.pack("<H", len(keys)) + elements + _routing_key(routing_key)
+    return struct.pack("<H", len(keys)) + elements
 
 
 def split_mget_keys(keys: Sequence[bytes]) -> list[Sequence[bytes]]:
@@ -257,8 +237,8 @@ def split_mget_keys(keys: Sequence[bytes]) -> list[Sequence[bytes]]:
     runs: list[Sequence[bytes]] = []
     start, size = 0, 0
     for i, k in enumerate(keys):
-        if len(k) > _MAX_ROUTING_KEY:
-            raise ValidationError(f"mget key is {len(k)} bytes, at most {_MAX_ROUTING_KEY}")
+        if len(k) > _MAX_KEY:
+            raise ValidationError(f"mget key is {len(k)} bytes, at most {_MAX_KEY}")
         if size + 2 + len(k) > MAX_MGET_KEYS_BYTES:
             runs.append(keys[start:i])
             start, size = i, 0
@@ -267,49 +247,38 @@ def split_mget_keys(keys: Sequence[bytes]) -> list[Sequence[bytes]]:
     return runs
 
 
-def encode_incr_body(delta: int, routing_key: str | None, txn: int | None = None) -> bytes:
-    """kv.incr's request: delta, routing_key, txn."""
+def encode_incr_body(delta: int, txn: int | None = None) -> bytes:
+    """kv.incr's request: delta, txn."""
     if not isinstance(delta, int) or isinstance(delta, bool) or not _I64_MIN <= delta <= _I64_MAX:
         raise ValidationError(f"delta must be an i64, got {delta!r}")
-    return b"\x01" + struct.pack("<q", delta) + _routing_key(routing_key) + _opt_u64("txn", txn)
+    return b"\x01" + struct.pack("<q", delta) + _opt_u64("txn", txn)
 
 
-def encode_expire_body(
-    ttl_ms: int, cas_version: int | None, routing_key: str | None, txn: int | None = None
-) -> bytes:
-    """kv.expire's request: ttl_ms (0 clears the TTL), cas_version, routing_key, txn."""
+def encode_expire_body(ttl_ms: int, cas_version: int | None, txn: int | None = None) -> bytes:
+    """kv.expire's request: ttl_ms (0 clears the TTL), cas_version, txn."""
     if not isinstance(ttl_ms, int) or isinstance(ttl_ms, bool) or not 0 <= ttl_ms <= MAX_TTL_MS:
         raise ValidationError(f"ttl_ms must be 0..{MAX_TTL_MS}, got {ttl_ms!r}")
-    return (
-        struct.pack("<Q", ttl_ms)
-        + _opt_u64("cas_version", cas_version)
-        + _routing_key(routing_key)
-        + _opt_u64("txn", txn)
-    )
+    return struct.pack("<Q", ttl_ms) + _opt_u64("cas_version", cas_version) + _opt_u64("txn", txn)
 
 
-def encode_exists_body(routing_key: str | None, txn: int | None = None) -> bytes:
-    """kv.exists's request: routing_key, txn."""
-    return _routing_key(routing_key) + _opt_u64("txn", txn)
+def encode_exists_body(txn: int | None = None) -> bytes:
+    """kv.exists's request: txn."""
+    return _opt_u64("txn", txn)
 
 
-def encode_json_get_body(path: str | None, routing_key: str | None) -> bytes:
-    """kv.json_get's request: path, routing_key."""
-    return _path(path) + _routing_key(routing_key)
+def encode_json_get_body(path: str | None) -> bytes:
+    """kv.json_get's request: path."""
+    return _path(path)
 
 
-def encode_json_set_body(path: str | None, document: bytes, routing_key: str | None) -> bytes:
-    """kv.json_set's request: path, document, routing_key."""
-    return (
-        _path(path)
-        + _bytes32("JSON document", document, _MAX_JSON_DOCUMENT)
-        + _routing_key(routing_key)
-    )
+def encode_json_set_body(path: str | None, document: bytes) -> bytes:
+    """kv.json_set's request: path, document."""
+    return _path(path) + _bytes32("JSON document", document, _MAX_JSON_DOCUMENT)
 
 
-def encode_json_del_body(path: str | None, routing_key: str | None) -> bytes:
-    """kv.json_del's request: path, routing_key."""
-    return _path(path) + _routing_key(routing_key)
+def encode_json_del_body(path: str | None) -> bytes:
+    """kv.json_del's request: path."""
+    return _path(path)
 
 
 def encode_worker_list_body(limit: int, cursor: bytes | None, action: str | None = None) -> bytes:
@@ -440,7 +409,7 @@ def encode_touch_body(worker: str, task: TaskAssignment) -> bytes:
 
 def encode_group_members_body(group: str) -> bytes:
     """stream.group.members's request: group."""
-    return _bytes16("group", group.encode("utf-8"), _MAX_ROUTING_KEY)
+    return _bytes16("group", group.encode("utf-8"), _MAX_KEY)
 
 
 def encode_dequeue_body(

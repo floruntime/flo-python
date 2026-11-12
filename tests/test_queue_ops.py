@@ -51,7 +51,7 @@ from flo.wire import REQUEST_HEADER_FORMAT, OptionsIterator
 
 from .test_result_resend import _str16, _until
 from .test_retry import _frame, _Scripted
-from .test_stream_worker_ack import _one_record
+from .test_stream_worker_ack import REPORT_OK, _one_record
 
 
 def _refusal(reason: Reason, ran: Ran, message: bytes) -> bytes:
@@ -303,6 +303,8 @@ async def test_a_stream_worker_retries_an_unavailable_group_read_quietly(
             return b""  # park
         if op == OpCode.WORKER_HEARTBEAT:
             return _frame(rid, StatusCode.OK, b"\x00")
+        if op in (OpCode.STREAM_GROUP_ACK, OpCode.STREAM_GROUP_NACK):
+            return _frame(rid, StatusCode.OK, REPORT_OK)
         return _frame(rid, StatusCode.OK, b"")
 
     fake = _Recording(reply)
@@ -326,31 +328,6 @@ async def test_a_stream_worker_retries_an_unavailable_group_read_quietly(
     reads = [p for op, p in fake.payloads if op == OpCode.STREAM_GROUP_READ]
     # The same group and consumer each time.
     assert len({p[: p.index(b"g") + 1] for p in reads[:4]}) == 1
-
-
-async def test_a_pending_drain_asks_again_after_an_unavailable_claim() -> None:
-    unavailable = _refusal(Reason.UNCLASSIFIED, Ran.NO, b"unavailable: retry")
-    claims = 0
-
-    class Claims:
-        async def group_claim(self, *_args: object, **_kw: object) -> object:
-            nonlocal claims
-            claims += 1
-            if claims <= 2:
-                raise_for_status(StatusCode.UNAVAILABLE, unavailable)
-            from flo.types import StreamClaimResult, StreamID
-
-            return StreamClaimResult(records=[], next_cursor=StreamID(), done=True)
-
-    worker = FloClient("127.0.0.1:1").new_stream_worker(stream="s", group="g", handler=print)
-
-    class Client:
-        stream = Claims()
-
-    worker._client = Client()  # type: ignore[assignment]
-    worker._semaphore = asyncio.Semaphore(1)
-    await asyncio.wait_for(worker._drain_pending(), 5)
-    assert claims == 3
 
 
 @pytest.mark.parametrize("delay_ms", [-1, 86_400_001, True])

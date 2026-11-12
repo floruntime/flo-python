@@ -37,7 +37,7 @@ from flo.worker import ActionContext
 
 from .test_result_resend import ACTION, _task, _until
 from .test_retry import _frame, _Scripted
-from .test_stream_worker_ack import _one_record
+from .test_stream_worker_ack import _one_record, _records
 
 _FAST = RetryPolicy(max_attempts=4, initial_backoff_ms=1, max_backoff_ms=2)
 
@@ -267,18 +267,19 @@ async def test_an_action_worker_waits_out_a_halted_shard_and_resumes(
         await fake.shut(server)
 
 
-async def test_a_stream_worker_waits_out_a_halted_shard_to_join_its_group() -> None:
-    joins = 0
+async def test_a_stream_worker_waits_out_a_halted_shard_to_create_its_group() -> None:
+    creates = 0
 
     def reply(_n: int, op: int, rid: int) -> bytes:
-        nonlocal joins
-        if op == OpCode.STREAM_GROUP_JOIN:
-            joins += 1
-            if joins <= _HALTED_FOR:
+        nonlocal creates
+        if op == OpCode.STREAM_GROUP_CREATE:
+            creates += 1
+            if creates <= _HALTED_FOR:
                 return _halted(rid, StatusCode.UNAVAILABLE, Ran.NO, b"shard 0 halted")
+            return _frame(rid, StatusCode.OK, b"\x01")
         if op == OpCode.STREAM_GROUP_READ:
             worker.stop()
-            return _frame(rid, StatusCode.OK, struct.pack("<I", 0))
+            return _frame(rid, StatusCode.OK, _records(0))
         return _frame(rid, StatusCode.OK, b"")
 
     fake = _Scripted(reply)
@@ -288,10 +289,12 @@ async def test_a_stream_worker_waits_out_a_halted_shard_to_join_its_group() -> N
     async def handler(_ctx: object) -> None:
         return None
 
-    worker = parent.new_stream_worker(stream="s", group="g", handler=handler, block_ms=100)
+    worker = parent.new_stream_worker(
+        stream="s", group="g", handler=handler, block_ms=100, ack_timeout_ms=60_000
+    )
     try:
         await asyncio.wait_for(worker.start(), timeout=10)
-        assert joins == _HALTED_FOR + 1
+        assert creates == _HALTED_FOR + 1
     finally:
         await fake.shut(server)
 
@@ -354,7 +357,7 @@ async def test_a_stream_worker_started_during_a_halt_comes_up_once_repaired(
         if op == OpCode.STREAM_GROUP_READ:
             reads += 1
             worker.stop()
-            return _frame(rid, StatusCode.OK, struct.pack("<I", 0))
+            return _frame(rid, StatusCode.OK, _records(0))
         if op == OpCode.WORKER_HEARTBEAT:
             return _frame(rid, StatusCode.OK, b"\x00")
         return _frame(rid, StatusCode.OK, b"")
@@ -413,9 +416,9 @@ async def test_an_action_registration_answered_outcome_pending_ends_start_after_
         await fake.shut(server)
 
 
-async def test_a_group_join_answered_outcome_pending_ends_start_after_one_try() -> None:
+async def test_a_group_create_answered_outcome_pending_ends_start_after_one_try() -> None:
     def reply(_n: int, op: int, rid: int) -> bytes:
-        if op == OpCode.STREAM_GROUP_JOIN:
+        if op == OpCode.STREAM_GROUP_CREATE:
             return _pending(rid)
         if op == OpCode.WORKER_HEARTBEAT:
             return _frame(rid, StatusCode.OK, b"\x00")
@@ -428,11 +431,13 @@ async def test_a_group_join_answered_outcome_pending_ends_start_after_one_try() 
     async def handler(_ctx: object) -> None:
         return None
 
-    worker = parent.new_stream_worker(stream="s", group="g", handler=handler, block_ms=100)
+    worker = parent.new_stream_worker(
+        stream="s", group="g", handler=handler, block_ms=100, max_deliver=3
+    )
     try:
         with pytest.raises(OutcomePendingError):
             await asyncio.wait_for(worker.start(), timeout=5)
-        assert fake.ops.count(OpCode.STREAM_GROUP_JOIN) == 1
+        assert fake.ops.count(OpCode.STREAM_GROUP_CREATE) == 1
     finally:
         await fake.shut(server)
 
@@ -441,10 +446,10 @@ async def test_a_group_join_answered_outcome_pending_ends_start_after_one_try() 
 
 
 @pytest.mark.parametrize("how", ["stop", "drain"])
-@pytest.mark.parametrize("kind", ["action-registration", "group-join"])
+@pytest.mark.parametrize("kind", ["action-registration", "group-create"])
 async def test_a_stop_or_drain_ends_a_halted_wait_promptly(kind: str, how: str) -> None:
     halted_op = (
-        OpCode.ACTION_REGISTER if kind == "action-registration" else OpCode.STREAM_GROUP_JOIN
+        OpCode.ACTION_REGISTER if kind == "action-registration" else OpCode.STREAM_GROUP_CREATE
     )
 
     def reply(_n: int, op: int, rid: int) -> bytes:
@@ -470,7 +475,9 @@ async def test_a_stop_or_drain_ends_a_halted_wait_promptly(kind: str, how: str) 
         async def handler(_ctx: object) -> None:
             return None
 
-        worker = parent.new_stream_worker(stream="s", group="g", handler=handler, block_ms=100)
+        worker = parent.new_stream_worker(
+            stream="s", group="g", handler=handler, block_ms=100, ack_timeout_ms=60_000
+        )
     run = asyncio.create_task(worker.start())
     try:
         await _until(lambda: fake.ops.count(halted_op) >= 2, timeout=10)

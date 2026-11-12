@@ -9,9 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 The op table hash moves with the server in this release: this SDK talks only
 to the flo it pins, and the pin lands with the release.
-The server's op table hash is now `0x19075df8e1ed5f75` (`TABLE_HASH`).
+The server's op table hash is now `0xc688167b51fcc846` (`TABLE_HASH`).
 
 ### Added
+
+- Consumer groups lease each record. `stream.group_read` returns a
+  `GroupReadResult` (the delivery's `term`, `index`, `expires_at_ms` and
+  `consumer`) of `GroupRecord`s, each with its `deliveries`.
+  `stream.group_ack`, `group_nack` and the new `group_touch` take that result
+  and optionally which of its records, and return what applied and the
+  `refused` rest (`GroupRefusal`: record id and `QueueRefusalReason`); a
+  stale report applies nothing to its records and still succeeds.
+  `StreamGroupNackOptions` gains `delay_ms`, `dead` and `error`
+- `stream.group_create` (with `StreamGroupCreateOptions`: `ack_timeout_ms`,
+  5 s to 12 h, and `max_deliver`, 1..255), `group_delete` and `group_info`
+  (`StreamGroupInfo`: ready, leased, dead, holders, trimmed_pending)
+- `StreamWorker` options `ack_timeout_ms` and `max_deliver` (the worker
+  creates the group with them at start) and `auto_touch` (touch each record
+  every sixth of the lease while its handler runs). `StreamContext.deliveries`
+- `LimitError` for the new status `LIMIT` (15), with reasons
+  `MEMORY_BUDGET` (32), `TOO_MANY_ACTIONS` (33),
+  `TOO_MANY_WORKFLOW_DEFINITIONS` (34) and `TOO_MANY_WORKFLOW_RUNS` (35).
+  It is never retried; worker loops log it once per reason and back off
+  until it clears
+- `OptionTag.DEAD` (0x32) and `ERROR_TEXT` (0x33)
 
 - `queue.complete`, `queue.fail` and `queue.touch` (`QUEUE_COMPLETE`,
   `QUEUE_FAIL`, `QUEUE_TOUCH`, 0x182-0x184) report on a dequeue's messages:
@@ -40,7 +61,7 @@ The server's op table hash is now `0x19075df8e1ed5f75` (`TABLE_HASH`).
 - `StaleReportError`, a `ConflictError`, for reason `STALE_REPORT`: a
   report for a delivery the run has moved on from
 - `stream.group_list` and `stream.group_members` (0x15D, 0x15E): a
-  stream's groups and a group's members, read on the leader
+  stream's groups and the consumers holding a group's records
 - `processing.remove` (`PROCESSING_REMOVE`, 0x365): remove a job that no
   longer runs; a running one raises `ConflictError` with
   `Reason.JOB_RUNNING` (31)
@@ -78,9 +99,8 @@ The server's op table hash is now `0x19075df8e1ed5f75` (`TABLE_HASH`).
   (ran `NO`), after the client's usual retries of about 350 ms
 - The stream worker retries an unavailable group read (ran `NO`: records
   still being read back from disk, or a leader not ready) with a backoff and
-  without logging an error, and its pending drain asks again after an
-  unavailable claim instead of giving up until the next reconnect. Neither
-  claimed or delivered anything, so the same request is safe to resend
+  without logging an error. It leased nothing, so the same read is safe to
+  resend
 - `retry.is_refused_unrun` excludes a halted shard's refusal (reason
   `SHARD_HALTED`): that one waits for an operator, not a retry
 - A stream read's `start` is documented as exclusive (the records after it),
@@ -131,6 +151,26 @@ The server's op table hash is now `0x19075df8e1ed5f75` (`TABLE_HASH`).
 
 ### Breaking
 
+- `stream.group_join`, `group_leave` and `group_claim` are gone, with
+  `StreamGroupJoinOptions`, `StreamClaimResult` and the op codes for join,
+  leave, claim and configure_sweeper: the server refuses them. A group read
+  takes expired and nacked records before new ones. `group_ack` and
+  `group_nack` take the read's `GroupReadResult`, not record ids, and
+  `StreamGroupAckOptions`/`StreamGroupNackOptions` lose `consumer` (the read
+  names it). The stream worker no longer joins, leaves or drains its pending
+  records on reconnect: `redeliver_pending_on_reconnect` and
+  `claim_min_idle_ms` are gone; held records come back when their lease runs
+  out. `group_pending` takes `namespace` in place of options
+- KV `routing_key` is gone from every option type (`GetOptions`,
+  `PutOptions`, `DeleteOptions`, `HistoryOptions`, `KVIncrOptions`,
+  `KVExpireOptions`, `KVExistsOptions`, `KVJsonOptions`, `KVMGetOptions`): a
+  key routes by its `{tag}`, or the whole key when it has none.
+  `kv.begin(key)` pins the transaction to the key's `{tag}`; a key that
+  routes elsewhere is refused with `Reason.KEYS_NOT_COLOCATED` (18, was
+  `WRONG_ROUTING_KEY`). `mget` gathers keys across shards on the server
+- The largest KV value is 257,916 bytes and the largest JSON document
+  256,918
+
 - `queue.ack` and `queue.nack` are gone: use `queue.complete` and
   `queue.fail`, which take the `DequeueResult`. `AckOptions` and
   `NackOptions` are gone (`QueueReportOptions`, `QueueFailOptions`), and
@@ -169,8 +209,8 @@ The server's op table hash is now `0x19075df8e1ed5f75` (`TABLE_HASH`).
   a list right after starting a worker there can raise it until the worker
   has registered (the write that creates the namespace).
 - `workflow.history` of a missing run, and a
-  `NOT_FOUND` answer to `stream.append`, `read`, `info`, `group_join`,
-  `group_leave`, `group_read`, `group_pending` or `group_claim`, raise
+  `NOT_FOUND` answer to `stream.append`, `read`, `info`, `group_read` or
+  `group_pending`, raise
   `NotFoundError`; the refusal's body was parsed as the answer
   (`workflow.history` of a missing run returned it as the history)
 - The cluster op codes are the server's: `CLUSTER_PROMOTE` (0x032),

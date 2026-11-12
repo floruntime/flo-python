@@ -18,7 +18,7 @@ VERSION: int = 0x03
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0x19075DF8E1ED5F75
+TABLE_HASH: int = 0xC688167B51FCC846
 # Response header flag: a shard that can't apply its next entry (halted at
 # it, or blocked reading it from disk) answered a read from its state just
 # before that entry. The read succeeded.
@@ -52,9 +52,9 @@ class Reason(IntEnum):
     CONDITION_FAILED = 16
     # No open transaction has this id here.
     NO_SUCH_TRANSACTION = 17
-    # The routing key (the key, when none is given) isn't the one the
-    # transaction was begun with.
-    WRONG_ROUTING_KEY = 18
+    # The key doesn't route with the key the transaction was begun with: give
+    # every key in a transaction the same {tag}.
+    KEYS_NOT_COLOCATED = 18
     # The transaction holds as many ops or bytes as it may.
     TXN_TOO_LARGE = 19
     # The shard holds as many waiting reads as it may.
@@ -84,6 +84,14 @@ class Reason(IntEnum):
     ADMIN_ONLY = 30
     # A processing job that still runs can't be removed: stop or cancel it first.
     JOB_RUNNING = 31
+    # The node's memory budget is spent (status LIMIT).
+    MEMORY_BUDGET = 32
+    # The node holds as many actions as it registers (status LIMIT).
+    TOO_MANY_ACTIONS = 33
+    # The node holds as many workflow definitions as it keeps (status LIMIT).
+    TOO_MANY_WORKFLOW_DEFINITIONS = 34
+    # The node holds as many workflow runs as it keeps (status LIMIT).
+    TOO_MANY_WORKFLOW_RUNS = 35
 
 
 class Ran(IntEnum):
@@ -111,7 +119,7 @@ MAX_BLOCK_MS: int = 300_000  # 5 minutes
 # Longest a KV get may wait (wait_ms).
 MAX_WAIT_MS: int = 300_000
 # Longest value a KV put takes.
-MAX_KV_VALUE_SIZE: int = 253_817
+MAX_KV_VALUE_SIZE: int = 257_916
 # A worker always long-polls: block_ms=0 ("don't wait") would turn its poll
 # loop into a busy spin against the server, so a worker reads 0 (or unset) as this.
 _DEFAULT_WORKER_BLOCK_MS: int = 30_000
@@ -179,13 +187,9 @@ class OpCode(IntEnum):
 
     # ── Stream Consumer Groups (0x150 – 0x16F) ──
     STREAM_GROUP_CREATE = 0x150
-    STREAM_GROUP_JOIN = 0x151
-    STREAM_GROUP_LEAVE = 0x152
     STREAM_GROUP_READ = 0x153
     STREAM_GROUP_ACK = 0x154
-    STREAM_GROUP_CLAIM = 0x155
     STREAM_GROUP_PENDING = 0x156
-    STREAM_GROUP_CONFIGURE_SWEEPER = 0x157
     STREAM_GROUP_NACK = 0x159
     STREAM_GROUP_TOUCH = 0x15A
     STREAM_GROUP_INFO = 0x15B
@@ -282,6 +286,9 @@ class StatusCode(IntEnum):
     # The namespace the request names doesn't exist; NOT_FOUND means a
     # missing key.
     NO_NAMESPACE = 14
+    # The node is at one of its limits; the reason names which. It
+    # never ran, and retrying won't clear it.
+    LIMIT = 15
 
     @classmethod
     def _missing_(cls, value: object) -> "StatusCode | None":
@@ -321,6 +328,7 @@ class StatusCode(IntEnum):
                 "Committed, not applied: its shard halted; don't resend it unchanged"
             ),
             StatusCode.NO_NAMESPACE: "Namespace not found",
+            StatusCode.LIMIT: "At a limit: delete something, or raise the limit",
         }
         return messages.get(self, f"Unknown status {int(self)}")
 
@@ -353,8 +361,10 @@ class OptionTag(IntEnum):
     FORCE = 0x2C  # void: Flag to delete a stream that still has records
 
     # Consumer Group Options (0x30 - 0x3F)
-    ACK_TIMEOUT_MS = 0x30  # u32: Time before unacked message auto-redelivers
-    MAX_DELIVER = 0x31  # u8: Max delivery attempts before DLQ (default: 10)
+    ACK_TIMEOUT_MS = 0x30  # u32: A group's lease, 5 s to 12 h (default 30 s)
+    MAX_DELIVER = 0x31  # u8: Nacks or expiries before a record is dead, 1..255 (default 5)
+    DEAD = 0x32  # void: A nack makes its records dead now
+    ERROR_TEXT = 0x33  # string: Why a nack's records failed
 
     # Time-Series Options (0x60 - 0x6F)
     TS_FROM_MS = 0x60  # i64: Start of time range (inclusive, unix ms)
@@ -555,7 +565,8 @@ class DequeueResult:
 
 
 class QueueRefusalReason(IntEnum):
-    """Why a complete, fail or touch didn't apply to a message."""
+    """Why a queue complete, fail or touch didn't apply to a message, or a
+    group ack, nack or touch to a record."""
 
     # For a complete, already done; otherwise the message is gone.
     GONE = 0
@@ -725,12 +736,9 @@ class StreamReadResult:
 
 @dataclass
 class PendingEntry:
-    """One entry in a consumer group's Pending Entry List (PEL).
-
-    A delivered-but-unacked message. ``delivery_count`` is how many times the
-    entry has been delivered; ``consumer`` is the consumer that currently owns
-    it.
-    """
+    """A consumer group record leased to ``consumer`` now: read and not yet
+    acked, nacked or expired. ``delivery_count`` counts its deliveries, this
+    one included."""
 
     id: StreamID = None  # type: ignore[assignment]
     consumer: str = ""
@@ -738,18 +746,76 @@ class PendingEntry:
 
 
 @dataclass
-class StreamClaimResult:
-    """Result of a :meth:`StreamOperations.group_claim` cursor page.
+class GroupRecord(StreamRecord):
+    """A record a group read leased. ``deliveries`` counts its deliveries,
+    this one included: above 1, an earlier lease ran out or was nacked."""
 
-    ``records`` carry payload + headers (same shape as ``group_read``).
-    ``next_cursor`` is the ``start_id`` to pass on the next ``group_claim``
-    call; when ``done`` is ``True`` the PEL has been fully scanned and the loop
-    should stop.
-    """
+    deliveries: int = 1
 
-    records: list[StreamRecord]
-    next_cursor: StreamID = None  # type: ignore[assignment]
-    done: bool = False
+
+@dataclass
+class GroupReadResult:
+    """A group read's records, leased to ``consumer`` until ``expires_at_ms``
+    (Unix ms) unless acked, nacked or touched. ``term`` and ``index`` name the
+    delivery: an ack, nack or touch names them back (pass this result).
+    ``expires_at_ms`` is 0 when nothing was read."""
+
+    records: list[GroupRecord]
+    term: int = 0
+    index: int = 0
+    expires_at_ms: int = 0
+    consumer: str = ""
+
+
+@dataclass
+class GroupRefusal:
+    """A record an ack, nack or touch didn't apply to, and why. ``GONE``
+    means no such record in the group: acked already, trimmed, or the group
+    is gone."""
+
+    id: StreamID
+    why: QueueRefusalReason
+
+
+@dataclass
+class GroupReportResult:
+    """What an ack or nack applied to: ``applied`` records, and the
+    ``refused`` rest. The report itself succeeded either way."""
+
+    applied: int
+    refused: list[GroupRefusal]
+
+    @property
+    def lost(self) -> list[GroupRefusal]:
+        """For an ack, the refusals that aren't ``GONE`` (which means done):
+        records this consumer no longer holds, which go or have gone to
+        another delivery."""
+        return [r for r in self.refused if r.why != QueueRefusalReason.GONE]
+
+
+@dataclass
+class GroupTouchResult:
+    """A touch's new expiry (when the lease runs out without another touch,
+    Unix ms), and what it applied to."""
+
+    expires_at_ms: int
+    applied: int
+    refused: list[GroupRefusal]
+
+
+@dataclass
+class StreamGroupInfo:
+    """A consumer group's counts. ``pending`` is ``ready`` plus ``leased``;
+    ``holders`` the consumers holding records now. Records at or below a
+    trim that cleanup hasn't taken yet are ``trimmed_pending`` alone."""
+
+    pending: int
+    holders: int
+    created_at_ns: int
+    ready: int
+    leased: int
+    dead: int
+    trimmed_pending: int
 
 
 @dataclass
@@ -765,8 +831,9 @@ class StreamInfo:
 
 @dataclass
 class StreamGroupEntry:
-    """A consumer group, as a group list shows it. ``members`` and ``pending``
-    are the leader's, and start again with a new leader."""
+    """A consumer group, as a group list shows it: ``members`` the consumers
+    holding records now, ``pending`` its records ready and leased, and the
+    last stream record it read (``last_delivered_ms``/``_seq``)."""
 
     name: str
     members: int
@@ -787,7 +854,8 @@ class StreamGroupListResult:
 
 
 class GroupMemberState(IntEnum):
-    """A consumer group member's state."""
+    """A consumer group member's state: a member is a consumer holding
+    records, always ACTIVE."""
 
     ACTIVE = 0
     LEAVING = 1
@@ -795,8 +863,9 @@ class GroupMemberState(IntEnum):
 
 @dataclass
 class StreamGroupMember:
-    """A consumer group member. ``last_active_ms`` is None until it is
-    delivered to."""
+    """A consumer holding a group's records: ``pending`` of them, held since
+    ``joined_at_ms`` (its oldest lease), last given one at
+    ``last_active_ms``."""
 
     id: str
     state: GroupMemberState
@@ -844,8 +913,6 @@ class GetOptions:
     wait_ms: int = 0
     # The key to exist (the default), or its next version.
     wait_for: WaitFor = WaitFor.EXISTS
-    # Routes the request in place of the key.
-    routing_key: str | None = None
 
 
 @dataclass
@@ -858,8 +925,6 @@ class PutOptions:
     condition: Condition = Condition.ALWAYS
     # The key's version the write requires; 0 means it doesn't exist.
     cas_version: int | None = None
-    # Routes the request in place of the key.
-    routing_key: str | None = None
 
 
 @dataclass
@@ -869,8 +934,6 @@ class DeleteOptions:
     namespace: str | None = None
     # Only delete when the key's version is this.
     cas_version: int | None = None
-    # Routes the request in place of the key.
-    routing_key: str | None = None
 
 
 @dataclass
@@ -892,8 +955,6 @@ class HistoryOptions:
     # Only versions older than this one (the last version of the page
     # before); None starts from the newest.
     before_version: int | None = None
-    # Routes the request in place of the key.
-    routing_key: str | None = None
 
 
 @dataclass
@@ -902,8 +963,6 @@ class KVIncrOptions:
 
     namespace: str | None = None
     delta: int = 1
-    # Routes the request in place of the key.
-    routing_key: str | None = None
 
 
 @dataclass
@@ -913,8 +972,6 @@ class KVExpireOptions:
     namespace: str | None = None
     # Only succeed when the key's version is this.
     cas_version: int | None = None
-    # Routes the request in place of the key.
-    routing_key: str | None = None
 
 
 @dataclass
@@ -922,8 +979,6 @@ class KVExistsOptions:
     """Options for KV exists operations."""
 
     namespace: str | None = None
-    # Routes the request in place of the key.
-    routing_key: str | None = None
 
 
 @dataclass
@@ -931,8 +986,6 @@ class KVJsonOptions:
     """Options for KV JSON.* operations."""
 
     namespace: str | None = None
-    # Routes the request in place of the key.
-    routing_key: str | None = None
 
 
 @dataclass
@@ -940,9 +993,6 @@ class KVMGetOptions:
     """Options for KV mget operations."""
 
     namespace: str | None = None
-    # The routing key every key was written with: all are looked up on its
-    # shard. Without it, each key is looked up on its own.
-    routing_key: str | None = None
 
 
 @dataclass
@@ -1079,10 +1129,16 @@ class StreamInfoOptions:
 
 
 @dataclass
-class StreamGroupJoinOptions:
-    """Options for joining a consumer group."""
+class StreamGroupCreateOptions:
+    """A consumer group's settings, fixed when it is created. None takes the
+    server's default: a 30 s lease and 5 attempts."""
 
     namespace: str | None = None
+    # The lease: a record not acked or touched this long is read again.
+    # 5000..43200000 (5 s to 12 h).
+    ack_timeout_ms: int | None = None
+    # A record nacked or expired this many times is dead. 1..255.
+    max_deliver: int | None = None
 
 
 @dataclass
@@ -1090,24 +1146,27 @@ class StreamGroupReadOptions:
     """Options for reading from a consumer group."""
 
     namespace: str | None = None
-    count: int | None = None  # Max records to read
+    count: int | None = None  # 1..100 records; None reads up to 100
     block_ms: int | None = None  # Block waiting for records (0 = don't wait, max 300000)
 
 
 @dataclass
 class StreamGroupAckOptions:
-    """Options for acknowledging records in a consumer group."""
+    """Options for an ack or touch of a group read's records."""
 
     namespace: str | None = None
-    consumer: str = ""  # Sent, but the server doesn't check it: any consumer can ack an entry
 
 
 @dataclass
 class StreamGroupNackOptions:
-    """Options for negatively acknowledging records in a consumer group."""
+    """Options for a nack: the records are read again after ``delay_ms``
+    (at most a day), or are dead once their attempts are spent, or at once
+    with ``dead``. ``error`` (at most 1024 bytes) says why."""
 
     namespace: str | None = None
-    consumer: str = ""  # Sent, but the server doesn't check it: any consumer can nack an entry
+    delay_ms: int = 0
+    dead: bool = False
+    error: str = ""
 
 
 # =============================================================================

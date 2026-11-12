@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 async def process_event(ctx: StreamContext) -> None:
     """Process a stream record.
 
-    Return normally to auto-ack. Raise an exception to auto-nack
-    (the record will be redelivered).
+    Return normally to auto-ack. Raise an exception to auto-nack: the
+    record is read again, until it has failed max_deliver times.
     """
     event = ctx.json()
     logger.info(
@@ -50,6 +50,7 @@ async def main():
         handler=process_event,
         concurrency=5,
         batch_size=10,
+        auto_touch=True,  # keep each record while its handler runs
     )
 
     # Handle shutdown signals

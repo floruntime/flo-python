@@ -268,6 +268,21 @@ class OutcomePendingError(ServerError):
         super().__init__(message, StatusCode.OUTCOME_PENDING)
 
 
+class LimitError(ServerError):
+    """The node is at one of its limits; ``reason`` names which
+    (MEMORY_BUDGET, TOO_MANY_ACTIONS, TOO_MANY_WORKFLOW_DEFINITIONS or
+    TOO_MANY_WORKFLOW_RUNS) and the message says more. It never ran.
+
+    Terminal: retrying won't clear it, so the client never retries it. It
+    isn't permanent: deleting something, giving the node more room, or
+    raising the setting does. Worker loops log it once per reason and back
+    off until it clears.
+    """
+
+    def __init__(self, message: str = StatusCode.LIMIT.message()):
+        super().__init__(message, StatusCode.LIMIT)
+
+
 class InternalServerError(ServerError):
     """Internal server error. Not retryable: the server uses it for a write
     that committed but wasn't applied, which must not be resent."""
@@ -340,6 +355,7 @@ def _error_for(status: StatusCode, message: str) -> ServerError:
         StatusCode.UNAVAILABLE: UnavailableError,
         StatusCode.OUTCOME_PENDING: OutcomePendingError,
         StatusCode.RATE_LIMITED: RateLimitedError,
+        StatusCode.LIMIT: LimitError,
         StatusCode.INTERNAL_ERROR: InternalServerError,
         StatusCode.ERROR_GENERIC: GenericServerError,
     }

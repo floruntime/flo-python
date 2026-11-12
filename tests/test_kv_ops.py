@@ -14,7 +14,6 @@ from flo import (
     KVExpireOptions,
     KVIncrOptions,
     KVJsonOptions,
-    KVMGetOptions,
     ScanOptions,
 )
 from flo import kv_body as kb
@@ -88,18 +87,17 @@ H = bytes.fromhex
 
 
 def test_request_bodies_match_the_servers_schemas() -> None:
-    assert kb.encode_delete_body(7, "rk", None) == H("010700000000000000010200726b00")
+    assert kb.encode_delete_body(7, None) == H("01070000000000000000")
     assert kb.encode_scan_body(2, b"c1") == H("010200000002006331")
-    assert kb.encode_history_body(2, None, None) == H("01020000000000")
-    assert kb.encode_history_body(2, 7, "rk") == H("0102000000010700000000000000010200726b")
-    assert kb.encode_mget_body([b"a", b"b"]) == H("020001006101006200")
-    assert kb.encode_mget_body([b"a", b"b"], "rk") == H("0200010061010062010200726b")
-    assert kb.encode_incr_body(-5, None, 9) == H("01fbffffffffffffff00010900000000000000")
-    assert kb.encode_expire_body(60000, None, None, None) == H("60ea000000000000000000")
-    assert kb.encode_exists_body(None, None) == H("0000")
-    assert kb.encode_json_get_body("$.a", None) == H("010300242e6100")
-    assert kb.encode_json_set_body("$", b"{}", "rk") == H("01010024020000007b7d010200726b")
-    assert kb.encode_json_del_body("$.b", None) == H("010300242e6200")
+    assert kb.encode_history_body(2, None) == H("010200000000")
+    assert kb.encode_history_body(2, 7) == H("0102000000010700000000000000")
+    assert kb.encode_mget_body([b"a", b"b"]) == H("0200010061010062")
+    assert kb.encode_incr_body(-5, 9) == H("01fbffffffffffffff010900000000000000")
+    assert kb.encode_expire_body(60000, None, None) == H("60ea0000000000000000")
+    assert kb.encode_exists_body(None) == H("00")
+    assert kb.encode_json_get_body("$.a") == H("010300242e61")
+    assert kb.encode_json_set_body("$", b"{}") == H("01010024020000007b7d")
+    assert kb.encode_json_del_body("$.b") == H("010300242e62")
     assert kb.encode_txn_body(1) == H("0100000000000000")
 
 
@@ -249,10 +247,10 @@ def test_every_kv_op_is_a_table_op() -> None:
 
 async def test_delete_says_whether_the_key_existed(monkeypatch: pytest.MonkeyPatch) -> None:
     client, calls = _client(monkeypatch, _ok("0101"), _ok("0100"))
-    assert await client.kv.delete("k", DeleteOptions(cas_version=7, routing_key="rk")) is True
+    assert await client.kv.delete("k", DeleteOptions(cas_version=7)) is True
     assert await client.kv.delete("missing") is False
-    assert calls[0][:4] == (OpCode.KV_DELETE, "default", b"k", H("010700000000000000010200726b00"))
-    assert calls[1][3] == H("000000")
+    assert calls[0][:4] == (OpCode.KV_DELETE, "default", b"k", H("01070000000000000000"))
+    assert calls[1][3] == H("0000")
 
 
 async def test_scan_sends_the_prefix_as_key_and_pages_by_cursor(
@@ -291,10 +289,10 @@ async def test_history_carries_each_versions_time(monkeypatch: pytest.MonkeyPatc
         more=True,
         stale=False,
     )
-    await client.kv.history("k", HistoryOptions(routing_key="rk", before_version=3))
+    await client.kv.history("k", HistoryOptions(before_version=3))
     assert [c[3] for c in calls] == [
-        H("01020000000000"),
-        b"\x01" + struct.pack("<I", 10) + b"\x01" + struct.pack("<Q", 3) + H("010200726b"),
+        H("010200000000"),
+        b"\x01" + struct.pack("<I", 10) + b"\x01" + struct.pack("<Q", 3),
     ]
 
 
@@ -348,17 +346,16 @@ async def test_mget_splits_keys_so_each_request_fits_its_frame(
             _mget_answer([(True, 1, b"v")] * struct.unpack("<H", body[:2])[0], None)
         ),
     )
-    got = await client.kv.mget(list(keys), KVMGetOptions(routing_key="rk"))
+    got = await client.kv.mget(list(keys))
     assert [e.key for e in got] == [k.decode() for k in keys]
     bodies = [c[3] for c in calls]
-    # 126 * 2002 = 252252 bytes of key elements fit; one more key doesn't.
+    # 128 * 2002 = 256256 bytes of key elements fit; one more key doesn't.
     assert bodies == [
-        kb.encode_mget_body(keys[:126], "rk"),
-        kb.encode_mget_body(keys[126:], "rk"),
+        kb.encode_mget_body(keys[:128]),
+        kb.encode_mget_body(keys[128:]),
     ]
-    assert all(b.endswith(H("010200726b")) for b in bodies)
     with pytest.raises(ValidationError):
-        kb.encode_mget_body(keys[:127])
+        kb.encode_mget_body(keys[:129])
 
 
 async def test_mget_follows_next_within_a_split_run(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -366,14 +363,14 @@ async def test_mget_follows_next_within_a_split_run(monkeypatch: pytest.MonkeyPa
     client, calls = _client(
         monkeypatch,
         _ok(_mget_answer([(True, 1, b"")] * 100, 100)),
-        _ok(_mget_answer([(True, 1, b"")] * 26, None)),
-        _ok(_mget_answer([(True, 1, b"")] * 4, None)),
+        _ok(_mget_answer([(True, 1, b"")] * 28, None)),
+        _ok(_mget_answer([(True, 1, b"")] * 2, None)),
     )
     assert len(await client.kv.mget(list(keys))) == 130
     assert [c[3] for c in calls] == [
-        kb.encode_mget_body(keys[:126]),
-        kb.encode_mget_body(keys[100:126]),
-        kb.encode_mget_body(keys[126:]),
+        kb.encode_mget_body(keys[:128]),
+        kb.encode_mget_body(keys[100:128]),
+        kb.encode_mget_body(keys[128:]),
     ]
 
 
@@ -391,8 +388,8 @@ async def test_incr_returns_the_new_value_and_version(monkeypatch: pytest.Monkey
     assert (res.value, res.version) == (42, 4)
     await client.kv.incr("n")
     assert [c[3] for c in calls] == [
-        H("01fbffffffffffffff0000"),
-        b"\x01" + struct.pack("<q", 1) + b"\x00\x00",
+        H("01fbffffffffffffff00"),
+        b"\x01" + struct.pack("<q", 1) + b"\x00",
     ]
 
 
@@ -403,19 +400,19 @@ async def test_incr_on_the_wrong_type_raises_wrong_type(monkeypatch: pytest.Monk
     assert raised.value.reason == Reason.WRONG_TYPE  # type: ignore[attr-defined]
 
 
-async def test_expire_sends_cas_and_routing_key(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_expire_sends_cas(monkeypatch: pytest.MonkeyPatch) -> None:
     client, calls = _client(monkeypatch, _ok(b""))
     await client.kv.expire("k", 60000)
-    await client.kv.expire("k", 0, KVExpireOptions(cas_version=3, routing_key="rk"))
-    assert calls[0][:4] == (OpCode.KV_EXPIRE, "default", b"k", H("60ea000000000000000000"))
-    assert calls[1][3] == struct.pack("<Q", 0) + b"\x01" + struct.pack("<Q", 3) + H("010200726b00")
+    await client.kv.expire("k", 0, KVExpireOptions(cas_version=3))
+    assert calls[0][:4] == (OpCode.KV_EXPIRE, "default", b"k", H("60ea0000000000000000"))
+    assert calls[1][3] == struct.pack("<Q", 0) + b"\x01" + struct.pack("<Q", 3) + H("00")
 
 
 async def test_exists(monkeypatch: pytest.MonkeyPatch) -> None:
     client, calls = _client(monkeypatch, _ok("010500000000000000"), _ok("000000000000000000"))
     assert await client.kv.exists("k") == ExistsResult(exists=True, version=5)
     assert await client.kv.exists("k") == ExistsResult(exists=False, version=0)
-    assert calls[0][3] == H("0000")
+    assert calls[0][3] == H("00")
 
 
 async def test_an_exists_result_is_truthy_only_when_the_key_exists(
@@ -438,15 +435,15 @@ async def test_json_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     got = await client.kv.json_get("k", "$.a")
     assert got is not None and (got.value, got.version) == ({}, 3)
-    assert (await client.kv.json_set("k", "$", b"{}", KVJsonOptions(routing_key="rk"))).version == 3
+    assert (await client.kv.json_set("k", "$", b"{}", KVJsonOptions(namespace="ns"))).version == 3
     assert await client.kv.json_del("k", "$.b") is None
     res = await client.kv.json_del("k", "$.c")
     assert res is not None and res.version == 4
     assert [(c[0], c[3]) for c in calls] == [
-        (OpCode.KV_JSON_GET, H("010300242e6100")),
-        (OpCode.KV_JSON_SET, H("01010024020000007b7d010200726b")),
-        (OpCode.KV_JSON_DEL, H("010300242e6200")),
-        (OpCode.KV_JSON_DEL, H("010300242e6300")),
+        (OpCode.KV_JSON_GET, H("010300242e61")),
+        (OpCode.KV_JSON_SET, H("01010024020000007b7d")),
+        (OpCode.KV_JSON_DEL, H("010300242e62")),
+        (OpCode.KV_JSON_DEL, H("010300242e63")),
     ]
 
 
@@ -482,12 +479,10 @@ async def test_bounds_are_refused_before_a_round_trip(monkeypatch: pytest.Monkey
         client.kv.history("k", HistoryOptions(limit=0)),
         client.kv.mget([f"k{i}" for i in range(257)]),
         client.kv.mget(["k", "x" * 4097]),
-        client.kv.mget(["k"], KVMGetOptions(routing_key="r" * 4097)),
         client.kv.incr("n", KVIncrOptions(delta=1 << 63)),
-        client.kv.delete("k", DeleteOptions(routing_key="r" * 4097)),
         client.kv.delete("k", DeleteOptions(cas_version=-1)),
         client.kv.json_get("k", "$" + "a" * 1024),
-        client.kv.json_set("k", "$", bytes(252_820)),
+        client.kv.json_set("k", "$", bytes(256_919)),
     ]
     for call in refused:
         with pytest.raises(ValidationError):
@@ -501,13 +496,13 @@ async def test_bounds_are_refused_before_a_round_trip(monkeypatch: pytest.Monkey
 # ── Transactions ────────────────────────────────────────────────────────────
 
 
-async def test_begin_sends_the_routing_key_as_key_and_an_empty_body(
+async def test_begin_sends_its_key_and_an_empty_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, calls = _client(monkeypatch, _ok("01000000000000000200000000000000"))
-    txn = await client.kv.begin("rk")
+    txn = await client.kv.begin("{t}a")
     assert (txn.id, txn.pinned_hash) == (1, 2)
-    assert calls[0][:4] == (OpCode.KV_BEGIN_TXN, "default", b"rk", b"")
+    assert calls[0][:4] == (OpCode.KV_BEGIN_TXN, "default", b"{t}a", b"")
 
 
 def _txn_answer(op: OpCode, key: bytes, body: bytes) -> RawResponse:
@@ -521,19 +516,19 @@ def _txn_answer(op: OpCode, key: bytes, body: bytes) -> RawResponse:
     }[op]
 
 
-async def test_txn_ops_carry_the_txn_and_its_routing_key(
+async def test_txn_ops_carry_the_txn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, calls = _client(monkeypatch, _txn_answer)
-    txn = Transaction(client, "ns", "rk", txn_id=1, pinned_hash=0)
-    assert await txn.delete("a", DeleteOptions(routing_key="ignored")) is None
+    txn = Transaction(client, "ns", txn_id=1, pinned_hash=0)
+    assert await txn.delete("a") is None
     assert await txn.incr("b", -5) is None
     await txn.expire("c", 60000)
     assert (await txn.exists("d")).exists is True
     res = await txn.commit()
     assert (res.commit_index, res.op_count) == (10, 2)
 
-    tail = H("010200726b") + H("01") + struct.pack("<Q", 1)
+    tail = H("01") + struct.pack("<Q", 1)
     assert [(c[0], c[2], c[3]) for c in calls] == [
         (OpCode.KV_DELETE, b"a", b"\x00" + tail),
         (OpCode.KV_INCR, b"b", H("01fbffffffffffffff") + tail),
@@ -545,11 +540,11 @@ async def test_txn_ops_carry_the_txn_and_its_routing_key(
 
 async def test_rollback_sends_the_txn_with_an_empty_key(monkeypatch: pytest.MonkeyPatch) -> None:
     client, calls = _client(monkeypatch, _txn_answer)
-    await Transaction(client, "ns", "rk", txn_id=1, pinned_hash=0).rollback()
+    await Transaction(client, "ns", txn_id=1, pinned_hash=0).rollback()
     assert calls[0][:4] == (OpCode.KV_ROLLBACK_TXN, "ns", b"", H("0100000000000000"))
 
 
 async def test_txn_op_on_an_unknown_txn_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     client, _ = _client(monkeypatch, _refused(StatusCode.NOT_FOUND, Reason.NO_SUCH_TRANSACTION))
     with pytest.raises(NotFoundError):
-        await Transaction(client, "ns", "rk", txn_id=1, pinned_hash=0).delete("k")
+        await Transaction(client, "ns", txn_id=1, pinned_hash=0).delete("k")

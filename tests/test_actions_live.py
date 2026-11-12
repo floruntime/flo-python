@@ -22,7 +22,7 @@ from flo import (
     RunStatus,
     StaleReportError,
     StreamAppendOptions,
-    StreamGroupJoinOptions,
+    StreamGroupReadOptions,
     WorkerAwaitOptions,
     WorkerFailOptions,
 )
@@ -169,10 +169,14 @@ async def test_live_an_empty_dlq_page(client: FloClient) -> None:
 async def test_live_stream_groups_and_their_members(client: FloClient) -> None:
     ns = fresh_namespace()
     await client.stream.append("events", b"e1", StreamAppendOptions(namespace=ns))
-    await client.stream.group_join("events", "g1", "c1", StreamGroupJoinOptions(namespace=ns))
+    # A member is a consumer holding records: the read makes c1 one.
+    got = await client.stream.group_read(
+        "events", "g1", "c1", StreamGroupReadOptions(namespace=ns, count=1)
+    )
+    assert len(got.records) == 1
     groups = await client.stream.group_list("events", ns)
     assert [g.name for g in groups.groups] == ["g1"]
-    assert groups.groups[0].members == 1
+    assert (groups.groups[0].members, groups.groups[0].pending) == (1, 1)
     members = await client.stream.group_members("events", "g1", ns)
     assert [(m.id, m.state) for m in members.members] == [("c1", GroupMemberState.ACTIVE)]
     with pytest.raises(NotFoundError):

@@ -38,6 +38,7 @@ from .retry import (
     _halted_backoff,
     _sleep_unless_stopped,
     _worker_backoff,
+    is_limit,
     is_refused_unrun,
     is_shard_halted,
 )
@@ -45,13 +46,15 @@ from .types import (
     _DEFAULT_WORKER_BLOCK_MS,
     ActionRegisterOptions,
     ActionType,
+    GroupReadResult,
+    GroupRecord,
+    GroupReportResult,
     Reason,
     StatusCode,
-    StreamGroupAckOptions,
+    StreamGroupCreateOptions,
     StreamGroupNackOptions,
     StreamGroupReadOptions,
     StreamID,
-    StreamRecord,
     TaskAssignment,
     WorkerAwaitOptions,
     WorkerCompleteOptions,
@@ -60,7 +63,7 @@ from .types import (
     WorkerStatus,
     WorkerType,
 )
-from .wire import _validate_block_ms
+from .wire import MAX_GROUP_BATCH, MAX_GROUP_NACK_ERROR, _validate_block_ms
 
 logger = logging.getLogger("flo.worker")
 
@@ -258,20 +261,36 @@ class _RegisteredWorker:
     async def _register(self, client: FloClient) -> None:
         raise NotImplementedError
 
-    async def _while_halted(self, what: str, call: Callable[[], Awaitable[object]]) -> bool:
-        """Run call, asking again while the shard is halted: it resumes once an
-        operator repairs it, and the worker comes up by itself then. False if
-        a stop or drain ended the wait."""
+    async def _while_blocked(self, what: str, call: Callable[[], Awaitable[object]]) -> bool:
+        """Run call, asking again while the shard is halted (it resumes once
+        an operator repairs it) or the node is at a limit (until something is
+        deleted or the limit raised), and after a refusal that didn't run or
+        a lost connection: the worker comes up by itself once it clears.
+        False if a stop or drain ended the wait. Anything else is raised."""
         halted = _halted_backoff()
+        failed = _worker_backoff()
+        limits = _LimitNotice()
         while True:
             try:
                 await call()
                 return True
             except Exception as e:
-                if not is_shard_halted(e):
+                if is_shard_halted(e):
+                    d = halted.next()
+                    logger.warning(f"{what} refused, shard halted: {e}; retrying in {d:.3f}s")
+                elif is_limit(e):
+                    d = halted.next()
+                    limits.note(what, e)
+                elif is_refused_unrun(e):
+                    d = failed.next()
+                    logger.warning(f"{what} refused: {e}; retrying in {d:.3f}s")
+                elif _lost(e):
+                    d = failed.next()
+                    logger.warning(f"{what} lost: {e!r}; reconnecting")
+                    with contextlib.suppress(Exception):
+                        await self._reconnect_control(self._control_generation())
+                else:
                     raise
-                d = halted.next()
-                logger.warning(f"{what} refused, shard halted: {e}; retrying in {d:.3f}s")
                 await _sleep_unless_stopped(self._leave_event, d)
                 if self._leave_event.is_set():
                     return False
@@ -424,6 +443,60 @@ class _RegisteredWorker:
             await send(client)
         except Exception as e:
             logger.warning(f"{what} failed: {e}")
+
+
+class _LimitNotice:
+    """Logs a limit refusal once per reason while it lasts: a loop backing
+    off from one would otherwise log it on every try. A success resets it."""
+
+    def __init__(self) -> None:
+        self._seen: set[int] = set()
+
+    def note(self, what: str, e: BaseException) -> None:
+        assert isinstance(e, ServerError)
+        if e.reason in self._seen:
+            return
+        self._seen.add(e.reason)
+        logger.error(
+            f"{what} refused: the node is at a limit ({e.reason.name}): {e}. "
+            "Backing off until something is deleted or the limit raised"
+        )
+
+    def reset(self) -> None:
+        self._seen.clear()
+
+
+def _nack_error(message: str) -> str:
+    """A nack's error, cut to what its option carries, on a character boundary."""
+    raw = message.encode("utf-8")[:MAX_GROUP_NACK_ERROR]
+    return raw.decode("utf-8", errors="ignore")
+
+
+async def _touch_loop(
+    interval_s: float,
+    arrived: float | None,
+    stop: asyncio.Event,
+    touch: Callable[[], Awaitable[bool]],
+) -> None:
+    """Call touch every interval_s, counted from arrived (the loop time the
+    lease began) or now, until stop is set or touch returns False."""
+    loop = asyncio.get_running_loop()
+    due = (loop.time() if arrived is None else arrived) + interval_s
+    while True:
+        # Checked first: a wait_for with no time left times out before the
+        # wait it wraps has run, however long stop has been set.
+        if stop.is_set():
+            return
+        try:
+            await asyncio.wait_for(stop.wait(), max(due - loop.time(), 0.0))
+            return
+        except asyncio.TimeoutError:
+            pass
+        # A touch that ran long skips the times it missed.
+        while due <= loop.time():
+            due += interval_s
+        if not await touch():
+            return
 
 
 def _touch_pace(lease_ms: int) -> float:
@@ -844,7 +917,7 @@ class ActionWorker(_RegisteredWorker):
             results = self._result_client
             for action_name in action_names:
                 opts = self._action_options[action_name]
-                if not await self._while_halted(
+                if not await self._while_blocked(
                     f"Registering action {action_name}",
                     functools.partial(results.action.register, action_name, ActionType.USER, opts),
                 ):
@@ -854,7 +927,7 @@ class ActionWorker(_RegisteredWorker):
             # Deregistered at the end even if this answer is lost: the
             # registration may still have taken.
             registered = True
-            if not await self._while_halted("Registering", lambda: self._register(results)):
+            if not await self._while_blocked("Registering", lambda: self._register(results)):
                 return
             logger.info(f"Worker registered with {len(action_names)} actions")
 
@@ -923,6 +996,7 @@ class ActionWorker(_RegisteredWorker):
         backoff = _EmptyPollBackoff(self.config.block_ms, leave)
         failed = _worker_backoff()
         halted = _halted_backoff()
+        limits = _LimitNotice()
         # Kept until an await is answered: one sent again after a lost answer
         # or a refusal gets the task the first one may have taken, rather than
         # leaving it leased to this worker until its lease runs out.
@@ -948,6 +1022,7 @@ class ActionWorker(_RegisteredWorker):
                 reconnect_pause = 0.0
                 failed.reset()
                 halted.reset()
+                limits.reset()
 
                 if result.task is None:
                     # No task available, release semaphore and continue
@@ -994,6 +1069,10 @@ class ActionWorker(_RegisteredWorker):
                 elif is_shard_halted(e):
                     d = halted.next()
                     logger.warning(f"Await refused, shard halted: {e}; retrying in {d:.3f}s")
+                    await _sleep_unless_stopped(leave, d)
+                elif is_limit(e):
+                    d = halted.next()
+                    limits.note("Await", e)
                     await _sleep_unless_stopped(leave, d)
                 elif is_connection_error(e):
                     # A stop or drain interrupts the poll connection: that is
@@ -1179,35 +1258,31 @@ class ActionWorker(_RegisteredWorker):
         say, is tried again next interval, and a lost connection is
         reconnected for it.
         """
-        loop = asyncio.get_running_loop()
-        interval_s = _touch_pace(task.lease_ms)
-        due = (loop.time() if arrived is None else arrived) + interval_s
-        while True:
-            # Checked first: a wait_for with no time left times out before
-            # the wait it wraps has run, however long stop has been set.
-            if stop.is_set():
-                return
-            try:
-                await asyncio.wait_for(stop.wait(), max(due - loop.time(), 0.0))
-                return
-            except asyncio.TimeoutError:
-                pass
-            # A touch that ran long skips the times it missed.
-            while due <= loop.time():
-                due += interval_s
+        limits = _LimitNotice()
+
+        async def touch() -> bool:
             seen = self._result_generation
             try:
                 await self._touch_task(task)
             except ServerError as e:
                 if e.status_code in _TOUCH_FINAL:
                     logger.warning(f"Touch for task {task.task_id} was refused, stopping: {e}")
-                    return
-                logger.warning(f"Touch for task {task.task_id} was refused: {e}; trying again")
+                    return False
+                if is_limit(e):
+                    limits.note(f"Touch for task {task.task_id}", e)
+                else:
+                    logger.warning(f"Touch for task {task.task_id} was refused: {e}; trying again")
+                return True
             except Exception as e:
                 logger.warning(f"Touch for task {task.task_id} lost: {e!r}")
                 if is_connection_error(e) or isinstance(e, asyncio.TimeoutError):
                     with contextlib.suppress(Exception):
                         await self._reconnect_result_client(seen)
+                return True
+            limits.reset()
+            return True
+
+        await _touch_loop(_touch_pace(task.lease_ms), arrived, stop, touch)
 
     def stop(self) -> None:
         """Signal the worker to stop.
@@ -1251,6 +1326,9 @@ class ActionWorker(_RegisteredWorker):
 # Return normally to auto-ack, raise to auto-nack.
 StreamRecordHandler = Callable[["StreamContext"], Awaitable[None]]
 
+# A group's lease when nothing says otherwise: the server's default.
+_DEFAULT_GROUP_LEASE_MS = 30_000
+
 
 @dataclass
 class StreamWorkerOptions:
@@ -1264,21 +1342,24 @@ class StreamWorkerOptions:
     consumer: str = ""
     worker_id: str = ""
     concurrency: int = 10
-    batch_size: int = 10
+    batch_size: int = 10  # 1..100 records a read
     block_ms: int = _DEFAULT_WORKER_BLOCK_MS
     message_timeout: float = 300.0  # 5 minutes
-    # Drain this consumer's pending (delivered-but-unacked) entries via
-    # group_claim after a reconnect, before resuming normal group_read.
-    # Required for at-least-once across reconnects: group_read alone only
-    # returns records past last_delivered_id. Set False for at-most-once.
-    redeliver_pending_on_reconnect: bool = True
-    # Minimum idle time (ms) an entry must have before the reconnect drain
-    # claims it. 0 = drain everything this consumer already owns; > 0 also
-    # steals entries abandoned by other (dead) consumers idle at least this long.
-    claim_min_idle_ms: int = 0
+    # The group's lease and attempts. Set either and the worker creates the
+    # group with them at start, failing if it exists with others; leave both
+    # None to take the group as it is (a read creates a missing one at the
+    # server's defaults: a 30 s lease, 5 attempts).
+    ack_timeout_ms: int | None = None
+    max_deliver: int | None = None
+    # Touch each record every sixth of the group's lease while its handler
+    # runs, so a long handler isn't redelivered elsewhere. A hold is capped at
+    # 12 h from the read whatever the touches.
+    auto_touch: bool = False
 
     def __post_init__(self) -> None:
         self.block_ms = _worker_block_ms(self.block_ms)
+        if not 1 <= self.batch_size <= MAX_GROUP_BATCH:
+            raise ValueError(f"batch_size must be 1..{MAX_GROUP_BATCH}, got {self.batch_size}")
 
 
 @dataclass
@@ -1288,7 +1369,7 @@ class StreamContext:
     Provides access to record data and helper methods.
     """
 
-    record: StreamRecord
+    record: GroupRecord
     namespace: str
     stream: str
     group: str
@@ -1303,6 +1384,12 @@ class StreamContext:
     def payload(self) -> bytes:
         """Get the raw record payload."""
         return self.record.payload
+
+    @property
+    def deliveries(self) -> int:
+        """This record's deliveries, this one included: above 1, an earlier
+        lease ran out or was nacked."""
+        return self.record.deliveries
 
     def json(self) -> Any:
         """Parse record payload as JSON."""
@@ -1326,8 +1413,12 @@ class StreamContext:
 class StreamWorker(_RegisteredWorker):
     """High-level Flo worker for processing stream records via consumer groups.
 
-    Polls a consumer group with ``group_read()``, dispatches records to the
-    handler, and auto-acks on success or auto-nacks on error.
+    Reads a consumer group with ``group_read()``, dispatches records to the
+    handler, and acks each on success or nacks it on error. Each record is
+    leased to this consumer until acked: one whose handler outlives the
+    group's lease is redelivered, unless ``auto_touch`` keeps it. A worker
+    that stops or loses its connection leaves its records to run out their
+    lease and be read again, so delivery is at least once.
 
     Created from a FloClient via ``client.new_stream_worker()``.
 
@@ -1362,8 +1453,9 @@ class StreamWorker(_RegisteredWorker):
         batch_size: int = 10,
         block_ms: int = _DEFAULT_WORKER_BLOCK_MS,
         message_timeout: float = 300.0,
-        redeliver_pending_on_reconnect: bool = True,
-        claim_min_idle_ms: int = 0,
+        ack_timeout_ms: int | None = None,
+        max_deliver: int | None = None,
+        auto_touch: bool = False,
     ):
         self._parent_client = parent_client
         self._handler = handler
@@ -1376,8 +1468,9 @@ class StreamWorker(_RegisteredWorker):
             batch_size=batch_size,
             block_ms=block_ms,
             message_timeout=message_timeout,
-            redeliver_pending_on_reconnect=redeliver_pending_on_reconnect,
-            claim_min_idle_ms=claim_min_idle_ms,
+            ack_timeout_ms=ack_timeout_ms,
+            max_deliver=max_deliver,
+            auto_touch=auto_touch,
         )
 
         self._client: FloClient | None = None
@@ -1391,6 +1484,8 @@ class StreamWorker(_RegisteredWorker):
         self._tasks = set()
         self._semaphore: asyncio.Semaphore | None = None
         self._running_handlers = 0
+        # The group's lease, which auto_touch paces by.
+        self._lease_ms = ack_timeout_ms or _DEFAULT_GROUP_LEASE_MS
 
     @staticmethod
     def _generate_consumer_id() -> str:
@@ -1405,8 +1500,12 @@ class StreamWorker(_RegisteredWorker):
         """Start the stream worker and process records until stop(), or a
         drain once its running handlers finish and ack. Either one before or
         during startup ends this run. It registers in the worker registry and
-        heartbeats while it runs, then leaves the group and deregisters. It may
-        be called again afterwards.
+        heartbeats while it runs, then deregisters. It may be called again
+        afterwards.
+
+        Raises:
+            ConflictError: ``ack_timeout_ms`` or ``max_deliver`` is set and
+                the group exists with other settings.
         """
         logger.info(
             f"Starting stream worker (stream={self.config.stream}, "
@@ -1416,7 +1515,6 @@ class StreamWorker(_RegisteredWorker):
 
         self._running = True
         registered = False
-        joined = False
         try:
             worker_timeout_ms = int(self._parent_client._timeout * 1000)
             self._client = FloClient(
@@ -1428,10 +1526,10 @@ class StreamWorker(_RegisteredWorker):
             )
             await self._client.connect()
 
-            # Acks, nacks, heartbeats and drain notices get their own
+            # Acks, nacks, touches, heartbeats and drain notices get their own
             # connection: the polling one is held by a group_read for up to
             # block_ms, and an ack queued behind it can arrive after the
-            # group's ack timeout and see the record redelivered.
+            # record's lease and see it redelivered.
             self._ack_client = FloClient(
                 self._parent_client._endpoint,
                 namespace=self._parent_client.namespace,
@@ -1443,25 +1541,18 @@ class StreamWorker(_RegisteredWorker):
             if self._stop_event.is_set():
                 return
 
-            # Semaphore must be set up before the join: a connection error
-            # during the join triggers _handle_reconnect -> _drain_pending,
-            # which acquires the semaphore.
             self._semaphore = asyncio.Semaphore(self.config.concurrency)
 
             # Deregistered at the end even if this answer is lost: the
             # registration may still have taken.
             registered = True
             acks = self._ack_client
-            if not await self._while_halted("Registering", lambda: self._register(acks)):
+            if not await self._while_blocked("Registering", lambda: self._register(acks)):
                 return
             self._start_heartbeats()
 
-            # Join consumer group. A connection error here (a stalled or dropped
-            # connection at startup) is retried via reconnect rather than
-            # killing the worker — mirroring the poll loop and ack retry.
-            joined = True
-            await self._join_group()
-            logger.info(f"Joined consumer group {self.config.group} on stream {self.config.stream}")
+            if not await self._while_blocked("Setting up the consumer group", self._setup_group):
+                return
 
             await self._poll_loop()
             if self._drain_event.is_set():
@@ -1474,13 +1565,6 @@ class StreamWorker(_RegisteredWorker):
                 await asyncio.gather(*self._tasks, return_exceptions=True)
             await self._stop_heartbeats()
 
-            # On the ack connection: a stop or drain cut the poll one.
-            if joined:
-                cfg = self.config
-                await self._on_control_once(
-                    "Leaving the consumer group",
-                    lambda c: c.stream.group_leave(cfg.stream, cfg.group, cfg.consumer),
-                )
             if registered:
                 wid = self.config.worker_id
                 await self._on_control_once("Deregister", lambda c: c.worker.deregister(wid))
@@ -1495,6 +1579,28 @@ class StreamWorker(_RegisteredWorker):
             self._running = False
             self._end_run()
             logger.info("Stream worker stopped")
+
+    async def _setup_group(self) -> None:
+        """Create the group when its settings are given, and learn its lease
+        when auto_touch needs it. On the ack connection: a stop or drain cuts
+        the poll one."""
+        client = self._ack_client
+        assert client is not None
+        cfg = self.config
+        if cfg.ack_timeout_ms is not None or cfg.max_deliver is not None:
+            await client.stream.group_create(
+                cfg.stream,
+                cfg.group,
+                StreamGroupCreateOptions(
+                    ack_timeout_ms=cfg.ack_timeout_ms, max_deliver=cfg.max_deliver
+                ),
+            )
+        if cfg.auto_touch and cfg.ack_timeout_ms is None:
+            listed = await client.stream.group_list(cfg.stream)
+            for g in listed.groups:
+                if g.name == cfg.group:
+                    self._lease_ms = g.ack_timeout_ms
+                    break
 
     @property
     def _worker_id(self) -> str:
@@ -1534,6 +1640,7 @@ class StreamWorker(_RegisteredWorker):
         backoff = _EmptyPollBackoff(self.config.block_ms, leave)
         failed = _worker_backoff()
         halted = _halted_backoff()
+        limits = _LimitNotice()
 
         while not leave.is_set():
             # Whether this pass holds a slot: exactly one place releases it.
@@ -1556,6 +1663,7 @@ class StreamWorker(_RegisteredWorker):
                 )
                 failed.reset()
                 halted.reset()
+                limits.reset()
 
                 if not result.records:
                     held = False
@@ -1571,7 +1679,7 @@ class StreamWorker(_RegisteredWorker):
 
                 # A drain handles the whole batch, already delivered here; a
                 # stop hands back what it hasn't started.
-                await self._dispatch(result.records)
+                await self._dispatch(result, loop.time())
                 if self._stop_event.is_set():
                     return
 
@@ -1599,10 +1707,14 @@ class StreamWorker(_RegisteredWorker):
                     d = halted.next()
                     logger.warning(f"Stream read refused, shard halted: {e}; retrying in {d:.3f}s")
                     await _sleep_unless_stopped(leave, d)
+                elif is_limit(e):
+                    d = halted.next()
+                    limits.note("Stream read", e)
+                    await _sleep_unless_stopped(leave, d)
                 elif is_refused_unrun(e):
                     # Routine: a leader not ready yet, or records still being
-                    # read back from disk. The read claimed and delivered
-                    # nothing, so the same read is safe to send again.
+                    # read back from disk. The read leased nothing, so the
+                    # same read is safe to send again.
                     d = failed.next()
                     logger.info(f"Stream read not served yet: {e}; retrying in {d:.3f}s")
                     await _sleep_unless_stopped(leave, d)
@@ -1611,90 +1723,35 @@ class StreamWorker(_RegisteredWorker):
                     logger.error(f"Stream read error: {e}, retrying in {d:.3f}s...")
                     await _sleep_unless_stopped(leave, d)
 
-    async def _dispatch(self, records: list[StreamRecord]) -> None:
+    async def _dispatch(self, delivery: GroupReadResult, arrived: float) -> None:
         """Hand each record to a handler as a slot frees. On stop, the
         records not yet started are nacked, so the group hands them out again
-        now rather than after its ack timeout."""
+        now rather than when their lease runs out; either way it counts as one
+        of their attempts."""
         assert self._semaphore is not None
         started = 0
-        for record in records:
+        for record in delivery.records:
             # A stop ends the wait; a drain handles the whole batch.
             if not await _acquire_unless_set(self._semaphore, self._stop_event):
                 break
-            task = asyncio.create_task(self._process_record(record))
+            task = asyncio.create_task(self._process_record(delivery, record, arrived))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             started += 1
-        rest = [r.id for r in records[started:]]
+        rest = delivery.records[started:]
         if not rest:
             return
         cfg = self.config
         await self._on_ack_connection(
             f"nack of {len(rest)}",
-            rest[0],
-            lambda c: c.stream.group_nack(
-                cfg.stream, cfg.group, rest, StreamGroupNackOptions(consumer=cfg.consumer)
-            ),
+            rest[0].id,
+            lambda c: c.stream.group_nack(cfg.stream, cfg.group, delivery, rest),
         )
 
-    async def _join_group(self) -> None:
-        """Join the consumer group, retrying on connection errors.
-
-        A connection error (a stalled or dropped connection at startup) triggers
-        a reconnect-and-retry instead of failing the worker. A join the server
-        refused without running it (overloaded or unavailable, past the
-        client's own retries) is tried again with the worker backoff, and one
-        refused because the shard halted every 30 s at most, until an
-        operator repairs it. Other errors (e.g. an invalid request) remain
-        fatal and are raised.
-        """
-        assert self._client is not None
-        failed = _worker_backoff()
-        halted = _halted_backoff()
-        leave = self._leave_event
-        while True:
-            if leave.is_set():
-                return
-            try:
-                await self._client.stream.group_join(
-                    self.config.stream,
-                    self.config.group,
-                    self.config.consumer,
-                )
-                return
-            except Exception as e:
-                if is_shard_halted(e):
-                    d = halted.next()
-                    logger.warning(f"Group join refused, shard halted: {e}; retrying in {d:.3f}s")
-                    await _sleep_unless_stopped(leave, d)
-                    continue
-                if is_refused_unrun(e):
-                    d = failed.next()
-                    logger.warning(f"Group join refused: {e}, retrying in {d:.3f}s...")
-                    await _sleep_unless_stopped(leave, d)
-                    continue
-                if not is_connection_error(e):
-                    raise
-                logger.warning(f"Connection lost during group join: {e}, reconnecting...")
-                with contextlib.suppress(Exception):
-                    if not await self._handle_reconnect():
-                        return
-                await _sleep_unless_stopped(leave, 1)
-
     async def _handle_reconnect(self) -> bool:
-        """Reconnect, re-join the consumer group, and drain pending entries.
-        False if a stop or drain ended the reconnect.
-
-        After re-joining, this consumer's pending (delivered-but-unacked)
-        entries are re-processed via a group_claim cursor loop before normal
-        reads resume — group_read only returns records past last_delivered_id,
-        so without this an in-flight record at crash time is never re-surfaced.
-        See ``redeliver_pending_on_reconnect``.
-
-        Only the reconnects end on a stop or drain: the join and the pending
-        drain check for one themselves, and cutting them short would leave
-        claimed records unhandled, or a nack cut off mid-request.
-        """
+        """Reconnect the poll and ack connections. False if a stop or drain
+        ended the reconnect. Records leased before the drop are read again
+        once their lease runs out."""
         assert self._client is not None
         leave = self._leave_event
         if not await _unless_set(leave, self._client.reconnect()):
@@ -1706,66 +1763,7 @@ class StreamWorker(_RegisteredWorker):
                 return False
         except Exception as e:
             logger.warning(f"Failed to reconnect ack client: {e}")
-        await self._client.stream.group_join(
-            self.config.stream,
-            self.config.group,
-            self.config.consumer,
-        )
-        if self.config.redeliver_pending_on_reconnect:
-            await self._drain_pending()
         return True
-
-    async def _drain_pending(self) -> None:
-        """Re-process this consumer's pending entries via a group_claim loop.
-
-        Records flow through the same _process_record path (and concurrency
-        gate) as live reads, so a handler that succeeds acks and clears the PEL
-        entry. Bounded per stream by a max page count so a pathological backlog
-        can't wedge the reconnect indefinitely; leftovers are reclaimed on the
-        next reconnect or by group_read once acked.
-        """
-        if self._semaphore is None or self._client is None:
-            # start() has not initialized the concurrency gate yet.
-            return
-
-        max_pages = 1000  # safety cap: max_pages * batch_size entries
-        cursor = StreamID()  # MIN — scan from the start of the PEL
-        pages = 0
-        unserved = _worker_backoff()
-        while True:
-            if self._leave_event.is_set():
-                return
-            try:
-                result = await self._client.stream.group_claim(
-                    self.config.stream,
-                    self.config.group,
-                    self.config.consumer,
-                    self.config.claim_min_idle_ms,
-                    cursor,
-                    self.config.batch_size,
-                )
-            except Exception as e:
-                if is_refused_unrun(e):
-                    # Not served yet (records being read back from disk, a
-                    # leader not ready): claimed nothing, so ask again.
-                    d = unserved.next()
-                    logger.info(f"Pending drain claim not served yet: {e}; retrying in {d:.3f}s")
-                    await _sleep_unless_stopped(self._leave_event, d)
-                    continue
-                # Don't fail the reconnect on a drain error; normal reads resume.
-                logger.warning(f"Pending drain claim failed: {e}")
-                return
-            unserved.reset()
-
-            # Same gate as live reads.
-            await self._dispatch(result.records)
-            if self._stop_event.is_set():
-                return
-
-            pages += 1
-            if result.done or not result.records or pages >= max_pages:
-                return
-            cursor = result.next_cursor
 
     async def _reconnect_ack_client(self, failed_generation: int | None = None) -> None:
         """Reconnect the ack connection, unless it was reconnected since
@@ -1781,42 +1779,110 @@ class StreamWorker(_RegisteredWorker):
         self,
         op: str,
         record_id: StreamID,
-        send: Callable[[FloClient], Awaitable[object]],
+        send: Callable[[FloClient], Awaitable[GroupReportResult]],
     ) -> bool:
         """Send an ack or nack on the ack connection, resending it after a
-        reconnect if the connection drops. Never raises; False if dropped."""
+        reconnect if the connection drops. Never raises; False if dropped.
+        Records the report didn't apply to are logged: their lease ran out,
+        and they go or went to another delivery."""
         ack_client = self._ack_client
         assert ack_client is not None
+        what = f"{op} for record {record_id}"
+
+        async def report() -> None:
+            result = await send(ack_client)
+            if result.lost:
+                why = ", ".join(f"{r.id}: {r.why.name}" for r in result.lost)
+                logger.warning(f"{what} applied to none of {why}; it is delivered again")
+
         return await _send_result(
-            f"{op} for record {record_id}",
-            lambda: send(ack_client),
+            what,
+            report,
             lambda: self._ack_generation,
             self._reconnect_ack_client,
             self._leave_event,
         )
 
-    async def _process_record(self, record: StreamRecord) -> None:
+    async def _keep_touching(
+        self,
+        delivery: GroupReadResult,
+        record: GroupRecord,
+        stop: asyncio.Event,
+        arrived: float,
+    ) -> None:
+        """Touch a record every _touch_pace(lease), counted from when its read
+        came in, until stop is set. A touch the record moved on from (it is
+        refused, or the request is) stops touching; a lost connection is
+        reconnected for it."""
+        cfg = self.config
+        limits = _LimitNotice()
+
+        async def touch() -> bool:
+            client = self._ack_client
+            assert client is not None
+            seen = self._ack_generation
+            try:
+                result = await client.stream.group_touch(cfg.stream, cfg.group, delivery, [record])
+            except ServerError as e:
+                if is_limit(e):
+                    limits.note(f"Touch for record {record.id}", e)
+                    return True
+                logger.warning(f"Touch for record {record.id} was refused, stopping: {e}")
+                return False
+            except Exception as e:
+                logger.warning(f"Touch for record {record.id} lost: {e!r}")
+                if is_connection_error(e) or isinstance(e, asyncio.TimeoutError):
+                    with contextlib.suppress(Exception):
+                        await self._reconnect_ack_client(seen)
+                return True
+            limits.reset()
+            if result.refused:
+                logger.warning(
+                    f"Touch for record {record.id} refused ({result.refused[0].why.name}), "
+                    "stopping: it is delivered again"
+                )
+                return False
+            return True
+
+        await _touch_loop(_touch_pace(self._lease_ms), arrived, stop, touch)
+
+    async def _process_record(
+        self, delivery: GroupReadResult, record: GroupRecord, arrived: float
+    ) -> None:
         """Process a single record: call handler, then ack or nack."""
         assert self._semaphore is not None
+        cfg = self.config
         try:
             ctx = StreamContext(
                 record=record,
                 namespace=self._parent_client.namespace,
-                stream=self.config.stream,
-                group=self.config.group,
-                consumer=self.config.consumer,
+                stream=cfg.stream,
+                group=cfg.group,
+                consumer=cfg.consumer,
+            )
+            stop_touching = asyncio.Event()
+            touching = (
+                asyncio.ensure_future(self._keep_touching(delivery, record, stop_touching, arrived))
+                if cfg.auto_touch
+                else None
             )
             self._running_handlers += 1
+            error = ""
             try:
-                await asyncio.wait_for(self._handler(ctx), timeout=self.config.message_timeout)
+                await asyncio.wait_for(self._handler(ctx), timeout=cfg.message_timeout)
                 handled = True
             except Exception as e:
-                logger.error(
-                    f"Record processing failed (stream={self.config.stream}, id={record.id}): {e}"
-                )
+                logger.error(f"Record processing failed (stream={cfg.stream}, id={record.id}): {e}")
                 handled = False
+                error = str(e) or type(e).__name__
             finally:
                 self._running_handlers -= 1
+                if touching is not None:
+                    # Let a touch in flight finish: cancelled mid-request, it
+                    # would cost the ack connection.
+                    stop_touching.set()
+                    with contextlib.suppress(Exception):
+                        await asyncio.shield(touching)
 
             # Outside the handler's error handling: an ack that can't be
             # delivered must not turn into a nack.
@@ -1824,23 +1890,14 @@ class StreamWorker(_RegisteredWorker):
                 await self._on_ack_connection(
                     "ack",
                     record.id,
-                    lambda c: c.stream.group_ack(
-                        self.config.stream,
-                        self.config.group,
-                        [record.id],
-                        StreamGroupAckOptions(consumer=self.config.consumer),
-                    ),
+                    lambda c: c.stream.group_ack(cfg.stream, cfg.group, delivery, [record]),
                 )
             else:
+                nack = StreamGroupNackOptions(error=_nack_error(error))
                 await self._on_ack_connection(
                     "nack",
                     record.id,
-                    lambda c: c.stream.group_nack(
-                        self.config.stream,
-                        self.config.group,
-                        [record.id],
-                        StreamGroupNackOptions(consumer=self.config.consumer),
-                    ),
+                    lambda c: c.stream.group_nack(cfg.stream, cfg.group, delivery, [record], nack),
                 )
         except Exception as e:
             logger.error(f"Failed to process record: {e}")

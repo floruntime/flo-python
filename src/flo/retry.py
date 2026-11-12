@@ -21,7 +21,8 @@ class RetryPolicy:
     safe for any operation, writes included. Each retry is a new request with
     a new id; the server routes it afresh. Unavailable with reason
     SHARD_HALTED is not retried: the shard takes no writes until an operator
-    repairs it. Neither is outcome_pending: that write committed.
+    repairs it. Neither is outcome_pending: that write committed. Nor is
+    limit (``LimitError``): it never ran, but retrying won't clear it.
 
     Attributes:
         max_attempts: Tries in all, the first included; 1 (or less) turns
@@ -104,6 +105,13 @@ def is_shard_halted(exc: BaseException) -> bool:
     )
 
 
+def is_limit(exc: BaseException) -> bool:
+    """Whether exc is a limit refusal: the node is at one of its limits.
+    Never retried by the client, as retrying won't clear it; a worker loop
+    backs off until something is deleted or the limit raised."""
+    return isinstance(exc, ServerError) and exc.status_code == StatusCode.LIMIT
+
+
 class _Backoff:
     """A capped, doubling, fully jittered wait, in seconds."""
 
@@ -133,8 +141,9 @@ def _policy_backoff(policy: RetryPolicy) -> _Backoff:
 # the bottom after a poll that succeeds.
 _WORKER_INITIAL_BACKOFF_S = 0.1
 _WORKER_MAX_BACKOFF_S = 5.0
-# A halted shard stays halted until an operator repairs it, so a worker asks
-# again less often; it resumes on its own once the shard does.
+# A halted shard stays halted until an operator repairs it, and a limit holds
+# until something is deleted or the limit raised, so a worker asks again less
+# often; it resumes on its own once either clears.
 _HALTED_MAX_BACKOFF_S = 30.0
 
 
