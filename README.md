@@ -628,7 +628,9 @@ A stream worker acks each record its handler returns from and nacks each one
 its handler raises on, naming the read's delivery. A record whose handler runs
 past the group's lease is read again elsewhere unless `auto_touch=True`, which
 touches it every sixth of the lease (at least 100 ms apart) counted from when
-its read came in. With `ack_timeout_ms` or `max_deliver` set, the worker
+its read came in. The worker learns the lease when it creates the group or
+finds it listed; until then (a group its first read makes) it paces by the
+shortest lease a group may have, 5 s. With `ack_timeout_ms` or `max_deliver` set, the worker
 creates the group at start and fails if it exists with other settings; with
 neither, it takes the group as it is. A worker that loses its connection
 reconnects and reads on: the records it held come back once their lease runs

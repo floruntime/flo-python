@@ -297,8 +297,9 @@ async def test_a_stream_worker_touches_a_long_record_by_its_delivery(
 ) -> None:
     from flo import worker as worker_mod
 
-    # A 600 ms lease: a touch every 100 ms, the floor.
-    monkeypatch.setattr(worker_mod, "_DEFAULT_GROUP_LEASE_MS", 600)
+    # The group isn't listed, so touches pace by the shortest lease, here
+    # 600 ms: a touch every 100 ms, the floor.
+    monkeypatch.setattr(worker_mod, "MIN_GROUP_LEASE_MS", 600)
     reads = 0
 
     def reply(_n: int, op: int, rid: int) -> bytes:
@@ -373,3 +374,76 @@ async def test_a_key_that_routes_elsewhere_in_a_transaction_is_refused_unrun() -
     assert (raised.value.reason, raised.value.ran) == (Reason.KEYS_NOT_COLOCATED, Ran.NO)
     assert "same {tag}" in str(raised.value)
     assert [op for op, _ in fake.payloads] == [OpCode.KV_BEGIN_TXN, OpCode.KV_PUT]
+
+
+def _listing(*groups: tuple[str, int]) -> bytes:
+    """stream.group.list's answer: each group's row, then more = false."""
+    out = struct.pack("<H", len(groups))
+    for name, lease in groups:
+        out += _str16(name) + struct.pack("<IQqIBQQ", 0, 0, 0, lease, 5, 0, 0)
+    return out + b"\x00"
+
+
+class _Lister:
+    """An ack client whose group list and create answer as given."""
+
+    def __init__(self, listed: bytes) -> None:
+        from flo.kv_body import decode_group_list_answer
+
+        self.listed = decode_group_list_answer(listed)
+        self.stream = self
+        self.created: list[object] = []
+
+    async def group_list(self, _stream: str) -> object:
+        return self.listed
+
+    async def group_create(self, *args: object) -> bool:
+        self.created.append(args)
+        return True
+
+
+@pytest.mark.parametrize(
+    ("settings", "listed", "lease_ms"),
+    [
+        # Not made yet: the shortest lease, so a touch every ~833 ms.
+        ({}, _listing(), 5_000),
+        ({}, _listing(("other", 600_000)), 5_000),
+        # Listed: its own lease.
+        ({}, _listing(("g", 600_000)), 600_000),
+        # Created by this worker: what it asked for, or the server's default.
+        ({"ack_timeout_ms": 60_000}, _listing(), 60_000),
+        ({"max_deliver": 3}, _listing(), 30_000),
+    ],
+)
+async def test_auto_touch_paces_by_the_groups_lease_or_the_shortest_until_known(
+    settings: dict[str, int], listed: bytes, lease_ms: int
+) -> None:
+    from flo.worker import _touch_pace
+
+    worker = FloClient("127.0.0.1:1").new_stream_worker(
+        stream="s", group="g", handler=_noop, auto_touch=True, **settings
+    )
+    assert worker._touch_lease_ms() == settings.get("ack_timeout_ms", 5_000)
+    worker._ack_client = _Lister(listed)  # type: ignore[assignment]
+    await worker._setup_group()
+    assert worker._touch_lease_ms() == lease_ms
+    assert _touch_pace(5_000) == pytest.approx(5 / 6)
+
+
+async def test_a_worker_learns_the_lease_once_its_first_read_makes_the_group() -> None:
+    worker = FloClient("127.0.0.1:1").new_stream_worker(
+        stream="s", group="g", handler=_noop, auto_touch=True
+    )
+    lister = _Lister(_listing())
+    worker._ack_client = lister  # type: ignore[assignment]
+    await worker._setup_group()
+    assert worker._lease_ms is None
+    from flo.kv_body import decode_group_list_answer
+
+    lister.listed = decode_group_list_answer(_listing(("g", 20_000)))
+    await worker._learn_lease(lister)  # type: ignore[arg-type]
+    assert worker._touch_lease_ms() == 20_000
+
+
+async def _noop(_ctx: object) -> None:
+    return None

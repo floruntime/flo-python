@@ -63,7 +63,7 @@ from .types import (
     WorkerStatus,
     WorkerType,
 )
-from .wire import MAX_GROUP_BATCH, MAX_GROUP_NACK_ERROR, _validate_block_ms
+from .wire import MAX_GROUP_BATCH, MAX_GROUP_NACK_ERROR, MIN_GROUP_LEASE_MS, _validate_block_ms
 
 logger = logging.getLogger("flo.worker")
 
@@ -1326,7 +1326,7 @@ class ActionWorker(_RegisteredWorker):
 # Return normally to auto-ack, raise to auto-nack.
 StreamRecordHandler = Callable[["StreamContext"], Awaitable[None]]
 
-# A group's lease when nothing says otherwise: the server's default.
+# A group's lease when it was created without one: the server's default.
 _DEFAULT_GROUP_LEASE_MS = 30_000
 
 
@@ -1352,8 +1352,9 @@ class StreamWorkerOptions:
     ack_timeout_ms: int | None = None
     max_deliver: int | None = None
     # Touch each record every sixth of the group's lease while its handler
-    # runs, so a long handler isn't redelivered elsewhere. A hold is capped at
-    # 12 h from the read whatever the touches.
+    # runs, so a long handler isn't redelivered elsewhere. Until the lease is
+    # known (the group isn't made yet), every sixth of the shortest lease, 5 s.
+    # A hold is capped at 12 h from the read whatever the touches.
     auto_touch: bool = False
 
     def __post_init__(self) -> None:
@@ -1484,8 +1485,8 @@ class StreamWorker(_RegisteredWorker):
         self._tasks = set()
         self._semaphore: asyncio.Semaphore | None = None
         self._running_handlers = 0
-        # The group's lease, which auto_touch paces by.
-        self._lease_ms = ack_timeout_ms or _DEFAULT_GROUP_LEASE_MS
+        # The group's lease, which auto_touch paces by; None until known.
+        self._lease_ms: int | None = ack_timeout_ms
 
     @staticmethod
     def _generate_consumer_id() -> str:
@@ -1595,12 +1596,26 @@ class StreamWorker(_RegisteredWorker):
                     ack_timeout_ms=cfg.ack_timeout_ms, max_deliver=cfg.max_deliver
                 ),
             )
-        if cfg.auto_touch and cfg.ack_timeout_ms is None:
-            listed = await client.stream.group_list(cfg.stream)
-            for g in listed.groups:
-                if g.name == cfg.group:
-                    self._lease_ms = g.ack_timeout_ms
-                    break
+            # Made, or there with the same settings: the server's default
+            # lease when none was given.
+            self._lease_ms = cfg.ack_timeout_ms or _DEFAULT_GROUP_LEASE_MS
+        elif cfg.auto_touch:
+            await self._learn_lease(client)
+
+    async def _learn_lease(self, client: FloClient) -> None:
+        """The group's lease, from its listing; left unknown while it has
+        none (the group isn't made yet)."""
+        listed = await client.stream.group_list(self.config.stream)
+        for g in listed.groups:
+            if g.name == self.config.group:
+                self._lease_ms = g.ack_timeout_ms
+                return
+
+    def _touch_lease_ms(self) -> int:
+        """The lease auto_touch paces by: the group's, or until that is known
+        the shortest a group may have, so no group's lease runs out between
+        touches."""
+        return self._lease_ms if self._lease_ms is not None else MIN_GROUP_LEASE_MS
 
     @property
     def _worker_id(self) -> str:
@@ -1677,9 +1692,19 @@ class StreamWorker(_RegisteredWorker):
                 held = False
                 self._semaphore.release()
 
+                arrived = loop.time()
+                if self.config.auto_touch and self._lease_ms is None:
+                    # The read made the group if no one had: learn its lease
+                    # once. Until then touches pace by the shortest lease.
+                    assert self._ack_client is not None
+                    try:
+                        await self._learn_lease(self._ack_client)
+                    except Exception as e:
+                        logger.debug(f"Group lease not read yet: {e!r}")
+
                 # A drain handles the whole batch, already delivered here; a
                 # stop hands back what it hasn't started.
-                await self._dispatch(result, loop.time())
+                await self._dispatch(result, arrived)
                 if self._stop_event.is_set():
                     return
 
@@ -1844,7 +1869,7 @@ class StreamWorker(_RegisteredWorker):
                 return False
             return True
 
-        await _touch_loop(_touch_pace(self._lease_ms), arrived, stop, touch)
+        await _touch_loop(_touch_pace(self._touch_lease_ms()), arrived, stop, touch)
 
     async def _process_record(
         self, delivery: GroupReadResult, record: GroupRecord, arrived: float
