@@ -6,12 +6,14 @@ import asyncio
 import logging
 import struct
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
 from flo import FloClient, RetryPolicy
 from flo import retry as retry_mod
 from flo.exceptions import (
+    BadRequestError,
     ConflictError,
     IncompleteResponseError,
     LimitError,
@@ -429,3 +431,52 @@ async def _until_true(cond: Callable[[], bool], timeout: float) -> None:
         if asyncio.get_running_loop().time() > deadline:
             raise AssertionError("condition not met in time")
         await asyncio.sleep(0.01)
+
+
+def _bad_request(request_id: int) -> bytes:
+    body = int(Reason.FIELD_TOO_LONG).to_bytes(2, "little") + bytes([int(Ran.NO)]) + b"bad"
+    return _frame(request_id, StatusCode.BAD_REQUEST, body)
+
+
+@pytest.mark.parametrize(
+    "refused_op", [OpCode.ACTION_REGISTER, OpCode.WORKER_REGISTER, OpCode.STREAM_GROUP_CREATE]
+)
+async def test_start_fails_on_a_terminal_refusal_after_one_request(refused_op: int) -> None:
+    # Only a halted shard or a retryable refusal that didn't run is waited
+    # out at start; any other refusal is the caller's to see.
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        if op == refused_op:
+            return _bad_request(rid)
+        if op == OpCode.STREAM_GROUP_CREATE:
+            return _frame(rid, StatusCode.OK, b"\x01")
+        if op == OpCode.WORKER_HEARTBEAT:
+            return _frame(rid, StatusCode.OK, b"\x00")
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Scripted(reply)
+    server, addr = await fake.serve()
+    client = FloClient(addr, timeout_ms=1000, retry=_FAST)
+    worker: Any
+    if refused_op == OpCode.ACTION_REGISTER:
+        worker = client.new_action_worker(block_ms=100)
+
+        async def done(_ctx: object) -> bytes:
+            return b"done"
+
+        worker.register_action("echo", done)
+    else:
+
+        async def handler(_ctx: object) -> None:
+            return None
+
+        worker = client.new_stream_worker(
+            stream="s", group="g", handler=handler, block_ms=100, ack_timeout_ms=60_000
+        )
+    try:
+        with pytest.raises(BadRequestError) as raised:
+            await asyncio.wait_for(worker.start(), timeout=5)
+    finally:
+        await fake.shut(server)
+    assert raised.value.reason == Reason.FIELD_TOO_LONG
+    assert fake.ops.count(refused_op) == 1
+    assert OpCode.ACTION_AWAIT not in fake.ops and OpCode.STREAM_GROUP_READ not in fake.ops
