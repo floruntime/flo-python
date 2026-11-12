@@ -20,7 +20,7 @@ from flo.worker import ActionContext, ActionWorker, StreamContext, StreamWorker
 
 from .test_result_resend import ACTION, NO_TASK, _task, _until
 from .test_retry import _frame
-from .test_stream_worker_ack import _records
+from .test_stream_worker_ack import REPORT_OK, _records
 
 # How the fake answers the nth poll (await or group read): bytes to send,
 # None for an empty answer after a short wait, or "park" to never answer.
@@ -49,12 +49,9 @@ class Registry:
         poll: Poll,
         hang_up: Callable[[int, int], bool] = lambda op, n: False,
         delay: dict[int, float] | None = None,
-        claim: bytes = b"",
     ):
         self.poll = poll
         self.hang_up = hang_up
-        # The first group claim's records; later claims find none.
-        self.claim = claim
         # Seconds each op's answer is held back.
         self.delay = delay or {}
         self.status: WorkerStatus | None = None
@@ -117,10 +114,11 @@ class Registry:
                     else:
                         writer.write(_frame(request_id, StatusCode.OK, bytes([self.status])))
                         continue
-                elif op == OpCode.STREAM_GROUP_CLAIM:
-                    # Records, then the cursor: all ones once the scan is done.
-                    body = (self.claim if n == 0 else _records(0)) + b"\xff" * 16
-                    writer.write(_frame(request_id, StatusCode.OK, body))
+                elif op in (OpCode.STREAM_GROUP_ACK, OpCode.STREAM_GROUP_NACK):
+                    writer.write(_frame(request_id, StatusCode.OK, REPORT_OK))
+                    continue
+                elif op == OpCode.STREAM_GROUP_CREATE:
+                    writer.write(_frame(request_id, StatusCode.OK, b"\x01"))
                     continue
                 elif op in (OpCode.ACTION_AWAIT, OpCode.STREAM_GROUP_READ):
                     answer = self.poll(n)
@@ -157,7 +155,10 @@ def _action_worker(
 
 
 def _stream_worker(
-    endpoint: str, handler: Callable[[StreamContext], Any] | None = None, concurrency: int = 2
+    endpoint: str,
+    handler: Callable[[StreamContext], Any] | None = None,
+    concurrency: int = 2,
+    ack_timeout_ms: int | None = None,
 ) -> StreamWorker:
     client = FloClient(endpoint, retry=RetryPolicy(max_attempts=1))
 
@@ -171,7 +172,7 @@ def _stream_worker(
         handler=run,
         block_ms=30000,
         concurrency=concurrency,
-        redeliver_pending_on_reconnect=False,
+        ack_timeout_ms=ack_timeout_ms,
     )
 
 
@@ -395,11 +396,10 @@ async def test_a_stream_worker_registers_heartbeats_and_deregisters() -> None:
     name_len = struct.unpack_from("<H", value, 7)[0]
     assert value[9 : 9 + name_len] == b"s/g"
     assert value[9 + name_len] == 1  # a stream consumer
-    ops = reg.ops()
-    assert ops[-2:] == [OpCode.STREAM_GROUP_LEAVE, OpCode.WORKER_DEREGISTER]
+    assert reg.ops()[-1] == OpCode.WORKER_DEREGISTER
 
 
-async def test_a_stream_drain_finishes_its_records_then_leaves_the_group() -> None:
+async def test_a_stream_drain_finishes_its_records_then_deregisters() -> None:
     reg = Registry(lambda n: _records(1) if n == 0 else "park")
     started, finished = asyncio.Event(), asyncio.Event()
     worker = _stream_worker(await reg.listen(), _held(0.4, started, finished))
@@ -415,7 +415,7 @@ async def test_a_stream_drain_finishes_its_records_then_leaves_the_group() -> No
     drain, ack = ops.index(OpCode.WORKER_DRAIN), ops.index(OpCode.STREAM_GROUP_ACK)
     assert drain < ack
     assert ops[drain:ack].count(OpCode.WORKER_HEARTBEAT) >= 3
-    assert ops[-2:] == [OpCode.STREAM_GROUP_LEAVE, OpCode.WORKER_DEREGISTER]
+    assert ops[-1] == OpCode.WORKER_DEREGISTER
 
 
 async def test_a_draining_heartbeat_drains_a_stream_worker() -> None:
@@ -446,12 +446,17 @@ async def test_a_stream_stop_hands_back_the_records_it_has_not_started() -> None
         await reg.close()
     assert len(reg.of(OpCode.STREAM_GROUP_ACK)) == 1
     (nack,) = reg.of(OpCode.STREAM_GROUP_NACK)
-    # [group_len:u16][group][consumer_len:u16][consumer][count:u32][ts:u64][seq:u64]*
+    # [group_len:u16][group][consumer_len:u16][consumer][term:u64][index:u64]
+    # [count:u32]([ts:u64][seq:u64][deliveries:u32])*: the read's delivery.
     value = _value(nack)
     group_len = struct.unpack_from("<H", value)[0]
     consumer_len = struct.unpack_from("<H", value, 2 + group_len)[0]
-    count = struct.unpack_from("<I", value, 4 + group_len + consumer_len)[0]
-    assert count == 2
+    at = 4 + group_len + consumer_len
+    assert struct.unpack_from("<QQI", value, at) == (3, 40, 2)
+    assert [struct.unpack_from("<QQI", value, at + 20 + 20 * i) for i in range(2)] == [
+        (1000, 2, 1),
+        (1000, 3, 1),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -565,13 +570,13 @@ async def test_a_heartbeat_answer_that_isnt_one_known_status_byte_is_refused(ans
         server.close()
 
 
-@pytest.mark.parametrize("op", [OpCode.WORKER_REGISTER, OpCode.STREAM_GROUP_JOIN])
+@pytest.mark.parametrize("op", [OpCode.WORKER_REGISTER, OpCode.STREAM_GROUP_CREATE])
 @pytest.mark.parametrize("end", ["stop", "drain"])
 async def test_a_stream_stop_or_drain_while_a_startup_request_is_out_ends_the_run_cleanly(
     op: int, end: str
 ) -> None:
     reg = Registry(lambda n: "park", delay={op: 0.3})
-    worker = _stream_worker(await reg.listen())
+    worker = _stream_worker(await reg.listen(), ack_timeout_ms=60_000)
     run = asyncio.create_task(worker.start())
     try:
         await _until(lambda: op in reg.ops())
@@ -580,44 +585,6 @@ async def test_a_stream_stop_or_drain_while_a_startup_request_is_out_ends_the_ru
     finally:
         await reg.close()
     assert OpCode.STREAM_GROUP_READ not in reg.ops()
-
-
-async def test_a_drain_during_pending_redelivery_handles_every_claimed_record() -> None:
-    # The first read loses its connection; the reconnect claims three pending
-    # records, handled one at a time.
-    reg = Registry(
-        lambda n: "park",
-        hang_up=lambda op, n: op == OpCode.STREAM_GROUP_READ and n == 0,
-        claim=_records(3),
-    )
-    started = asyncio.Event()
-    handled = 0
-
-    async def slow(ctx: StreamContext) -> None:
-        nonlocal handled
-        started.set()
-        await asyncio.sleep(0.2)
-        handled += 1
-
-    client = FloClient(await reg.listen(), retry=RetryPolicy(max_attempts=1))
-    worker = client.new_stream_worker(
-        stream="s",
-        group="g",
-        handler=slow,
-        block_ms=30000,
-        concurrency=1,
-        redeliver_pending_on_reconnect=True,
-    )
-    run = asyncio.create_task(worker.start())
-    try:
-        await asyncio.wait_for(started.wait(), 5)
-        worker.drain()
-        await asyncio.wait_for(run, 5)
-    finally:
-        await reg.close()
-    assert handled == 3
-    assert len(reg.of(OpCode.STREAM_GROUP_ACK)) == 3
-    assert reg.of(OpCode.STREAM_GROUP_NACK) == []
 
 
 async def test_cancel_outlasts_a_task_that_swallows_the_first_cancel() -> None:

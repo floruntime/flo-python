@@ -79,7 +79,7 @@ async def test_a_failed_dispatch_keeps_the_stream_workers_concurrency_cap() -> N
     free_slots: list[int] = []
     dispatches = 0
 
-    async def dispatch(_records: object) -> None:
+    async def dispatch(_records: object, _arrived: float) -> None:
         nonlocal dispatches
         dispatches += 1
         assert worker._semaphore is not None

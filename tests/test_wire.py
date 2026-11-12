@@ -27,8 +27,7 @@ from flo.wire import (
     parse_pending_entries,
     parse_response,
     serialize_action_invoke_value,
-    serialize_group_claim_value,
-    serialize_group_pending_value,
+    serialize_group_value,
     serialize_request,
 )
 
@@ -170,7 +169,7 @@ class TestSerializeRequest:
         assert request_id == 42
         assert op_code == OpCode.KV_GET
         assert flags == 0
-        assert table_hash == 0x19075DF8E1ED5F75
+        assert table_hash == 0xC688167B51FCC846
 
     def test_table_op_payload_is_namespace_key_body(self) -> None:
         request = serialize_request(
@@ -347,42 +346,24 @@ class TestBuildStreamBatchValue:
         assert struct.unpack("<H", value[13:15])[0] == 1
 
 
-class TestGroupPendingClaimWire:
-    """Tests for the consumer-group pending-list (PEL) pending/claim wire format."""
+class TestGroupPendingWire:
+    """A group pending request names the group, and a consumer only to filter."""
 
     def test_serialize_group_pending_no_consumer(self) -> None:
-        value = serialize_group_pending_value("grp")
+        value = serialize_group_value("grp")
         # [group_len:u16][group] only — no consumer trailer.
-        assert struct.unpack("<H", value[0:2])[0] == 3
-        assert value[2:5] == b"grp"
-        assert len(value) == 5
+        assert value == struct.pack("<H", 3) + b"grp"
 
     def test_serialize_group_pending_with_consumer(self) -> None:
-        value = serialize_group_pending_value("grp", "cons")
-        assert struct.unpack("<H", value[0:2])[0] == 3
-        assert value[2:5] == b"grp"
-        assert struct.unpack("<H", value[5:7])[0] == 4
-        assert value[7:11] == b"cons"
+        value = serialize_group_value("grp", "cons")
+        assert value == struct.pack("<H", 3) + b"grp" + struct.pack("<H", 4) + b"cons"
 
-    def test_serialize_group_claim_value(self) -> None:
-        sid = StreamID(timestamp_ms=111, sequence=5)
-        value = serialize_group_claim_value("grp", "cons", 2000, sid, 50)
-        pos = 0
-        assert struct.unpack("<H", value[pos : pos + 2])[0] == 3
-        pos += 2
-        assert value[pos : pos + 3] == b"grp"
-        pos += 3
-        assert struct.unpack("<H", value[pos : pos + 2])[0] == 4
-        pos += 2
-        assert value[pos : pos + 4] == b"cons"
-        pos += 4
-        assert struct.unpack("<I", value[pos : pos + 4])[0] == 2000
-        pos += 4
-        assert struct.unpack("<Q", value[pos : pos + 8])[0] == 111
-        pos += 8
-        assert struct.unpack("<Q", value[pos : pos + 8])[0] == 5
-        pos += 8
-        assert struct.unpack("<I", value[pos : pos + 4])[0] == 50
+    def test_a_group_name_past_256_bytes_is_refused_before_sending(self) -> None:
+        serialize_group_value("g" * 256)
+        with pytest.raises(ValidationError):
+            serialize_group_value("g" * 257)
+        with pytest.raises(ValidationError):
+            serialize_group_value("")
 
     def test_parse_pending_entries(self) -> None:
         blob = (
@@ -407,7 +388,6 @@ class TestGroupPendingClaimWire:
         assert entries[1].delivery_count == 1
 
     def test_parse_pending_entries_empty(self) -> None:
-        assert parse_pending_entries(b"") == []
         assert parse_pending_entries(struct.pack("<I", 0)) == []
 
 

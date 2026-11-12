@@ -73,7 +73,7 @@ async def test_expire_sends_ms_and_zero_clears(sent: tuple[FloClient, list[Call]
 
 async def test_txn_put_and_expire_send_ms(sent: tuple[FloClient, list[Call]]) -> None:
     client, calls = sent
-    txn = Transaction(client, "default", "k", txn_id=7, pinned_hash=0)
+    txn = Transaction(client, "default", txn_id=7, pinned_hash=0)
     await txn.put("k", b"v", PutOptions(ttl_ms=2500))
     await txn.expire("k", 2500)
     assert set_ttl(calls[0][3]) == b"\x01" + struct.pack("<Q", 2500)

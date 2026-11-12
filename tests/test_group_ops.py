@@ -1,0 +1,621 @@
+"""Consumer groups on the delivery model: bodies and answers byte for byte
+against the server's group handler, stale reports answered per record, and
+KV's keys_not_colocated refusal. Client paths run against an in-process fake
+server."""
+
+import asyncio
+import logging
+import struct
+
+import pytest
+
+from flo import (
+    FloClient,
+    GroupReadResult,
+    GroupRecord,
+    GroupRefusal,
+    GroupReportResult,
+    RetryPolicy,
+    StreamGroupCreateOptions,
+    StreamGroupNackOptions,
+    StreamGroupReadOptions,
+)
+from flo.exceptions import BadRequestError, IncompleteResponseError, ValidationError
+from flo.types import OpCode, OptionTag, QueueRefusalReason, Ran, Reason, StatusCode, StreamID
+from flo.wire import (
+    OptionsIterator,
+    parse_group_info_response,
+    parse_group_read_response,
+    parse_group_report_response,
+    parse_group_touch_response,
+    serialize_group_report_value,
+)
+
+from .test_queue_ops import _Recording
+from .test_result_resend import _str16, _until
+from .test_retry import _frame
+from .test_stream_worker_ack import REPORT_OK, _records
+
+_FAST = RetryPolicy(max_attempts=1)
+
+
+def _rec(ms: int, seq: int, deliveries: int) -> GroupRecord:
+    return GroupRecord(id=StreamID(timestamp_ms=ms, sequence=seq), deliveries=deliveries)
+
+
+def _refused(*records: tuple[int, int, QueueRefusalReason]) -> bytes:
+    return struct.pack("<I", len(records)) + b"".join(
+        struct.pack("<QQB", ms, seq, why) for ms, seq, why in records
+    )
+
+
+def _value_and_options(payload: bytes) -> tuple[bytes, bytes]:
+    """A request's [ns][key][value_len:u32][value][options_len:u16][options]."""
+    at = 2 + int.from_bytes(payload[0:2], "little")
+    at += 2 + int.from_bytes(payload[at : at + 2], "little")
+    n = int.from_bytes(payload[at : at + 4], "little")
+    value = payload[at + 4 : at + 4 + n]
+    return value, payload[at + 4 + n + 2 :]
+
+
+# ── Bodies and answers ──────────────────────────────────────────────────────
+
+
+def test_a_report_names_the_consumer_delivery_and_each_records_deliveries() -> None:
+    delivery = GroupReadResult(
+        records=[_rec(1000, 1, 1), _rec(1000, 2, 3)], term=3, index=40, consumer="c1"
+    )
+    value = serialize_group_report_value("g", delivery, None)
+    assert value == (
+        _str16("g")
+        + _str16("c1")
+        + struct.pack("<QQI", 3, 40, 2)
+        + struct.pack("<QQI", 1000, 1, 1)
+        + struct.pack("<QQI", 1000, 2, 3)
+    )
+    # Some of the read's records only.
+    one = serialize_group_report_value("g", delivery, delivery.records[1:])
+    assert one.endswith(struct.pack("<QQI", 3, 40, 1) + struct.pack("<QQI", 1000, 2, 3))
+    with pytest.raises(ValidationError):
+        serialize_group_report_value("g", delivery, [])
+    with pytest.raises(ValidationError):
+        serialize_group_report_value("g", delivery, [_rec(1, i, 1) for i in range(101)])
+
+
+def test_a_group_read_answer_decodes_its_token_and_each_records_deliveries() -> None:
+    got = parse_group_read_response(_records(2, term=7, index=99, deliveries=2), "c1")
+    assert (got.term, got.index, got.expires_at_ms, got.consumer) == (7, 99, 9_000_000, "c1")
+    assert [(r.id, r.payload, r.deliveries) for r in got.records] == [
+        (StreamID(1000, 1), b"hello", 2),
+        (StreamID(1000, 2), b"hello", 2),
+    ]
+    # Nothing read: the fixed part, all zero.
+    empty = parse_group_read_response(bytes(28), "c1")
+    assert (empty.records, empty.expires_at_ms) == ([], 0)
+    for cut in (_records(1)[:-1], _records(1) + b"\x00", bytes(27)):
+        with pytest.raises(IncompleteResponseError):
+            parse_group_read_response(cut, "c1")
+
+
+def test_report_and_touch_answers_carry_each_refused_record_and_why() -> None:
+    answer = struct.pack("<I", 1) + _refused(
+        (1000, 2, QueueRefusalReason.DELIVERED_AGAIN), (1000, 3, QueueRefusalReason.GONE)
+    )
+    got = parse_group_report_response("stream group ack", answer)
+    assert got == GroupReportResult(
+        applied=1,
+        refused=[
+            GroupRefusal(id=StreamID(1000, 2), why=QueueRefusalReason.DELIVERED_AGAIN),
+            GroupRefusal(id=StreamID(1000, 3), why=QueueRefusalReason.GONE),
+        ],
+    )
+    # GONE is done; the other went to another delivery.
+    assert [r.id for r in got.lost] == [StreamID(1000, 2)]
+    touch = parse_group_touch_response(
+        struct.pack("<qI", 123_456, 0) + _refused((1, 1, QueueRefusalReason.EXPIRED))
+    )
+    assert (touch.expires_at_ms, touch.applied) == (123_456, 0)
+    assert touch.refused[0].why == QueueRefusalReason.EXPIRED
+    with pytest.raises(IncompleteResponseError):
+        parse_group_report_response("stream group ack", struct.pack("<II", 0, 1) + bytes(16))
+    with pytest.raises(IncompleteResponseError):
+        # why 9 is no refusal the server sends
+        parse_group_report_response(
+            "stream group ack", struct.pack("<II", 0, 1) + struct.pack("<QQB", 1, 1, 9)
+        )
+
+
+def test_a_group_info_answer_decodes_its_counts() -> None:
+    info = parse_group_info_response(struct.pack("<QIQQQQQ", 5, 2, 77, 3, 2, 1, 4))
+    assert (info.pending, info.holders, info.created_at_ns) == (5, 2, 77)
+    assert (info.ready, info.leased, info.dead, info.trimmed_pending) == (3, 2, 1, 4)
+
+
+async def test_group_settings_and_names_out_of_bounds_are_refused_before_sending() -> None:
+    client = FloClient("127.0.0.1:1")
+    refused = [
+        client.stream.group_create("s", "g", StreamGroupCreateOptions(ack_timeout_ms=4999)),
+        client.stream.group_create("s", "g", StreamGroupCreateOptions(ack_timeout_ms=43_200_001)),
+        client.stream.group_create("s", "g", StreamGroupCreateOptions(max_deliver=0)),
+        client.stream.group_create("s", "g" * 257),
+        client.stream.group_read("s", "g", "c", StreamGroupReadOptions(count=101)),
+        client.stream.group_read("s", "g", "c", StreamGroupReadOptions(count=0)),
+    ]
+    delivery = GroupReadResult(records=[_rec(1, 1, 1)], term=1, index=1, consumer="c")
+    refused += [
+        client.stream.group_nack("s", "g", delivery, None, StreamGroupNackOptions(error="x" * 256)),
+        client.stream.group_nack(
+            "s", "g", delivery, None, StreamGroupNackOptions(delay_ms=86_400_001)
+        ),
+    ]
+    for call in refused:
+        with pytest.raises(ValidationError):
+            await call
+
+
+# ── Through the client ─────────────────────────────────────────────────────
+
+
+async def test_a_consumer_reads_acks_nacks_and_touches_by_its_delivery() -> None:
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        if op == OpCode.STREAM_GROUP_CREATE:
+            return _frame(rid, StatusCode.OK, b"\x01")
+        if op == OpCode.STREAM_GROUP_READ:
+            return _frame(rid, StatusCode.OK, _records(2, term=3, index=40))
+        if op == OpCode.STREAM_GROUP_TOUCH:
+            return _frame(rid, StatusCode.OK, struct.pack("<qI", 5_000, 2) + _refused())
+        return _frame(rid, StatusCode.OK, REPORT_OK)
+
+    fake = _Recording(reply)
+    server, addr = await fake.serve()
+    client = await FloClient(addr, namespace="ns", timeout_ms=1000, retry=_FAST).connect()
+    try:
+        created = await client.stream.group_create(
+            "s", "g", StreamGroupCreateOptions(ack_timeout_ms=60_000, max_deliver=3)
+        )
+        got = await client.stream.group_read("s", "g", "c1", StreamGroupReadOptions(count=2))
+        touched = await client.stream.group_touch("s", "g", got)
+        acked = await client.stream.group_ack("s", "g", got, got.records[:1])
+        await client.stream.group_nack(
+            "s", "g", got, got.records[1:], StreamGroupNackOptions(delay_ms=500, error="boom")
+        )
+    finally:
+        await client.close()
+        await fake.shut(server)
+    assert created is True and touched.expires_at_ms == 5_000 and acked.applied == 1
+    ops = [op for op, _ in fake.payloads]
+    assert ops == [
+        OpCode.STREAM_GROUP_CREATE,
+        OpCode.STREAM_GROUP_READ,
+        OpCode.STREAM_GROUP_TOUCH,
+        OpCode.STREAM_GROUP_ACK,
+        OpCode.STREAM_GROUP_NACK,
+    ]
+    (_, create), (_, read), (_, touch), (_, ack), (_, nack) = fake.payloads
+    value, options = _value_and_options(create)
+    assert value == _str16("g")
+    opts = {o.tag: o.data for o in OptionsIterator(options)}
+    assert opts == {
+        OptionTag.ACK_TIMEOUT_MS: struct.pack("<I", 60_000),
+        OptionTag.MAX_DELIVER: b"\x03",
+    }
+    value, options = _value_and_options(read)
+    assert value == _str16("g") + _str16("c1")
+    assert {o.tag: o.data for o in OptionsIterator(options)} == {
+        OptionTag.COUNT: struct.pack("<I", 2)
+    }
+    head = _str16("g") + _str16("c1")
+    assert _value_and_options(touch)[0] == head + struct.pack("<QQI", 3, 40, 2) + struct.pack(
+        "<QQIQQI", 1000, 1, 1, 1000, 2, 1
+    )
+    assert _value_and_options(ack)[0] == head + struct.pack("<QQIQQI", 3, 40, 1, 1000, 1, 1)
+    value, options = _value_and_options(nack)
+    assert value == head + struct.pack("<QQIQQI", 3, 40, 1, 1000, 2, 1)
+    assert {o.tag: o.data for o in OptionsIterator(options)} == {
+        OptionTag.DELAY_MS: struct.pack("<Q", 500),
+        OptionTag.ERROR_TEXT: b"boom",
+    }
+
+
+async def test_a_stale_group_report_succeeds_and_names_each_record_it_skipped() -> None:
+    # The server answers a stale ack ok, applying nothing to those records
+    # and saying why: the call itself doesn't raise.
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        if op == OpCode.STREAM_GROUP_READ:
+            return _frame(rid, StatusCode.OK, _records(2))
+        return _frame(
+            rid,
+            StatusCode.OK,
+            struct.pack("<I", 0)
+            + _refused(
+                (1000, 1, QueueRefusalReason.EXPIRED), (1000, 2, QueueRefusalReason.OTHER_HOLDER)
+            ),
+        )
+
+    fake = _Recording(reply)
+    server, addr = await fake.serve()
+    client = await FloClient(addr, timeout_ms=1000, retry=_FAST).connect()
+    try:
+        got = await client.stream.group_read("s", "g", "c1")
+        result = await client.stream.group_ack("s", "g", got)
+    finally:
+        await client.close()
+        await fake.shut(server)
+    assert result.applied == 0
+    assert [(r.id.sequence, r.why) for r in result.lost] == [
+        (1, QueueRefusalReason.EXPIRED),
+        (2, QueueRefusalReason.OTHER_HOLDER),
+    ]
+
+
+async def test_a_stream_worker_logs_a_stale_ack_and_keeps_going(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    reads = 0
+
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        nonlocal reads
+        if op == OpCode.STREAM_GROUP_READ:
+            reads += 1
+            return _frame(rid, StatusCode.OK, _records(1)) if reads == 1 else b""
+        if op == OpCode.STREAM_GROUP_ACK:
+            return _frame(
+                rid,
+                StatusCode.OK,
+                struct.pack("<I", 0) + _refused((1000, 1, QueueRefusalReason.DELIVERED_AGAIN)),
+            )
+        if op == OpCode.WORKER_HEARTBEAT:
+            return _frame(rid, StatusCode.OK, b"\x00")
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Recording(reply)
+    server, addr = await fake.serve()
+
+    async def handler(_ctx: object) -> None:
+        return None
+
+    worker = FloClient(addr, timeout_ms=1000, retry=_FAST).new_stream_worker(
+        stream="s", group="g", handler=handler, block_ms=30000
+    )
+    caplog.set_level(logging.WARNING, logger="flo")
+    run = asyncio.create_task(worker.start())
+    try:
+        await _until(lambda: OpCode.STREAM_GROUP_ACK in [op for op, _ in fake.payloads], 10)
+        await asyncio.sleep(0.1)
+        assert not run.done()
+    finally:
+        worker.stop()
+        await asyncio.wait_for(run, timeout=10)
+        await fake.shut(server)
+    stale = [r for r in caplog.records if "DELIVERED_AGAIN" in r.getMessage()]
+    assert len(stale) == 1 and stale[0].levelno == logging.WARNING
+    assert OpCode.STREAM_GROUP_NACK not in [op for op, _ in fake.payloads]
+
+
+async def test_a_stream_worker_touches_a_long_record_by_its_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from flo import worker as worker_mod
+
+    # The group isn't listed, so touches pace by the shortest lease, here
+    # 600 ms: a touch every 100 ms, the floor.
+    monkeypatch.setattr(worker_mod, "MIN_GROUP_LEASE_MS", 600)
+    reads = 0
+
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        nonlocal reads
+        if op == OpCode.STREAM_GROUP_READ:
+            reads += 1
+            return _frame(rid, StatusCode.OK, _records(1, term=5, index=6)) if reads == 1 else b""
+        if op == OpCode.STREAM_GROUP_TOUCH:
+            return _frame(rid, StatusCode.OK, struct.pack("<qI", 1, 1) + _refused())
+        if op == OpCode.STREAM_GROUP_ACK:
+            return _frame(rid, StatusCode.OK, REPORT_OK)
+        if op == OpCode.WORKER_HEARTBEAT:
+            return _frame(rid, StatusCode.OK, b"\x00")
+        if op == OpCode.STREAM_GROUP_LIST:
+            return _frame(rid, StatusCode.OK, b"\x00\x00\x00")
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Recording(reply)
+    server, addr = await fake.serve()
+
+    async def slow(_ctx: object) -> None:
+        await asyncio.sleep(0.45)
+
+    worker = FloClient(addr, timeout_ms=1000, retry=_FAST).new_stream_worker(
+        stream="s", group="g", handler=slow, block_ms=30000, auto_touch=True
+    )
+    run = asyncio.create_task(worker.start())
+    try:
+        await _until(lambda: OpCode.STREAM_GROUP_ACK in [op for op, _ in fake.payloads], 10)
+    finally:
+        worker.stop()
+        await asyncio.wait_for(run, timeout=10)
+        await fake.shut(server)
+    touches = [p for op, p in fake.payloads if op == OpCode.STREAM_GROUP_TOUCH]
+    assert 3 <= len(touches) <= 5
+    head = _str16("g") + _str16(worker.config.consumer)
+    assert _value_and_options(touches[0])[0] == head + struct.pack("<QQIQQI", 5, 6, 1, 1000, 1, 1)
+    ops = [op for op, _ in fake.payloads]
+    assert ops.index(OpCode.STREAM_GROUP_ACK) > max(
+        i for i, op in enumerate(ops) if op == OpCode.STREAM_GROUP_TOUCH
+    )
+
+
+# ── KV: keys in a transaction share a {tag} ─────────────────────────────────
+
+
+async def test_a_key_that_routes_elsewhere_in_a_transaction_is_refused_unrun() -> None:
+    message = (
+        b"bad request: this key routes elsewhere than the key the transaction was begun with; "
+        b"give every key in a transaction the same {tag}, e.g. {user:1}:balance"
+    )
+
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        if op == OpCode.KV_BEGIN_TXN:
+            return _frame(rid, StatusCode.OK, struct.pack("<QQ", 9, 1234))
+        body = int(Reason.KEYS_NOT_COLOCATED).to_bytes(2, "little") + bytes([Ran.NO]) + message
+        return _frame(rid, StatusCode.BAD_REQUEST, body)
+
+    fake = _Recording(reply)
+    server, addr = await fake.serve()
+    # A policy that would retry anything retryable: this isn't.
+    client = await FloClient(
+        addr, timeout_ms=1000, retry=RetryPolicy(max_attempts=4, initial_backoff_ms=1)
+    ).connect()
+    try:
+        txn = await client.kv.begin("{t}a")
+        with pytest.raises(BadRequestError) as raised:
+            await txn.put("b", b"x")
+    finally:
+        await client.close()
+        await fake.shut(server)
+    assert (raised.value.reason, raised.value.ran) == (Reason.KEYS_NOT_COLOCATED, Ran.NO)
+    assert "same {tag}" in str(raised.value)
+    assert [op for op, _ in fake.payloads] == [OpCode.KV_BEGIN_TXN, OpCode.KV_PUT]
+
+
+def _listing(*groups: tuple[str, int]) -> bytes:
+    """stream.group.list's answer: each group's row, then more = false."""
+    out = struct.pack("<H", len(groups))
+    for name, lease in groups:
+        out += _str16(name) + struct.pack("<IQqIBQQ", 0, 0, 0, lease, 5, 0, 0)
+    return out + b"\x00"
+
+
+class _Lister:
+    """An ack client whose group list and create answer as given."""
+
+    def __init__(self, listed: bytes) -> None:
+        from flo.kv_body import decode_group_list_answer
+
+        self.listed = decode_group_list_answer(listed)
+        self.stream = self
+        self.created: list[object] = []
+
+    async def group_list(self, _stream: str) -> object:
+        return self.listed
+
+    async def group_create(self, *args: object) -> bool:
+        self.created.append(args)
+        return True
+
+
+@pytest.mark.parametrize(
+    ("settings", "listed", "lease_ms"),
+    [
+        # Not made yet: the shortest lease, so a touch every ~833 ms.
+        ({}, _listing(), 5_000),
+        ({}, _listing(("other", 600_000)), 5_000),
+        # Listed: its own lease.
+        ({}, _listing(("g", 600_000)), 600_000),
+        # Created by this worker: what it asked for, or the server's default.
+        ({"ack_timeout_ms": 60_000}, _listing(), 60_000),
+        ({"max_deliver": 3}, _listing(), 30_000),
+    ],
+)
+async def test_auto_touch_paces_by_the_groups_lease_or_the_shortest_until_known(
+    settings: dict[str, int], listed: bytes, lease_ms: int
+) -> None:
+    from flo.worker import _touch_pace
+
+    worker = FloClient("127.0.0.1:1").new_stream_worker(
+        stream="s", group="g", handler=_noop, auto_touch=True, **settings
+    )
+    assert worker._touch_lease_ms() == settings.get("ack_timeout_ms", 5_000)
+    worker._ack_client = _Lister(listed)  # type: ignore[assignment]
+    await worker._setup_group()
+    assert worker._touch_lease_ms() == lease_ms
+    assert _touch_pace(5_000) == pytest.approx(5 / 6)
+
+
+async def test_a_worker_learns_the_lease_once_its_first_read_makes_the_group() -> None:
+    worker = FloClient("127.0.0.1:1").new_stream_worker(
+        stream="s", group="g", handler=_noop, auto_touch=True
+    )
+    lister = _Lister(_listing())
+    worker._ack_client = lister  # type: ignore[assignment]
+    await worker._setup_group()
+    assert worker._lease_ms is None
+    from flo.kv_body import decode_group_list_answer
+
+    lister.listed = decode_group_list_answer(_listing(("g", 20_000)))
+    await worker._learn_lease(lister)  # type: ignore[arg-type]
+    assert worker._touch_lease_ms() == 20_000
+
+
+async def _noop(_ctx: object) -> None:
+    return None
+
+
+def _touch_records(payload: bytes, consumer: str) -> list[int]:
+    """The sequences a touch names, from its value."""
+    value = _value_and_options(payload)[0]
+    at = len(_str16("g") + _str16(consumer))
+    _term, _index, count = struct.unpack_from("<QQI", value, at)
+    return [struct.unpack_from("<QQI", value, at + 20 + 20 * i)[1] for i in range(count)]
+
+
+async def test_auto_touch_keeps_records_waiting_for_a_slot_from_arrival(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from flo import worker as worker_mod
+
+    # Touch every 100 ms; three records, one slot, 250 ms a handler.
+    monkeypatch.setattr(worker_mod, "MIN_GROUP_LEASE_MS", 600)
+    reads = 0
+
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        nonlocal reads
+        if op == OpCode.STREAM_GROUP_READ:
+            reads += 1
+            return _frame(rid, StatusCode.OK, _records(3)) if reads == 1 else b""
+        if op == OpCode.STREAM_GROUP_TOUCH:
+            return _frame(rid, StatusCode.OK, struct.pack("<qI", 1, 1) + _refused())
+        if op in (OpCode.STREAM_GROUP_ACK, OpCode.STREAM_GROUP_NACK):
+            return _frame(rid, StatusCode.OK, REPORT_OK)
+        if op == OpCode.WORKER_HEARTBEAT:
+            return _frame(rid, StatusCode.OK, b"\x00")
+        if op == OpCode.STREAM_GROUP_LIST:
+            return _frame(rid, StatusCode.OK, b"\x00\x00\x00")
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Recording(reply)
+    server, addr = await fake.serve()
+
+    async def slow(_ctx: object) -> None:
+        await asyncio.sleep(0.25)
+
+    worker = FloClient(addr, timeout_ms=1000, retry=_FAST).new_stream_worker(
+        stream="s", group="g", handler=slow, block_ms=30000, concurrency=1, auto_touch=True
+    )
+    run = asyncio.create_task(worker.start())
+    try:
+        await _until(
+            lambda: [op for op, _ in fake.payloads].count(OpCode.STREAM_GROUP_ACK) == 3, 10
+        )
+    finally:
+        worker.stop()
+        await asyncio.wait_for(run, timeout=10)
+        await fake.shut(server)
+    ops = [op for op, _ in fake.payloads]
+    touched = [
+        _touch_records(p, worker.config.consumer)
+        for op, p in fake.payloads
+        if op == OpCode.STREAM_GROUP_TOUCH
+    ]
+    # The first touch, before any ack, keeps all three: two of them still
+    # wait for the slot.
+    assert touched[0] == [1, 2, 3]
+    assert ops.index(OpCode.STREAM_GROUP_TOUCH) < ops.index(OpCode.STREAM_GROUP_ACK)
+    # Acked records drop out of later touches, in order, until none is left.
+    assert [2, 3] in touched and [3] in touched
+    assert all(t == sorted(t) and t for t in touched)
+    last_ack = max(i for i, op in enumerate(ops) if op == OpCode.STREAM_GROUP_ACK)
+    assert OpCode.STREAM_GROUP_TOUCH not in ops[last_ack:]
+
+
+@pytest.mark.parametrize(
+    ("status", "keeps_touching"),
+    [
+        (StatusCode.UNAVAILABLE, True),
+        (StatusCode.OVERLOADED, True),
+        (StatusCode.CONFLICT, False),
+        (StatusCode.NOT_FOUND, False),
+        (StatusCode.BAD_REQUEST, False),
+    ],
+)
+async def test_auto_touch_retries_transient_refusals_and_stops_on_final_ones(
+    monkeypatch: pytest.MonkeyPatch, status: StatusCode, keeps_touching: bool
+) -> None:
+    from flo import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "MIN_GROUP_LEASE_MS", 600)
+    reads = 0
+
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        nonlocal reads
+        if op == OpCode.STREAM_GROUP_READ:
+            reads += 1
+            return _frame(rid, StatusCode.OK, _records(1)) if reads == 1 else b""
+        if op == OpCode.STREAM_GROUP_TOUCH:
+            body = int(Reason.UNCLASSIFIED).to_bytes(2, "little") + bytes([Ran.NO]) + b"no"
+            return _frame(rid, status, body)
+        if op == OpCode.STREAM_GROUP_ACK:
+            return _frame(rid, StatusCode.OK, REPORT_OK)
+        if op == OpCode.WORKER_HEARTBEAT:
+            return _frame(rid, StatusCode.OK, b"\x00")
+        if op == OpCode.STREAM_GROUP_LIST:
+            return _frame(rid, StatusCode.OK, b"\x00\x00\x00")
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Recording(reply)
+    server, addr = await fake.serve()
+
+    async def slow(_ctx: object) -> None:
+        await asyncio.sleep(0.45)
+
+    worker = FloClient(addr, timeout_ms=1000, retry=_FAST).new_stream_worker(
+        stream="s", group="g", handler=slow, block_ms=30000, auto_touch=True
+    )
+    run = asyncio.create_task(worker.start())
+    try:
+        await _until(lambda: OpCode.STREAM_GROUP_ACK in [op for op, _ in fake.payloads], 10)
+    finally:
+        worker.stop()
+        await asyncio.wait_for(run, timeout=10)
+        await fake.shut(server)
+    touches = [op for op, _ in fake.payloads].count(OpCode.STREAM_GROUP_TOUCH)
+    # A touch every 100 ms over a 450 ms handler: about four.
+    assert touches >= 3 if keeps_touching else touches == 1
+
+
+async def test_auto_touch_recalibrates_from_the_servers_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from flo import worker as worker_mod
+
+    # A 6 s lease: a touch every second. The first touch's answer puts the
+    # lease's end 4 s earlier than the read's did, so only about 1 s of the
+    # half lease is left: the next touch goes at once, not a second later.
+    monkeypatch.setattr(worker_mod, "MIN_GROUP_LEASE_MS", 6_000)
+    read_expiry = 9_000_000
+    reads = 0
+
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        nonlocal reads
+        if op == OpCode.STREAM_GROUP_READ:
+            reads += 1
+            return _frame(rid, StatusCode.OK, _records(1)) if reads == 1 else b""
+        if op == OpCode.STREAM_GROUP_TOUCH:
+            answer = struct.pack("<qI", read_expiry - 4_000, 1) + _refused()
+            return _frame(rid, StatusCode.OK, answer)
+        if op == OpCode.STREAM_GROUP_ACK:
+            return _frame(rid, StatusCode.OK, REPORT_OK)
+        if op == OpCode.WORKER_HEARTBEAT:
+            return _frame(rid, StatusCode.OK, b"\x00")
+        if op == OpCode.STREAM_GROUP_LIST:
+            return _frame(rid, StatusCode.OK, b"\x00\x00\x00")
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Recording(reply)
+    server, addr = await fake.serve()
+
+    async def slow(_ctx: object) -> None:
+        await asyncio.sleep(1.5)
+
+    worker = FloClient(addr, timeout_ms=1000, retry=_FAST).new_stream_worker(
+        stream="s", group="g", handler=slow, block_ms=30000, auto_touch=True
+    )
+    run = asyncio.create_task(worker.start())
+    try:
+        await _until(lambda: OpCode.STREAM_GROUP_ACK in [op for op, _ in fake.payloads], 10)
+    finally:
+        worker.stop()
+        await asyncio.wait_for(run, timeout=10)
+        await fake.shut(server)
+    # One at 1 s by the pace, one 100 ms later by the server's expiry; then
+    # an unmoved expiry puts the pace back in charge (next at 2 s, after the
+    # handler).
+    assert [op for op, _ in fake.payloads].count(OpCode.STREAM_GROUP_TOUCH) == 2

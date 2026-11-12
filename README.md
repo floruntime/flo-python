@@ -116,17 +116,19 @@ while True:
 ### MGet
 
 ```python
-# One entry per key, in order (at most 256 keys of at most 4096 bytes each)
+# One entry per key, in order (at most 256 keys of at most 4096 bytes each).
+# The keys may live on any shards: the server gathers them.
 for e in await client.kv.mget(["user:1", "user:2"]):
     if e.found:
         print(e.key, e.version, e.value)
-
-# Keys all written with one routing key: look them all up on its shard
-# (without it, each key is looked up on its own shard)
-from flo import KVMGetOptions
-
-await client.kv.mget(["user:1:name", "user:1:email"], KVMGetOptions(routing_key="user:1"))
 ```
+
+A key routes by its `{tag}`, the part between its first `{` and the next
+`}`, or by the whole key when it has none. Keys that share a `{tag}`, such as
+`{user:1}:name` and `{user:1}:email`, are stored on the same shard; that is
+what a transaction needs. An empty tag counts: every key holding `{}` routes
+alike. A `{` with no `}` after it isn't a tag, so that key routes by the
+whole key.
 
 ### History
 
@@ -180,14 +182,20 @@ await client.kv.json_del("user:1")  # "$" deletes the key: returns None
 ### Transactions
 
 ```python
-# Every op inside is routed by the transaction's routing key
-async with await client.kv.begin("user:123") as txn:
-    await txn.put("user:123:name", b"Jane")
-    await txn.incr("user:123:visits")
-    await txn.expire("user:123:session", 60_000)
+# Pinned to the {tag} of the key it begins with: every key in it shares it
+async with await client.kv.begin("{user:123}") as txn:
+    await txn.put("{user:123}:name", b"Jane")
+    await txn.incr("{user:123}:visits")
+    await txn.expire("{user:123}:session", 60_000)
     result = await txn.commit()
     print(result.commit_index, result.op_count)
 ```
+
+A transaction runs on the shard that owns the key it begins with, pinned to
+that key's `{tag}`, or to the whole key when it has none. A key in it that
+routes elsewhere is refused with reason `KEYS_NOT_COLOCATED` (a
+`BadRequestError` that didn't run, never retried): give every key in a
+transaction the same `{tag}`.
 
 A transaction holds at most 64 ops and 256 KiB of keys and values by default;
 both are operator settings (`[kv] max_txn_ops`, `[kv] max_txn_bytes`). A
@@ -336,34 +344,62 @@ result = await client.stream.read("events", StreamReadOptions(start=last, block_
 
 ### Consumer Groups
 
-Consumer groups allow multiple consumers to process a stream in parallel, with each record delivered to only one consumer.
+Consumer groups let many consumers work through a stream, each record leased
+to one consumer at a time. A group read leases up to 100 records to its
+consumer: the group's ready records first (those whose lease ran out, or that
+were nacked), then the stream's records it hasn't read yet. Each record stays
+leased until it is acked, nacked, or its lease runs out; one whose lease runs
+out is read again, with `deliveries` one higher, so delivery is at least once.
+A record nacked or expired `max_deliver` times (5 by default) is dead and
+isn't read again.
+
+A group's lease (`ack_timeout_ms`, 5 s to 12 h, 30 s by default) and
+`max_deliver` (1 to 255) are fixed when it is created; the first read of a
+group that doesn't exist creates it at the defaults. A group name is at most
+256 bytes.
 
 ```python
-from flo import StreamGroupReadOptions
+from flo import StreamGroupCreateOptions, StreamGroupNackOptions, StreamGroupReadOptions
 
-# Join a consumer group
-await client.stream.group_join("events", "processors", "worker-1")
-
-# Read from consumer group
-result = await client.stream.group_read("events", "processors", "worker-1")
-for record in result.records:
-    try:
-        process(record.payload)
-        # Acknowledge successful processing
-        await client.stream.group_ack("events", "processors", [record.id])
-    except Exception:
-        # Record will be redelivered to another consumer
-        pass
-
-# With blocking (long polling)
-result = await client.stream.group_read(
-    "events", "processors", "worker-1",
-    StreamGroupReadOptions(count=10, block_ms=30000)
+await client.stream.group_create(
+    "events", "processors", StreamGroupCreateOptions(ack_timeout_ms=60_000, max_deliver=3)
 )
 
-# A stream's groups, and a group's members, as the leader sees them
+got = await client.stream.group_read(
+    "events", "processors", "worker-1", StreamGroupReadOptions(count=10, block_ms=30000)
+)
+done, failed = [], []
+for record in got.records:  # each carries its deliveries, this one included
+    try:
+        process(record.payload)
+        done.append(record)
+    except Exception:
+        failed.append(record)
+
+# Ack, nack and touch name the read's delivery: pass the read's result, and
+# the records (all of the read's when None).
+if done:
+    result = await client.stream.group_ack("events", "processors", got, done)
+if failed:
+    await client.stream.group_nack(
+        "events", "processors", got, failed, StreamGroupNackOptions(delay_ms=1000, error="boom")
+    )
+```
+
+A report the server can't apply to a record (its lease ran out and it was
+read again, another consumer holds it, or it was acked already) still
+succeeds: that record comes back in `result.refused` with why, and
+`result.lost` lists the ones that aren't `GONE` (acked, which is done).
+Resending an ack is safe. A handler that needs longer than the lease calls
+`group_touch` at least every half lease: with half the lease or less left, the
+lease runs a full lease from now, up to 12 h from the read.
+
+```python
+info = await client.stream.group_info("events", "processors")  # ready, leased, dead
+pending = await client.stream.group_pending("events", "processors")  # leased now
 groups = await client.stream.group_list("events")
-members = await client.stream.group_members("events", "processors")
+members = await client.stream.group_members("events", "processors")  # consumers holding records
+await client.stream.group_delete("events", "processors")
 ```
 
 ## Action Operations
@@ -561,7 +597,7 @@ Delivery is at-least-once: a result lost to a dropped connection is resent, and 
 
 Both workers register in the worker registry and heartbeat every 30 s, reporting the handlers they are running. One the server removed after missed heartbeats registers again, with the same options, when its next heartbeat is answered not found.
 
-`worker.drain()` stops taking work and lets the running handlers finish, heartbeats going on; the server is told, so it assigns the worker nothing more, and `start()` returns once the last handler has reported. A drain started on the server does the same. Neither waits out `block_ms`: `drain()` interrupts the worker's own poll connection, so an action worker's held await and a stream worker's held read end at once. A drain started on the server answers an action worker's held await at once, refused as `WORKER_DRAINING`; it doesn't wake a stream worker's held group read, so a stream worker learns of it from its next heartbeat (every 30 s) and only then interrupts its read and leaves. `worker.stop()` ends polling at once, also mid-reconnect or mid-drain; running handlers still finish, and a stream worker hands back the records of its last batch it hasn't started. Either one before or during `start()` ends that run, and a worker can be started again afterwards.
+`worker.drain()` stops taking work and lets the running handlers finish, heartbeats going on; the server is told, so it assigns the worker nothing more, and `start()` returns once the last handler has reported. A drain started on the server does the same. Neither waits out `block_ms`: `drain()` interrupts the worker's own poll connection, so an action worker's held await and a stream worker's held read end at once. A drain started on the server answers an action worker's held await at once, refused as `WORKER_DRAINING`; it doesn't wake a stream worker's held group read, so a stream worker learns of it from its next heartbeat (every 30 s) and only then interrupts its read and leaves. `worker.stop()` ends polling at once, also mid-reconnect or mid-drain; running handlers still finish, and a stream worker hands back (nacks) the records of its last batch it hasn't started; each one handed back spends one of its attempts. Either one before or during `start()` ends that run, and a worker can be started again afterwards.
 
 ### StreamWorker Example
 
@@ -582,11 +618,30 @@ async def run_stream_worker():
             group="processors",
             handler=process_event,
             concurrency=5,
+            ack_timeout_ms=60_000,  # creates the group with this lease
+            auto_touch=True,        # keeps a record while its handler runs
         )
         await worker.start()
 
 asyncio.run(run_stream_worker())
 ```
+
+A stream worker acks each record its handler returns from and nacks each one
+its handler raises on, naming the read's delivery. A record whose handler runs
+past the group's lease is read again elsewhere unless `auto_touch=True`, which
+touches it every sixth of the lease (at least 100 ms apart) counted from when
+its read came in, together with the rest of that read's records not yet acked
+or nacked, those still waiting for a handler slot included. A touch refused as
+overloaded or unavailable, or lost with the connection, is tried again at the
+next interval; one refused as conflict, not found or bad request stops. Each
+touch answer's expiry, as the server places it, can bring the next touch
+forward, so the worker's clock needn't agree with the server's. The worker learns the lease when it creates the group or
+finds it listed; until then (a group its first read makes) it paces by the
+shortest lease a group may have, 5 s. With `ack_timeout_ms` or `max_deliver` set, the worker
+creates the group at start and fails if it exists with other settings; with
+neither, it takes the group as it is. A worker that loses its connection
+reconnects and reads on: the records it held come back once their lease runs
+out.
 
 ## Configuration
 
@@ -655,6 +710,7 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 | `OverloadedError` | Server is overloaded, and the client's retries ran out |
 | `UnavailableError` | No leader, or the shard isn't taking writes or is offline, and the client's retries ran out (the message says why, and whether an operator must act first) |
 | `StaleNotFoundError` | `kv.get` or `kv.json_get` found no key, but a halted or read-blocked shard answered: absent only as of the entry it couldn't apply |
+| `LimitError` | Status `LIMIT` (15): the node is at one of its limits; `reason` says which (`TOO_MANY_ACTIONS`, `MEMORY_BUDGET`, `TOO_MANY_WORKFLOW_DEFINITIONS`, `TOO_MANY_WORKFLOW_RUNS`). It didn't run. Terminal, never retried (see below) |
 | `OutcomePendingError` | The write committed but hasn't applied: its shard halted at or before it (reason `SHARD_HALTED`, ran `UNKNOWN`; the message says whether it applies when the shard resumes). Never retried |
 | `InternalServerError` | Server internal error; not retryable (may mean committed but not applied) |
 | `GenericServerError` | Any other error status, including one this SDK doesn't know (`status_code` carries it) |
@@ -674,9 +730,16 @@ refusal, or one that may have run, comes straight back.
 
 `UnavailableError` with ran `NO` is routine, not a fault: a first read of
 records that left the warm store is answered so while the shard reads them
-back from disk. A group read or claim refused this way claimed and delivered
-nothing, so sending the same one again is safe; the stream worker's read and
-claim loops do so with a backoff, without logging an error.
+back from disk. A group read refused this way leased nothing, so sending the
+same one again is safe; the stream worker's read loop does so with a backoff,
+without logging an error.
+
+A `LimitError` is never retried: the node is at one of its limits
+(today, registering past the 10,000 actions a shard holds), and retrying won't
+clear it. It isn't permanent either: deleting something, giving the node more
+room, or raising the setting does. For a worker, start() fails with the limit error; a limit hit while running is logged and backed off.
+The poll and touch loops log it once per reason, at error, and back off (up
+to 30 s) until it clears.
 
 Two refusals from a halted shard are never retried, and come back after one
 attempt for the caller to decide:
@@ -715,17 +778,17 @@ routes it afresh. Other calls on the client are not held up by the wait.
 The action and stream workers use their client's policy, and wait the same way
 between failed polls, from 100 ms up to 5 s, starting again from 100 ms after a
 poll that succeeds; `stop()` cuts the wait short. A stream worker retries a
-group join refused this way instead of stopping.
+group create refused this way instead of stopping.
 
 Workers are the exception to the halted-shard rule: registering, polling and
-joining a group are safe to repeat, so on `SHARD_HALTED` either worker's
-registration at start and poll, and a stream worker's group join, keep
+creating a group are safe to repeat, so on `SHARD_HALTED` either worker's
+registration at start and poll, and a stream worker's group create, keep
 trying, waiting from 100 ms up to 30 s, logging each refusal at
 warning with the server's message. A worker started during a halt comes up,
 and one running through it resumes, by itself once the shard is repaired; no
 restart is needed. They wait only on a write the shard refused without running it
 (`UNAVAILABLE`, ran `NO`); an `OutcomePendingError` (an action registration or
-group join that committed but hasn't applied) ends `start()` after one try,
+group create that committed but hasn't applied) ends `start()` after one try,
 with the server's message, since sending it again could halt the shard again.
 Results and acks the shard refuses are not resent.
 

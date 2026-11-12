@@ -7,26 +7,30 @@ Uses StreamID-native positioning (timestamp_ms + sequence).
 import struct
 from typing import TYPE_CHECKING
 
+from .exceptions import IncompleteResponseError, ValidationError
 from .kv_body import (
     decode_group_list_answer,
     decode_group_members_answer,
     encode_group_members_body,
 )
 from .types import (
+    GroupReadResult,
+    GroupRecord,
+    GroupReportResult,
+    GroupTouchResult,
     OpCode,
     OptionTag,
     PendingEntry,
     StreamAppendOptions,
     StreamAppendResult,
-    StreamClaimResult,
     StreamDeleteOptions,
     StreamGroupAckOptions,
-    StreamGroupJoinOptions,
+    StreamGroupCreateOptions,
+    StreamGroupInfo,
     StreamGroupListResult,
     StreamGroupMembersResult,
     StreamGroupNackOptions,
     StreamGroupReadOptions,
-    StreamID,
     StreamInfo,
     StreamInfoOptions,
     StreamReadOptions,
@@ -35,21 +39,24 @@ from .types import (
     StreamTrimResult,
 )
 from .wire import (
+    MAX_GROUP_BATCH,
+    MAX_GROUP_LEASE_MS,
+    MAX_GROUP_NACK_DELAY_MS,
+    MAX_GROUP_NACK_ERROR,
+    MIN_GROUP_LEASE_MS,
     OptionsBuilder,
     build_stream_batch_value,
+    parse_group_info_response,
+    parse_group_read_response,
+    parse_group_report_response,
+    parse_group_touch_response,
     parse_pending_entries,
     parse_stream_append_response,
     parse_stream_info_response,
     parse_stream_read_response,
-    serialize_group_ack_value,
-    serialize_group_claim_value,
-    serialize_group_pending_value,
+    serialize_group_report_value,
     serialize_group_value,
 )
-
-# u64 max sentinel: group_claim returns StreamID.MAX when the PEL is fully
-# scanned (mirrors Go's math.MaxUint64 check).
-_U64_MAX = 0xFFFFFFFFFFFFFFFF
 
 if TYPE_CHECKING:
     from .client import FloClient
@@ -276,65 +283,70 @@ class StreamOperations:
             builder.build(),
         )
 
-    async def group_join(
+    async def group_create(
         self,
         stream: str,
         group: str,
-        consumer: str,
-        options: StreamGroupJoinOptions | None = None,
-    ) -> None:
-        """Join a consumer group.
+        options: StreamGroupCreateOptions | None = None,
+    ) -> bool:
+        """Create a consumer group with its lease (``ack_timeout_ms``) and
+        attempts (``max_deliver``), which can't change once it exists.
 
-        Args:
-            stream: Stream name.
-            group: Consumer group name.
-            consumer: Consumer ID (unique within the group).
-            options: Optional join options.
+        A group read creates a group that doesn't exist yet at the server's
+        defaults (a 30 s lease, 5 attempts); create it first for others.
 
-        Example:
-            await client.stream.group_join("events", "processors", "worker-1")
+        Returns:
+            True if this made the group, False if it existed with the same
+            settings.
+
+        Raises:
+            ConflictError: The group exists with other settings; the message
+                names them.
         """
-        opts = options or StreamGroupJoinOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = serialize_group_value(group, consumer)
-
-        await self._client._send_and_check(
-            OpCode.STREAM_GROUP_JOIN,
-            namespace,
+        opts = options or StreamGroupCreateOptions()
+        builder = OptionsBuilder()
+        if opts.ack_timeout_ms is not None:
+            if not MIN_GROUP_LEASE_MS <= opts.ack_timeout_ms <= MAX_GROUP_LEASE_MS:
+                raise ValidationError(
+                    f"ack_timeout_ms must be {MIN_GROUP_LEASE_MS}..{MAX_GROUP_LEASE_MS}, "
+                    f"got {opts.ack_timeout_ms}"
+                )
+            builder.add_u32(OptionTag.ACK_TIMEOUT_MS, opts.ack_timeout_ms)
+        if opts.max_deliver is not None:
+            if not 1 <= opts.max_deliver <= 255:
+                raise ValidationError(f"max_deliver must be 1..255, got {opts.max_deliver}")
+            builder.add_u8(OptionTag.MAX_DELIVER, opts.max_deliver)
+        response = await self._client._send_and_check(
+            OpCode.STREAM_GROUP_CREATE,
+            self._client.get_namespace(opts.namespace),
             stream.encode("utf-8"),
-            value,
+            serialize_group_value(group),
+            builder.build(),
         )
+        if len(response.data) != 1:
+            raise IncompleteResponseError(
+                f"stream group create answer is {len(response.data)} bytes"
+            )
+        return response.data[0] == 1
 
-    async def group_leave(
-        self,
-        stream: str,
-        group: str,
-        consumer: str,
-        options: StreamGroupJoinOptions | None = None,
-    ) -> None:
-        """Leave a consumer group.
+    async def group_delete(self, stream: str, group: str, namespace: str | None = None) -> int:
+        """Delete a consumer group and every record it holds. Returns how
+        many records it dropped.
 
-        Args:
-            stream: Stream name.
-            group: Consumer group name.
-            consumer: Consumer ID.
-            options: Optional leave options.
-
-        Example:
-            await client.stream.group_leave("events", "processors", "worker-1")
+        Raises:
+            NotFoundError: The stream has no such group.
         """
-        opts = options or StreamGroupJoinOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = serialize_group_value(group, consumer)
-
-        await self._client._send_and_check(
-            OpCode.STREAM_GROUP_LEAVE,
-            namespace,
+        response = await self._client._send_and_check(
+            OpCode.STREAM_GROUP_DELETE,
+            self._client.get_namespace(namespace),
             stream.encode("utf-8"),
-            value,
+            serialize_group_value(group),
         )
+        if len(response.data) != 8:
+            raise IncompleteResponseError(
+                f"stream group delete answer is {len(response.data)} bytes"
+            )
+        return int(struct.unpack("<Q", response.data)[0])
 
     async def group_read(
         self,
@@ -342,241 +354,189 @@ class StreamOperations:
         group: str,
         consumer: str,
         options: StreamGroupReadOptions | None = None,
-    ) -> StreamReadResult:
-        """Read new records from a consumer group, advancing last_delivered_id.
+    ) -> GroupReadResult:
+        """Lease up to ``count`` (1..100) of a group's records to ``consumer``.
 
-        Records are distributed among consumers in the group; each record is
-        delivered to only one consumer and added to that consumer's Pending
-        Entry List (PEL) until acked. Unacknowledged records are redelivered.
+        A read takes the group's ready records first (those whose lease ran
+        out or that were nacked, once any delay passes), then the stream's
+        records past the group's cursor. Each is leased until the group's
+        lease runs out: ack it, nack it, or touch it to keep it. One whose
+        lease runs out is read again with ``deliveries`` one higher, so
+        delivery is at least once. A record nacked or expired ``max_deliver``
+        times (5 by default) is dead and isn't read again.
 
-        Crash recovery: ``group_read`` alone is NOT sufficient. It only returns
-        records past ``last_delivered_id``, so a record delivered-but-unacked at
-        crash time is never re-surfaced by a later ``group_read``. To re-process
-        in-flight work after a reconnect, drain the PEL with :meth:`group_claim`
-        (StreamWorker does this automatically — see
-        ``redeliver_pending_on_reconnect``).
-
-        Args:
-            stream: Stream name.
-            group: Consumer group name.
-            consumer: Consumer ID.
-            options: Optional read options (count, block_ms).
-
-        Returns:
-            StreamReadResult with list of records.
+        The first read of a group that doesn't exist creates it at the
+        server's defaults (a 30 s lease, 5 attempts); see :meth:`group_create`.
 
         Example:
-            result = await client.stream.group_read("events", "processors", "worker-1")
-            for record in result.records:
+            got = await client.stream.group_read("events", "processors", "worker-1")
+            for record in got.records:
                 process(record.payload)
-                await client.stream.group_ack("events", "processors", [record.id])
+            await client.stream.group_ack("events", "processors", got)
         """
         opts = options or StreamGroupReadOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        # Build TLV options
         builder = OptionsBuilder()
-
         if opts.count is not None:
+            if not 1 <= opts.count <= MAX_GROUP_BATCH:
+                raise ValidationError(
+                    f"a group read takes 1..{MAX_GROUP_BATCH} records, got {opts.count}"
+                )
             builder.add_u32(OptionTag.COUNT, opts.count)
-
         if opts.block_ms is not None:
             builder.add_u32(OptionTag.BLOCK_MS, opts.block_ms)
-
-        value = serialize_group_value(group, consumer)
-
         response = await self._client._send_and_check(
             OpCode.STREAM_GROUP_READ,
-            namespace,
+            self._client.get_namespace(opts.namespace),
             stream.encode("utf-8"),
-            value,
+            serialize_group_value(group, consumer),
             builder.build(),
         )
-
-        return parse_stream_read_response(response.data)
-
-    async def group_pending(
-        self,
-        stream: str,
-        group: str,
-        consumer: str = "",
-        options: StreamGroupReadOptions | None = None,
-    ) -> list[PendingEntry]:
-        """List a consumer group's pending (delivered-but-unacked) entries.
-
-        If ``consumer`` is non-empty, only that consumer's entries are returned;
-        otherwise the whole group's PEL is returned.
-
-        Returns:
-            A list of :class:`PendingEntry`.
-        """
-        opts = options or StreamGroupReadOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = serialize_group_pending_value(group, consumer)
-
-        response = await self._client._send_and_check(
-            OpCode.STREAM_GROUP_PENDING,
-            namespace,
-            stream.encode("utf-8"),
-            value,
-        )
-
-        return parse_pending_entries(response.data)
-
-    async def group_claim(
-        self,
-        stream: str,
-        group: str,
-        consumer: str,
-        min_idle_ms: int,
-        start_id: StreamID,
-        count: int,
-        options: StreamGroupReadOptions | None = None,
-    ) -> StreamClaimResult:
-        """Claim a page of a consumer group's pending entries for ``consumer``.
-
-        Scans the PEL in StreamID order from ``start_id`` and takes up to
-        ``count`` entries idle for at least ``min_idle_ms``. Returns the claimed
-        records (payload + headers) plus a cursor for the next page.
-
-        * Drain own pending (reconnect): ``min_idle_ms=0``, ``start_id=StreamID()``.
-        * Steal from idle consumers (rebalance): ``min_idle_ms > 0``.
-
-        Loop until ``result.done`` to fully drain::
-
-            cursor = StreamID()
-            while True:
-                r = await client.stream.group_claim(
-                    stream, group, consumer, 0, cursor, 100)
-                for rec in r.records:
-                    process(rec)
-                if r.done or not r.records:
-                    break
-                cursor = r.next_cursor
-        """
-        opts = options or StreamGroupReadOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = serialize_group_claim_value(group, consumer, min_idle_ms, start_id, count)
-
-        response = await self._client._send_and_check(
-            OpCode.STREAM_GROUP_CLAIM,
-            namespace,
-            stream.encode("utf-8"),
-            value,
-        )
-
-        # Response = <records blob> + [next_ts:u64][next_seq:u64] trailer.
-        data = response.data or b""
-        if len(data) < 16:
-            return StreamClaimResult(records=[], next_cursor=StreamID(), done=True)
-
-        cursor_off = len(data) - 16
-        next_ts = int.from_bytes(data[cursor_off : cursor_off + 8], "little")
-        next_seq = int.from_bytes(data[cursor_off + 8 : cursor_off + 16], "little")
-
-        read = parse_stream_read_response(data[:cursor_off])
-
-        # StreamID.MAX (max, max) is the "fully scanned" sentinel.
-        done = next_ts == _U64_MAX and next_seq == _U64_MAX
-        return StreamClaimResult(
-            records=read.records,
-            next_cursor=StreamID(timestamp_ms=next_ts, sequence=next_seq),
-            done=done,
-        )
+        # The server reads an empty consumer as "default", and so do reports.
+        return parse_group_read_response(response.data, consumer)
 
     async def group_ack(
         self,
         stream: str,
         group: str,
-        ids: list[StreamID],
+        delivery: GroupReadResult,
+        records: list[GroupRecord] | None = None,
         options: StreamGroupAckOptions | None = None,
-    ) -> None:
-        """Acknowledge records in a consumer group.
+    ) -> GroupReportResult:
+        """Ack a group read's records, all of them unless ``records`` names
+        some: they leave the group.
 
-        Args:
-            stream: Stream name.
-            group: Consumer group name.
-            ids: StreamIDs of records to acknowledge.
-            options: Optional ack options (including consumer name).
-
-        Raises:
-            NotFoundError: If the stream or group does not exist, so the ack
-                did not take effect.
-
-        Example:
-            result = await client.stream.group_read("events", "processors", "worker-1")
-            for record in result.records:
-                try:
-                    process(record.payload)
-                    await client.stream.group_ack("events", "processors", [record.id],
-                        StreamGroupAckOptions(consumer="worker-1"))
-                except Exception:
-                    pass  # Record will be redelivered
+        A record the ack doesn't apply to comes back in ``refused`` with why;
+        the call itself succeeds. ``GONE`` means done (acked already, or not in
+        the group), so ``result.lost`` lists only the records that go to
+        another delivery: their lease ran out, or another consumer holds them.
+        Resending an ack is safe.
         """
-        if not ids:
-            return
-
-        opts = options or StreamGroupAckOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = serialize_group_ack_value(group, ids, consumer=opts.consumer)
-
-        await self._client._send_and_check(
-            OpCode.STREAM_GROUP_ACK,
-            namespace,
-            stream.encode("utf-8"),
-            value,
+        return await self._report(
+            OpCode.STREAM_GROUP_ACK, "stream group ack", stream, group, delivery, records, options
         )
 
     async def group_nack(
         self,
         stream: str,
         group: str,
-        ids: list[StreamID],
+        delivery: GroupReadResult,
+        records: list[GroupRecord] | None = None,
         options: StreamGroupNackOptions | None = None,
-    ) -> None:
-        """Negatively acknowledge records in a consumer group for redelivery.
-
-        Args:
-            stream: Stream name.
-            group: Consumer group name.
-            ids: StreamIDs of records to negatively acknowledge.
-            options: Optional nack options (consumer name).
-
-        Raises:
-            NotFoundError: If the stream or group does not exist, so the nack
-                did not take effect.
-
-        Example:
-            result = await client.stream.group_read("events", "processors", "worker-1")
-            for record in result.records:
-                try:
-                    process(record.payload)
-                except Exception:
-                    await client.stream.group_nack("events", "processors", [record.id],
-                        StreamGroupNackOptions(consumer="worker-1"))
-        """
-        if not ids:
-            return
-
+    ) -> GroupReportResult:
+        """Nack a group read's records, all of them unless ``records`` names
+        some: each is ready again after ``delay_ms``, or dead once nacked or
+        expired ``max_deliver`` times (at once with ``dead``). Records it
+        doesn't apply to come back in ``refused``."""
         opts = options or StreamGroupNackOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-
-        value = serialize_group_ack_value(group, ids, consumer=opts.consumer)
-
-        await self._client._send_and_check(
+        builder = OptionsBuilder()
+        if not 0 <= opts.delay_ms <= MAX_GROUP_NACK_DELAY_MS:
+            raise ValidationError(
+                f"delay_ms must be 0..{MAX_GROUP_NACK_DELAY_MS}, got {opts.delay_ms}"
+            )
+        if opts.delay_ms:
+            builder.add_u64(OptionTag.DELAY_MS, opts.delay_ms)
+        if opts.dead:
+            builder.add_flag(OptionTag.DEAD)
+        if opts.error:
+            error = opts.error.encode("utf-8")
+            if len(error) > MAX_GROUP_NACK_ERROR:
+                raise ValidationError(
+                    f"a nack's error is at most {MAX_GROUP_NACK_ERROR} bytes, got {len(error)}"
+                )
+            builder.add_bytes(OptionTag.ERROR_TEXT, error)
+        return await self._report(
             OpCode.STREAM_GROUP_NACK,
-            namespace,
-            stream.encode("utf-8"),
-            value,
+            "stream group nack",
+            stream,
+            group,
+            delivery,
+            records,
+            opts,
+            builder.build(),
         )
 
+    async def group_touch(
+        self,
+        stream: str,
+        group: str,
+        delivery: GroupReadResult,
+        records: list[GroupRecord] | None = None,
+        options: StreamGroupAckOptions | None = None,
+    ) -> GroupTouchResult:
+        """Keep a group read's records: with half their lease or less left,
+        it runs a full lease from now, up to 12 h from their read; with more
+        left, nothing changes. Touch at least every half lease."""
+        opts = options or StreamGroupAckOptions()
+        response = await self._client._send_and_check(
+            OpCode.STREAM_GROUP_TOUCH,
+            self._client.get_namespace(opts.namespace),
+            stream.encode("utf-8"),
+            serialize_group_report_value(group, delivery, records),
+        )
+        return parse_group_touch_response(response.data)
+
+    async def _report(
+        self,
+        op: OpCode,
+        name: str,
+        stream: str,
+        group: str,
+        delivery: GroupReadResult,
+        records: list[GroupRecord] | None,
+        options: StreamGroupAckOptions | StreamGroupNackOptions | None,
+        tlv: bytes = b"",
+    ) -> GroupReportResult:
+        namespace = options.namespace if options is not None else None
+        response = await self._client._send_and_check(
+            op,
+            self._client.get_namespace(namespace),
+            stream.encode("utf-8"),
+            serialize_group_report_value(group, delivery, records),
+            tlv,
+        )
+        return parse_group_report_response(name, response.data)
+
+    async def group_info(
+        self, stream: str, group: str, namespace: str | None = None
+    ) -> StreamGroupInfo:
+        """A consumer group's counts: its records ready, leased and dead, and
+        the consumers holding some.
+
+        Raises:
+            NotFoundError: The stream has no such group.
+        """
+        response = await self._client._send_and_check(
+            OpCode.STREAM_GROUP_INFO,
+            self._client.get_namespace(namespace),
+            stream.encode("utf-8"),
+            serialize_group_value(group),
+        )
+        return parse_group_info_response(response.data)
+
+    async def group_pending(
+        self,
+        stream: str,
+        group: str,
+        consumer: str = "",
+        namespace: str | None = None,
+    ) -> list[PendingEntry]:
+        """Up to 100 of a group's records leased now, ``consumer``'s alone
+        when it is given.
+
+        Raises:
+            NotFoundError: The stream has no such group.
+        """
+        response = await self._client._send_and_check(
+            OpCode.STREAM_GROUP_PENDING,
+            self._client.get_namespace(namespace),
+            stream.encode("utf-8"),
+            serialize_group_value(group, consumer or None),
+        )
+        return parse_pending_entries(response.data)
+
     async def group_list(self, stream: str, namespace: str | None = None) -> StreamGroupListResult:
-        """A stream's consumer groups: members, pending entries, settings and
-        the last record delivered. Read on the leader; members and pending
-        start again with a new leader."""
+        """A stream's consumer groups: the consumers holding records, the
+        records ready and leased, settings and the last record read."""
         response = await self._client._send_and_check(
             OpCode.STREAM_GROUP_LIST,
             self._client.get_namespace(namespace),
@@ -588,8 +548,9 @@ class StreamOperations:
     async def group_members(
         self, stream: str, group: str, namespace: str | None = None
     ) -> StreamGroupMembersResult:
-        """A consumer group's members: each one's state, pending entries, and
-        when it joined and was last delivered to. Read on the leader.
+        """A consumer group's members: the consumers holding records now, each
+        with how many, when it first took one still held, and when it last
+        took one. A consumer holding nothing isn't a member.
 
         Raises:
             NotFoundError: The stream has no such group.

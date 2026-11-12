@@ -55,17 +55,15 @@ def _get_answer(version: int, value: bytes) -> RawResponse:
     return _ok(struct.pack("<QI", version, len(value)) + value + b"\x00")
 
 
-async def test_get_sends_wait_ms_wait_for_routing_key_and_txn(
+async def test_get_sends_wait_ms_wait_for_and_txn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, calls = _client(monkeypatch, _get_answer(4, b"hi"))
-    got = await client.kv.get(
-        "k", GetOptions(wait_ms=5000, wait_for=WaitFor.CHANGE, routing_key="rk")
-    )
+    got = await client.kv.get("k", GetOptions(wait_ms=5000, wait_for=WaitFor.CHANGE))
     assert (got.version, got.value) == (4, b"hi")
     op, _, key, body, options = calls[0]
     assert (op, key, options) == (OpCode.KV_GET, b"k", b"")
-    assert body == b"\x01" + struct.pack("<Q", 5000) + b"\x01\x01" + b"\x01\x02\x00rk" + b"\x00"
+    assert body == b"\x01" + struct.pack("<Q", 5000) + b"\x01\x01" + b"\x00"
 
 
 async def test_get_is_absent_on_not_found_and_raises_on_any_other(
@@ -93,7 +91,7 @@ async def test_set_sends_condition_and_cas_and_reads_its_version(
         + b"\x01\x01"
         + b"\x01"
         + struct.pack("<Q", 0)
-        + b"\x00\x00"
+        + b"\x00"
     )
 
 
@@ -112,19 +110,19 @@ async def test_a_transaction_sends_its_id_and_commits_by_id_alone(
 ) -> None:
     txn_id = (3 << 48) | 7
     client, calls = _client(monkeypatch, _get_answer(0, b"5"))
-    txn = Transaction(client, "ns", "rk", txn_id=txn_id, pinned_hash=0)
+    txn = Transaction(client, "ns", txn_id=txn_id, pinned_hash=0)
     await txn.get("k")
-    assert calls[0][3] == b"\x01" + struct.pack(
-        "<Q", 0
-    ) + b"\x01\x00" + b"\x01\x02\x00rk" + b"\x01" + struct.pack("<Q", txn_id)
+    assert calls[0][3] == b"\x01" + struct.pack("<Q", 0) + b"\x01\x00" + b"\x01" + struct.pack(
+        "<Q", txn_id
+    )
 
     client, calls = _client(monkeypatch, _ok(b"\x00"))
-    txn = Transaction(client, "ns", "rk", txn_id=txn_id, pinned_hash=0)
+    txn = Transaction(client, "ns", txn_id=txn_id, pinned_hash=0)
     assert (await txn.put("k", b"v")).version == 0
-    assert calls[0][3].endswith(b"\x01\x02\x00rk" + b"\x01" + struct.pack("<Q", txn_id))
+    assert calls[0][3].endswith(b"\x00\x01" + struct.pack("<Q", txn_id))
 
     client, calls = _client(monkeypatch, _ok(struct.pack("<QH", 5, 1)))
-    res = await Transaction(client, "ns", "rk", txn_id=txn_id, pinned_hash=0).commit()
+    res = await Transaction(client, "ns", txn_id=txn_id, pinned_hash=0).commit()
     assert (res.commit_index, res.op_count) == (5, 1)
     _, _, key, value, options = calls[0]
     assert (key, value, options) == (b"", struct.pack("<Q", txn_id), b"")
@@ -139,8 +137,15 @@ def test_answers_decode_whole_or_not_at_all() -> None:
 
 
 def test_new_reasons_are_known() -> None:
-    assert [r.value for r in Reason if r.value >= 13] == list(range(13, 32))
+    assert [r.value for r in Reason if r.value >= 13] == list(range(13, 36))
+    assert Reason(18).name == "KEYS_NOT_COLOCATED"
     assert (Reason(27).name, Reason(28).name) == ("WORKER_UNHEALTHY", "WORKER_DRAINING")
     assert Reason(29).name == "SHARD_HALTED"
     assert Reason(30).name == "ADMIN_ONLY"
     assert Reason(31).name == "JOB_RUNNING"
+    assert [Reason(n).name for n in range(32, 36)] == [
+        "MEMORY_BUDGET",
+        "TOO_MANY_ACTIONS",
+        "TOO_MANY_WORKFLOW_DEFINITIONS",
+        "TOO_MANY_WORKFLOW_RUNS",
+    ]

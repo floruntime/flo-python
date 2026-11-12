@@ -35,12 +35,19 @@ from .types import (
     RESPONSE_STALE,
     TABLE_HASH,
     VERSION,
+    GroupReadResult,
+    GroupRecord,
+    GroupRefusal,
+    GroupReportResult,
+    GroupTouchResult,
     OpCode,
     OptionTag,
     PendingEntry,
+    QueueRefusalReason,
     StatusCode,
     StorageTier,
     StreamAppendResult,
+    StreamGroupInfo,
     StreamID,
     StreamInfo,
     StreamReadResult,
@@ -428,117 +435,69 @@ def parse_stream_append_response(data: bytes) -> StreamAppendResult:
     return StreamAppendResult(id=StreamID(timestamp_ms=timestamp_ms, sequence=sequence))
 
 
-def parse_stream_read_response(data: bytes) -> StreamReadResult:
-    """Parse stream read response data.
+class _Reader:
+    """Reads a little-endian answer field by field; one cut short raises."""
 
-    Wire format: [count:u32]([sequence:u64][timestamp_ms:i64][tier:u8][partition:u32]
-                 [key_present:u8][key_len:u32]?[key]?[payload_len:u32][payload]
-                 [header_count:u32])*
+    def __init__(self, op: str, data: bytes) -> None:
+        self.op = op
+        self.data = data
+        self.pos = 0
+
+    def take(self, n: int, what: str) -> bytes:
+        if self.pos + n > len(self.data):
+            raise IncompleteResponseError(f"{self.op}: missing {what}")
+        b = self.data[self.pos : self.pos + n]
+        self.pos += n
+        return b
+
+    def unpack(self, fmt: str, what: str) -> tuple[Any, ...]:
+        return struct.unpack(fmt, self.take(struct.calcsize(fmt), what))
+
+    def u32(self, what: str) -> int:
+        return int(self.unpack("<I", what)[0])
+
+    def done(self) -> None:
+        if self.pos != len(self.data):
+            raise IncompleteResponseError(f"{self.op}: {len(self.data) - self.pos} bytes left over")
+
+
+def _stream_record(r: _Reader) -> StreamRecord:
+    """One record as a stream read gives it: [sequence:u64][timestamp_ms:i64]
+    [tier:u8][partition:u32][key_present:u8]([key_len:u32][key])?
+    [payload_len:u32][payload][header_count:u32]([len:u32][k][len:u32][v])*."""
+    sequence, timestamp_ms, tier, _partition, key_present = r.unpack("<QqBIB", "record header")
+    stream_name = ""
+    if key_present != 0:
+        stream_name = r.take(r.u32("key length"), "key").decode("utf-8")
+    payload = r.take(r.u32("payload length"), "payload")
+    header_count = r.u32("header count")
+    headers = None
+    if header_count > 0:
+        headers = {}
+        for _ in range(header_count):
+            hkey = r.take(r.u32("header key length"), "header key").decode("utf-8")
+            headers[hkey] = r.take(r.u32("header value length"), "header value").decode("utf-8")
+    return StreamRecord(
+        id=StreamID(timestamp_ms=timestamp_ms, sequence=sequence),
+        tier=StorageTier(tier),
+        stream=stream_name,
+        payload=payload,
+        headers=headers,
+    )
+
+
+def parse_stream_read_response(data: bytes) -> StreamReadResult:
+    """Parse stream read response data: [count:u32] then each record.
+
+    An answer that ends before its count of records is refused, not returned
+    short.
     """
     if len(data) < 4:
         # Empty response is valid (no records)
         return StreamReadResult(records=[])
-
-    pos = 0
-
-    count = struct.unpack("<I", data[pos : pos + 4])[0]
-    pos += 4
-
-    # An answer that ends before its count of records is refused, not
-    # returned short: each field below checks it's there.
-    records: list[StreamRecord] = []
-    for _ in range(count):
-        # Read sequence
-        if pos + 8 > len(data):
-            raise IncompleteResponseError("Stream record: missing sequence")
-        sequence = struct.unpack("<Q", data[pos : pos + 8])[0]
-        pos += 8
-
-        # Read timestamp_ms
-        if pos + 8 > len(data):
-            raise IncompleteResponseError("Stream record: missing timestamp_ms")
-        timestamp_ms = struct.unpack("<q", data[pos : pos + 8])[0]
-        pos += 8
-
-        # Read tier
-        if pos + 1 > len(data):
-            raise IncompleteResponseError("Stream record: missing tier")
-        tier = StorageTier(data[pos])
-        pos += 1
-
-        # Skip partition
-        if pos + 4 > len(data):
-            raise IncompleteResponseError("Stream record: missing partition")
-        pos += 4
-
-        # Read key_present
-        if pos + 1 > len(data):
-            raise IncompleteResponseError("Stream record: missing key_present")
-        key_present = data[pos]
-        pos += 1
-
-        # Read key (stream name) if present
-        stream_name = ""
-        if key_present != 0:
-            if pos + 4 > len(data):
-                raise IncompleteResponseError("Stream record: missing key length")
-            key_len = struct.unpack("<I", data[pos : pos + 4])[0]
-            pos += 4
-            if pos + key_len > len(data):
-                raise IncompleteResponseError("Stream record: missing key data")
-            stream_name = data[pos : pos + key_len].decode("utf-8")
-            pos += key_len
-
-        # Read payload
-        if pos + 4 > len(data):
-            raise IncompleteResponseError("Stream record: missing payload length")
-        payload_len = struct.unpack("<I", data[pos : pos + 4])[0]
-        pos += 4
-
-        if pos + payload_len > len(data):
-            raise IncompleteResponseError("Stream record: missing payload data")
-        payload = data[pos : pos + payload_len]
-        pos += payload_len
-
-        # Read headers: [header_count:u32]([key_len:u32][key][val_len:u32][val])*
-        if pos + 4 > len(data):
-            raise IncompleteResponseError("Stream record: missing header count")
-        header_count = struct.unpack("<I", data[pos : pos + 4])[0]
-        pos += 4
-
-        headers = None
-        if header_count > 0:
-            headers = {}
-            for _ in range(header_count):
-                if pos + 4 > len(data):
-                    raise IncompleteResponseError("Stream record: missing header key length")
-                hkey_len = struct.unpack("<I", data[pos : pos + 4])[0]
-                pos += 4
-                if pos + hkey_len > len(data):
-                    raise IncompleteResponseError("Stream record: missing header key")
-                hkey = data[pos : pos + hkey_len].decode("utf-8")
-                pos += hkey_len
-                if pos + 4 > len(data):
-                    raise IncompleteResponseError("Stream record: missing header value length")
-                hval_len = struct.unpack("<I", data[pos : pos + 4])[0]
-                pos += 4
-                if pos + hval_len > len(data):
-                    raise IncompleteResponseError("Stream record: missing header value")
-                hval = data[pos : pos + hval_len].decode("utf-8")
-                pos += hval_len
-                headers[hkey] = hval
-
-        records.append(
-            StreamRecord(
-                id=StreamID(timestamp_ms=timestamp_ms, sequence=sequence),
-                tier=tier,
-                stream=stream_name,
-                payload=payload,
-                headers=headers,
-            )
-        )
-
-    return StreamReadResult(records=records)
+    r = _Reader("stream read", data)
+    count = r.u32("count")
+    return StreamReadResult(records=[_stream_record(r) for _ in range(count)])
 
 
 def parse_stream_info_response(data: bytes) -> StreamInfo:
@@ -594,118 +553,142 @@ def build_stream_batch_value(
     return b"".join(parts)
 
 
-def serialize_group_value(group: str, consumer: str) -> bytes:
-    """Serialize group and consumer names for consumer group operations.
-
-    Format: [group_len:u16][group][consumer_len:u16][consumer]
-    """
-    group_bytes = group.encode("utf-8")
-    consumer_bytes = consumer.encode("utf-8")
-
-    result = bytearray()
-    result.extend(struct.pack("<H", len(group_bytes)))
-    result.extend(group_bytes)
-    result.extend(struct.pack("<H", len(consumer_bytes)))
-    result.extend(consumer_bytes)
-    return bytes(result)
+# The longest group name and consumer name the server takes.
+MAX_GROUP_NAME = 256
+MAX_GROUP_CONSUMER = 4096
+# The most records a group read takes, and a report names.
+MAX_GROUP_BATCH = 100
+# A group's lease (ack timeout) bounds, and a nack's longest delay.
+MIN_GROUP_LEASE_MS = 5_000
+MAX_GROUP_LEASE_MS = 43_200_000
+MAX_GROUP_NACK_DELAY_MS = 86_400_000
+# A nack's error travels as an option, whose length is one byte.
+MAX_GROUP_NACK_ERROR = 255
 
 
-def serialize_group_ack_value(group: str, ids: list[StreamID], consumer: str = "") -> bytes:
-    """Serialize group name, consumer, and StreamIDs for group ack/nack.
-
-    Format: [group_len:u16][group][consumer_len:u16][consumer][count:u32][ts:u64][seq:u64]*
-    """
-    group_bytes = group.encode("utf-8")
-    consumer_bytes = consumer.encode("utf-8")
-
-    result = bytearray()
-    result.extend(struct.pack("<H", len(group_bytes)))
-    result.extend(group_bytes)
-    result.extend(struct.pack("<H", len(consumer_bytes)))
-    result.extend(consumer_bytes)
-    result.extend(struct.pack("<I", len(ids)))
-    for sid in ids:
-        result.extend(struct.pack("<Q", sid.timestamp_ms))
-        result.extend(struct.pack("<Q", sid.sequence))
-    return bytes(result)
+def _str16(what: str, s: str, most: int) -> bytes:
+    b = s.encode("utf-8")
+    if len(b) > most:
+        raise ValidationError(f"{what} is {len(b)} bytes, at most {most}")
+    return struct.pack("<H", len(b)) + b
 
 
-def serialize_group_pending_value(group: str, consumer: str = "") -> bytes:
-    """Serialize group (and optional consumer filter) for STREAM_GROUP_PENDING.
-
-    Format: [group_len:u16][group]([consumer_len:u16][consumer])?
-
-    An empty ``consumer`` returns the whole group's PEL; a non-empty one filters
-    to that consumer's entries.
-    """
-    group_bytes = group.encode("utf-8")
-
-    result = bytearray()
-    result.extend(struct.pack("<H", len(group_bytes)))
-    result.extend(group_bytes)
-    if consumer:
-        consumer_bytes = consumer.encode("utf-8")
-        result.extend(struct.pack("<H", len(consumer_bytes)))
-        result.extend(consumer_bytes)
-    return bytes(result)
+def serialize_group_value(group: str, consumer: str | None = None) -> bytes:
+    """A group op's value: [group_len:u16][group], then the consumer's
+    [len:u16][consumer] when one is given."""
+    if not group:
+        raise ValidationError("a group name is required")
+    out = _str16("group name", group, MAX_GROUP_NAME)
+    if consumer is not None:
+        out += _str16("consumer", consumer, MAX_GROUP_CONSUMER)
+    return out
 
 
-def serialize_group_claim_value(
-    group: str,
-    consumer: str,
-    min_idle_ms: int,
-    start_id: StreamID,
-    count: int,
+def serialize_group_report_value(
+    group: str, delivery: GroupReadResult, records: list[GroupRecord] | None
 ) -> bytes:
-    """Serialize the request value for STREAM_GROUP_CLAIM.
+    """An ack's, nack's or touch's value: the group, the read's consumer, its
+    delivery (term, index), then each record's id and deliveries; all the
+    read's records when ``records`` is None."""
+    picked = delivery.records if records is None else records
+    if not 1 <= len(picked) <= MAX_GROUP_BATCH:
+        raise ValidationError(f"a report names 1..{MAX_GROUP_BATCH} records, got {len(picked)}")
+    return (
+        serialize_group_value(group, delivery.consumer)
+        + struct.pack("<QQI", delivery.term, delivery.index, len(picked))
+        + b"".join(
+            struct.pack("<QQI", r.id.timestamp_ms, r.id.sequence, r.deliveries) for r in picked
+        )
+    )
 
-    Format: [group_len:u16][group][consumer_len:u16][consumer]
-            [min_idle_ms:u32][start_ts:u64][start_seq:u64][count:u32]
-    """
-    group_bytes = group.encode("utf-8")
-    consumer_bytes = consumer.encode("utf-8")
 
-    result = bytearray()
-    result.extend(struct.pack("<H", len(group_bytes)))
-    result.extend(group_bytes)
-    result.extend(struct.pack("<H", len(consumer_bytes)))
-    result.extend(consumer_bytes)
-    result.extend(struct.pack("<I", min_idle_ms))
-    result.extend(struct.pack("<Q", start_id.timestamp_ms))
-    result.extend(struct.pack("<Q", start_id.sequence))
-    result.extend(struct.pack("<I", count))
-    return bytes(result)
+def parse_group_read_response(data: bytes, consumer: str) -> GroupReadResult:
+    """A group read's answer: [term:u64][index:u64][expires_at_ms:i64]
+    [count:u32], then each record as a stream read gives it followed by its
+    [deliveries:u32]."""
+    r = _Reader("stream group read", data)
+    term, index, expires_at_ms, count = r.unpack("<QQqI", "delivery")
+    if count > MAX_GROUP_BATCH:
+        raise IncompleteResponseError(f"stream group read answer has {count} records")
+    records = []
+    for _ in range(count):
+        rec = _stream_record(r)
+        records.append(
+            GroupRecord(
+                id=rec.id,
+                tier=rec.tier,
+                stream=rec.stream,
+                payload=rec.payload,
+                headers=rec.headers,
+                deliveries=r.u32("deliveries"),
+            )
+        )
+    r.done()
+    return GroupReadResult(
+        records=records, term=term, index=index, expires_at_ms=expires_at_ms, consumer=consumer
+    )
+
+
+def _group_refusals(r: _Reader) -> list[GroupRefusal]:
+    count = r.u32("refused count")
+    if count > MAX_GROUP_BATCH:
+        raise IncompleteResponseError(f"{r.op} answer refuses {count} records")
+    refused = []
+    for _ in range(count):
+        ms, seq, code = r.unpack("<QQB", "refused record")
+        try:
+            why = QueueRefusalReason(code)
+        except ValueError:
+            raise IncompleteResponseError(f"{r.op} answer has an unknown refusal {code}") from None
+        refused.append(GroupRefusal(id=StreamID(timestamp_ms=ms, sequence=seq), why=why))
+    r.done()
+    return refused
+
+
+def parse_group_report_response(op: str, data: bytes) -> GroupReportResult:
+    """An ack's or nack's answer: [applied:u32][refused:u32] then each refused
+    record's [ms:u64][seq:u64][why:u8]."""
+    r = _Reader(op, data)
+    applied = r.u32("applied")
+    return GroupReportResult(applied=applied, refused=_group_refusals(r))
+
+
+def parse_group_touch_response(data: bytes) -> GroupTouchResult:
+    """A touch's answer: [expires_at_ms:i64], then as an ack's."""
+    r = _Reader("stream group touch", data)
+    (expires_at_ms,) = r.unpack("<q", "expires_at_ms")
+    applied = r.u32("applied")
+    return GroupTouchResult(
+        expires_at_ms=expires_at_ms, applied=applied, refused=_group_refusals(r)
+    )
+
+
+def parse_group_info_response(data: bytes) -> StreamGroupInfo:
+    """A group info's answer: [pending:u64][holders:u32][created_at_ns:u64]
+    [ready:u64][leased:u64][dead:u64][trimmed_pending:u64]."""
+    r = _Reader("stream group info", data)
+    pending, holders, created_at_ns, ready, leased, dead, trimmed = r.unpack("<QIQQQQQ", "counts")
+    r.done()
+    return StreamGroupInfo(
+        pending=pending,
+        holders=holders,
+        created_at_ns=created_at_ns,
+        ready=ready,
+        leased=leased,
+        dead=dead,
+        trimmed_pending=trimmed,
+    )
 
 
 def parse_pending_entries(data: bytes) -> list[PendingEntry]:
-    """Parse the STREAM_GROUP_PENDING response.
-
-    Format: [count:u32]([ts:u64][seq:u64][delivery_count:u32]
-            [consumer_len:u16][consumer])*
-    """
-    if len(data) < 4:
-        return []
-
-    pos = 0
-    count = struct.unpack("<I", data[pos : pos + 4])[0]
-    pos += 4
-
+    """A group pending answer: [count:u32]([ts:u64][seq:u64]
+    [delivery_count:u32][consumer_len:u16][consumer])*."""
+    r = _Reader("stream group pending", data)
+    count = r.u32("count")
     entries: list[PendingEntry] = []
     for _ in range(count):
-        if pos + 8 + 8 + 4 + 2 > len(data):
-            raise IncompleteResponseError("Pending entry: truncated header")
-        ts = struct.unpack("<Q", data[pos : pos + 8])[0]
-        pos += 8
-        seq = struct.unpack("<Q", data[pos : pos + 8])[0]
-        pos += 8
-        delivery_count = struct.unpack("<I", data[pos : pos + 4])[0]
-        pos += 4
-        clen = struct.unpack("<H", data[pos : pos + 2])[0]
-        pos += 2
-        if pos + clen > len(data):
-            raise IncompleteResponseError("Pending entry: truncated consumer")
-        consumer = data[pos : pos + clen].decode("utf-8")
-        pos += clen
+        ts, seq, delivery_count, clen = r.unpack("<QQIH", "pending entry")
+        consumer = r.take(clen, "consumer").decode("utf-8")
         entries.append(
             PendingEntry(
                 id=StreamID(timestamp_ms=ts, sequence=seq),
@@ -713,6 +696,7 @@ def parse_pending_entries(data: bytes) -> list[PendingEntry]:
                 delivery_count=delivery_count,
             )
         )
+    r.done()
     return entries
 
 

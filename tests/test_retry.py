@@ -3,15 +3,20 @@ request; anything else comes straight back. Runs against an in-process fake
 server."""
 
 import asyncio
+import logging
 import struct
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
 from flo import FloClient, RetryPolicy
+from flo import retry as retry_mod
 from flo.exceptions import (
+    BadRequestError,
     ConflictError,
     IncompleteResponseError,
+    LimitError,
     OverloadedError,
     ServerError,
     UnavailableError,
@@ -19,6 +24,8 @@ from flo.exceptions import (
 from flo.retry import _Backoff, _policy_backoff
 from flo.types import HEADER_SIZE, MAGIC, TABLE_HASH, VERSION, OpCode, Ran, Reason, StatusCode
 from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc32c
+
+from .test_stream_worker_ack import _records
 
 
 def _frame(request_id: int, status: int, data: bytes) -> bytes:
@@ -210,20 +217,21 @@ def test_the_backoff_helper_normalises_its_own_bounds() -> None:
     assert all(b.next() == 0 for _ in range(5))
 
 
-async def test_stream_worker_retries_a_refused_group_join() -> None:
-    joins = 0
+async def test_stream_worker_retries_a_refused_group_create() -> None:
+    creates = 0
     policies: list[RetryPolicy] = []
 
     def reply(_n: int, op: int, rid: int) -> bytes:
-        nonlocal joins
-        if op == OpCode.STREAM_GROUP_JOIN:
-            joins += 1
-            if joins <= 3:
+        nonlocal creates
+        if op == OpCode.STREAM_GROUP_CREATE:
+            creates += 1
+            if creates <= 3:
                 return _refusal(rid, StatusCode.OVERLOADED, Ran.NO)
+            return _frame(rid, StatusCode.OK, b"\x01")
         if op == OpCode.STREAM_GROUP_READ:
             policies.extend(c._retry for c in (worker._client, worker._ack_client) if c)
             worker.stop()
-            return _frame(rid, StatusCode.OK, struct.pack("<I", 0))
+            return _frame(rid, StatusCode.OK, _records(0))
         return _frame(rid, StatusCode.OK, b"")
 
     fake = _Scripted(reply)
@@ -234,19 +242,21 @@ async def test_stream_worker_retries_a_refused_group_join() -> None:
     async def handler(_ctx: object) -> None:
         return None
 
-    worker = parent.new_stream_worker(stream="s", group="g", handler=handler, block_ms=100)
+    worker = parent.new_stream_worker(
+        stream="s", group="g", handler=handler, block_ms=100, ack_timeout_ms=60_000
+    )
     try:
         await asyncio.wait_for(worker.start(), timeout=10)
-        assert joins == 4
+        assert creates == 4
         # The worker's connections use the client's policy.
         assert policies == [parent._retry, parent._retry]
     finally:
         await fake.shut(server)
 
 
-async def test_stream_worker_still_fails_on_other_join_refusals() -> None:
+async def test_stream_worker_still_fails_on_other_create_refusals() -> None:
     def reply(_n: int, op: int, rid: int) -> bytes:
-        if op == OpCode.STREAM_GROUP_JOIN:
+        if op == OpCode.STREAM_GROUP_CREATE:
             return _refusal(rid, StatusCode.OVERLOADED, Ran.UNKNOWN)
         return _frame(rid, StatusCode.OK, b"")
 
@@ -257,18 +267,20 @@ async def test_stream_worker_still_fails_on_other_join_refusals() -> None:
     async def handler(_ctx: object) -> None:
         return None
 
-    worker = parent.new_stream_worker(stream="s", group="g", handler=handler, block_ms=100)
+    worker = parent.new_stream_worker(
+        stream="s", group="g", handler=handler, block_ms=100, max_deliver=3
+    )
     try:
         with pytest.raises(ServerError):
             await asyncio.wait_for(worker.start(), timeout=10)
-        assert fake.ops.count(OpCode.STREAM_GROUP_JOIN) == 1
+        assert fake.ops.count(OpCode.STREAM_GROUP_CREATE) == 1
     finally:
         await fake.shut(server)
 
 
 async def test_a_stopped_worker_does_not_sit_out_its_backoff() -> None:
     def reply(_n: int, op: int, rid: int) -> bytes:
-        if op == OpCode.STREAM_GROUP_JOIN:
+        if op == OpCode.STREAM_GROUP_CREATE:
             return _refusal(rid, StatusCode.OVERLOADED, Ran.NO)
         return _frame(rid, StatusCode.OK, b"")
 
@@ -279,7 +291,9 @@ async def test_a_stopped_worker_does_not_sit_out_its_backoff() -> None:
     async def handler(_ctx: object) -> None:
         return None
 
-    worker = parent.new_stream_worker(stream="s", group="g", handler=handler, block_ms=100)
+    worker = parent.new_stream_worker(
+        stream="s", group="g", handler=handler, block_ms=100, ack_timeout_ms=60_000
+    )
     try:
         task = asyncio.create_task(worker.start())
         # Long enough for the backoff ceiling to grow well past the deadline below.
@@ -288,3 +302,181 @@ async def test_a_stopped_worker_does_not_sit_out_its_backoff() -> None:
         await asyncio.wait_for(task, timeout=0.5)
     finally:
         await fake.shut(server)
+
+
+# ── limit: terminal, never retried; loops log it once and back off ──────────
+
+
+def _limit(request_id: int, reason: Reason = Reason.TOO_MANY_ACTIONS) -> bytes:
+    body = int(reason).to_bytes(2, "little") + bytes([int(Ran.NO)]) + b"limit: node is full"
+    return _frame(request_id, StatusCode.LIMIT, body)
+
+
+async def test_a_limit_is_never_retried() -> None:
+    fake = _Scripted(lambda _n, _op, rid: _limit(rid))
+    server, addr = await fake.serve()
+    # A policy that would retry an overloaded refusal four times.
+    client = await FloClient(addr, timeout_ms=1000, retry=_FAST).connect()
+    try:
+        with pytest.raises(LimitError) as raised:
+            await client.kv.get("k")
+        assert len(fake.ids) == 1
+        assert (raised.value.reason, raised.value.ran) == (Reason.TOO_MANY_ACTIONS, Ran.NO)
+        assert str(raised.value) == "limit: node is full"
+    finally:
+        await client.close()
+        await fake.shut(server)
+
+
+async def test_an_action_worker_start_fails_at_the_action_limit_after_one_request() -> None:
+    # Registering past the node's actions: start() raises, and the caller
+    # decides; it doesn't wait for a delete.
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        if op == OpCode.ACTION_REGISTER:
+            return _limit(rid)
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Scripted(reply)
+    server, addr = await fake.serve()
+    worker = FloClient(addr, timeout_ms=1000, retry=_FAST).new_action_worker(block_ms=100)
+
+    async def done(_ctx: object) -> bytes:
+        return b"done"
+
+    worker.register_action("echo", done)
+    try:
+        with pytest.raises(LimitError) as raised:
+            await asyncio.wait_for(worker.start(), timeout=5)
+    finally:
+        await fake.shut(server)
+    assert raised.value.reason == Reason.TOO_MANY_ACTIONS
+    assert fake.ops.count(OpCode.ACTION_REGISTER) == 1
+    assert OpCode.WORKER_REGISTER not in fake.ops and OpCode.ACTION_AWAIT not in fake.ops
+
+
+@pytest.mark.parametrize("refused_op", [OpCode.WORKER_REGISTER, OpCode.STREAM_GROUP_CREATE])
+async def test_a_stream_worker_start_fails_at_a_limit_after_one_request(refused_op: int) -> None:
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        if op == refused_op:
+            return _limit(rid)
+        if op == OpCode.STREAM_GROUP_CREATE:
+            return _frame(rid, StatusCode.OK, b"\x01")
+        if op == OpCode.WORKER_HEARTBEAT:
+            return _frame(rid, StatusCode.OK, b"\x00")
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Scripted(reply)
+    server, addr = await fake.serve()
+
+    async def handler(_ctx: object) -> None:
+        return None
+
+    worker = FloClient(addr, timeout_ms=1000, retry=_FAST).new_stream_worker(
+        stream="s", group="g", handler=handler, block_ms=100, ack_timeout_ms=60_000
+    )
+    try:
+        with pytest.raises(LimitError) as raised:
+            await asyncio.wait_for(worker.start(), timeout=5)
+    finally:
+        await fake.shut(server)
+    assert raised.value.reason == Reason.TOO_MANY_ACTIONS
+    assert fake.ops.count(refused_op) == 1
+    assert OpCode.STREAM_GROUP_READ not in fake.ops
+
+
+async def test_a_stream_worker_at_a_limit_backs_off_without_spinning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(retry_mod, "_WORKER_INITIAL_BACKOFF_S", 0.01)
+    monkeypatch.setattr(retry_mod, "_HALTED_MAX_BACKOFF_S", 0.2)
+    reads = 0
+
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        nonlocal reads
+        if op == OpCode.STREAM_GROUP_READ:
+            reads += 1
+            # Two reasons in turn: each is said once, however often it comes.
+            return _limit(rid, Reason.MEMORY_BUDGET if reads <= 5 else Reason.TOO_MANY_ACTIONS)
+        if op == OpCode.WORKER_HEARTBEAT:
+            return _frame(rid, StatusCode.OK, b"\x00")
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Scripted(reply)
+    server, addr = await fake.serve()
+    parent = FloClient(addr, timeout_ms=1000, retry=_FAST)
+
+    async def handler(_ctx: object) -> None:
+        return None
+
+    worker = parent.new_stream_worker(stream="s", group="g", handler=handler, block_ms=100)
+    caplog.set_level(logging.INFO, logger="flo")
+    run = asyncio.create_task(worker.start())
+    try:
+        await _until_true(lambda: reads >= 8, timeout=10)
+        assert not run.done()  # it didn't crash
+    finally:
+        worker.stop()
+        await asyncio.wait_for(run, timeout=5)
+        await fake.shut(server)
+    # Backed off: with a 0.2 s cap it reads a handful of times a second.
+    assert reads < 40
+    said = [r.getMessage() for r in caplog.records if "at a limit" in r.getMessage()]
+    assert len(said) == 2
+    assert "MEMORY_BUDGET" in said[0] and "TOO_MANY_ACTIONS" in said[1]
+
+
+async def _until_true(cond: Callable[[], bool], timeout: float) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not cond():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("condition not met in time")
+        await asyncio.sleep(0.01)
+
+
+def _bad_request(request_id: int) -> bytes:
+    body = int(Reason.FIELD_TOO_LONG).to_bytes(2, "little") + bytes([int(Ran.NO)]) + b"bad"
+    return _frame(request_id, StatusCode.BAD_REQUEST, body)
+
+
+@pytest.mark.parametrize(
+    "refused_op", [OpCode.ACTION_REGISTER, OpCode.WORKER_REGISTER, OpCode.STREAM_GROUP_CREATE]
+)
+async def test_start_fails_on_a_terminal_refusal_after_one_request(refused_op: int) -> None:
+    # Only a halted shard or a retryable refusal that didn't run is waited
+    # out at start; any other refusal is the caller's to see.
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        if op == refused_op:
+            return _bad_request(rid)
+        if op == OpCode.STREAM_GROUP_CREATE:
+            return _frame(rid, StatusCode.OK, b"\x01")
+        if op == OpCode.WORKER_HEARTBEAT:
+            return _frame(rid, StatusCode.OK, b"\x00")
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Scripted(reply)
+    server, addr = await fake.serve()
+    client = FloClient(addr, timeout_ms=1000, retry=_FAST)
+    worker: Any
+    if refused_op == OpCode.ACTION_REGISTER:
+        worker = client.new_action_worker(block_ms=100)
+
+        async def done(_ctx: object) -> bytes:
+            return b"done"
+
+        worker.register_action("echo", done)
+    else:
+
+        async def handler(_ctx: object) -> None:
+            return None
+
+        worker = client.new_stream_worker(
+            stream="s", group="g", handler=handler, block_ms=100, ack_timeout_ms=60_000
+        )
+    try:
+        with pytest.raises(BadRequestError) as raised:
+            await asyncio.wait_for(worker.start(), timeout=5)
+    finally:
+        await fake.shut(server)
+    assert raised.value.reason == Reason.FIELD_TOO_LONG
+    assert fake.ops.count(refused_op) == 1
+    assert OpCode.ACTION_AWAIT not in fake.ops and OpCode.STREAM_GROUP_READ not in fake.ops

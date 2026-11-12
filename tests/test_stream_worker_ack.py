@@ -34,9 +34,12 @@ def _response(request_id: int, data: bytes) -> bytes:
     return header(compute_crc32c(header(0), data)) + data
 
 
-def _records(n: int) -> bytes:
+def _records(n: int, term: int = 3, index: int = 40, deliveries: int = 1) -> bytes:
+    """A group read's answer: [term:u64][index:u64][expires_at_ms:i64]
+    [count:u32], then each record as a stream read gives it and its
+    [deliveries:u32]. Nothing read has no expiry."""
     payload = b"hello"
-    out = struct.pack("<I", n)  # count
+    out = struct.pack("<QQqI", term, index, 9_000_000 if n else 0, n)
     for seq in range(1, n + 1):
         out += (
             struct.pack("<Qq", seq, 1000)  # sequence, timestamp_ms
@@ -46,8 +49,13 @@ def _records(n: int) -> bytes:
             + struct.pack("<I", len(payload))
             + payload
             + struct.pack("<I", 0)  # no headers
+            + struct.pack("<I", deliveries)
         )
     return out
+
+
+# An ack's or nack's answer: one applied, none refused.
+REPORT_OK = struct.pack("<II", 1, 0)
 
 
 def _one_record() -> bytes:
@@ -86,24 +94,29 @@ class FakeStreamServer:
                         self.delivered = True
                         writer.write(_response(request_id, _records(self.count)))
                     else:
-                        loop.call_later(self.hold, self._answer_late, writer, request_id)
+                        loop.call_later(
+                            self.hold, self._answer_late, writer, request_id, _records(0)
+                        )
                     continue
                 if op_code == OpCode.STREAM_GROUP_ACK:
                     self.acks += 1
                     self.acked.set()
                     if self.ack_delay:
-                        loop.call_later(self.ack_delay, self._answer_late, writer, request_id)
+                        loop.call_later(
+                            self.ack_delay, self._answer_late, writer, request_id, REPORT_OK
+                        )
                         continue
                 if op_code == OpCode.STREAM_GROUP_NACK:
                     self.nacked.set()
-                writer.write(_response(request_id, b""))
+                report = op_code in (OpCode.STREAM_GROUP_ACK, OpCode.STREAM_GROUP_NACK)
+                writer.write(_response(request_id, REPORT_OK if report else b""))
         except (asyncio.IncompleteReadError, ConnectionError):
             self.closed_by_client += 1
 
     @staticmethod
-    def _answer_late(writer: asyncio.StreamWriter, request_id: int) -> None:
+    def _answer_late(writer: asyncio.StreamWriter, request_id: int, data: bytes) -> None:
         if not writer.is_closing():
-            writer.write(_response(request_id, b""))
+            writer.write(_response(request_id, data))
 
     def drop_all(self) -> None:
         for writer in self.writers:
@@ -233,7 +246,6 @@ async def test_acks_land_after_a_server_restart() -> None:
         handler=handler,
         block_ms=1000,
         concurrency=n + 1,  # leaves the poll loop a slot to notice the drop
-        redeliver_pending_on_reconnect=False,
     )
     run = asyncio.create_task(worker.start())
     try:
@@ -405,11 +417,12 @@ class NackDropServer:
                     self.nacks += 1
                     if not self.dropped:
                         self.dropped = True
-                        writer.write(_response(request_id, b""))
+                        writer.write(_response(request_id, REPORT_OK))
                         await writer.drain()
                         writer.close()
                         return
-                writer.write(_response(request_id, b""))
+                nack = op_code == OpCode.STREAM_GROUP_NACK
+                writer.write(_response(request_id, REPORT_OK if nack else b""))
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
 

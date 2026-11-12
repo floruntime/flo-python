@@ -125,16 +125,27 @@ async def test_blocking_call_still_times_out_after_its_wait(
     assert is_connection_error(raised.value)
 
 
-async def test_stream_worker_join_survives_a_timed_out_join(
-    server_factory: list[FakeServer],
-) -> None:
-    # The first join is answered after the client gave up.
-    client = await _client(server_factory, [0.3, 0.0], timeout_ms=100)
-    worker = client.new_stream_worker(stream="s", group="g", handler=_noop)
-    worker._client = client
-    await asyncio.wait_for(worker._join_group(), timeout=5)
-    assert client.is_connected
-    await client.close()
+async def test_stream_worker_setup_survives_a_timed_out_create() -> None:
+    # The first group create times out; the worker reconnects and asks again.
+    worker = FloClient("127.0.0.1:1").new_stream_worker(
+        stream="s", group="g", handler=_noop, ack_timeout_ms=60_000
+    )
+    calls = 0
+    reconnects = 0
+
+    async def create() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RequestTimeoutError("no answer")
+
+    async def reconnect(_seen: int | None = None) -> None:
+        nonlocal reconnects
+        reconnects += 1
+
+    worker._reconnect_control = reconnect  # type: ignore[method-assign]
+    assert await asyncio.wait_for(worker._while_blocked("Setting up", create), timeout=5)
+    assert (calls, reconnects) == (2, 1)
 
 
 async def test_failed_call_keeps_a_connection_swapped_in_meanwhile(

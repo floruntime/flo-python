@@ -15,6 +15,7 @@ from flo.wire import REQUEST_HEADER_FORMAT, RESPONSE_HEADER_FORMAT, compute_crc3
 from flo.worker import ActionWorker, StreamContext, StreamWorker, _EmptyPollBackoff
 
 from .test_result_resend import NO_TASK, TASK, task_answer
+from .test_stream_worker_ack import REPORT_OK, _records
 
 POLL_OPS = (OpCode.ACTION_AWAIT, OpCode.STREAM_GROUP_READ)
 
@@ -41,15 +42,7 @@ def _response(request_id: int, data: bytes) -> bytes:
 
 
 def _one_record() -> bytes:
-    return (
-        struct.pack("<I", 1)  # count
-        + struct.pack("<Qq", 1, 1000)  # sequence, timestamp_ms
-        + bytes([0])  # tier
-        + struct.pack("<I", 0)  # partition
-        + bytes([0])  # no key
-        + struct.pack("<I", 0)  # empty payload
-        + struct.pack("<I", 0)  # no headers
-    )
+    return _records(1)
 
 
 def _one_task() -> bytes:
@@ -78,13 +71,14 @@ class FakeServer:
                 )
                 await reader.readexactly(payload_len)
                 if op_code not in POLL_OPS:
-                    writer.write(_response(request_id, b""))
+                    report = op_code in (OpCode.STREAM_GROUP_ACK, OpCode.STREAM_GROUP_NACK)
+                    writer.write(_response(request_id, REPORT_OK if report else b""))
                     continue
                 self.polls += 1
                 self.poll_times.append(loop.time())
                 delay, record = self.script.pop(0) if self.script else (0.0, False)
                 body = _one_task() if op_code == OpCode.ACTION_AWAIT else _one_record()
-                empty = NO_TASK if op_code == OpCode.ACTION_AWAIT else b""
+                empty = NO_TASK if op_code == OpCode.ACTION_AWAIT else _records(0)
                 data = body if record else empty
 
                 def answer(rid: int = request_id, body: bytes = data) -> None:

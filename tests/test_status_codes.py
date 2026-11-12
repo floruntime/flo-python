@@ -6,10 +6,11 @@ import struct
 
 import pytest
 
-from flo import FloClient, RetryPolicy, StreamID
+from flo import FloClient, RetryPolicy
 from flo.exceptions import (
     GenericServerError,
     IncompleteResponseError,
+    LimitError,
     NoNamespaceError,
     NotFoundError,
     ServerError,
@@ -197,10 +198,30 @@ def test_a_body_that_is_not_a_refusal_is_refused(body: bytes) -> None:
         raise_for_status(StatusCode.BAD_REQUEST, body)
 
 
-@pytest.mark.parametrize("op", ["group_ack", "group_nack"])
-async def test_an_ack_or_nack_on_a_missing_group_raises(op: str) -> None:
-    client, server = await _client_answering(int(StatusCode.NOT_FOUND))
-    with pytest.raises(NotFoundError):
-        await getattr(client.stream, op)("events", "workers", [StreamID(1, 0)])
+def test_status_15_is_a_limit_carrying_its_reason_and_message() -> None:
+    assert StatusCode(15) is StatusCode.LIMIT
+    body = _refusal(b"limit: node holds 10000 actions; delete one", Reason.TOO_MANY_ACTIONS)
+    with pytest.raises(LimitError) as raised:
+        raise_for_status(StatusCode(15), body)
+    assert raised.value.status_code == StatusCode.LIMIT
+    assert (raised.value.reason, raised.value.ran) == (Reason.TOO_MANY_ACTIONS, Ran.NO)
+    assert str(raised.value) == "limit: node holds 10000 actions; delete one"
+    # The reasons defined ahead of their checks decode by name too.
+    for reason in (
+        Reason.MEMORY_BUDGET,
+        Reason.TOO_MANY_WORKFLOW_DEFINITIONS,
+        Reason.TOO_MANY_WORKFLOW_RUNS,
+    ):
+        with pytest.raises(LimitError) as raised:
+            raise_for_status(StatusCode.LIMIT, _refusal(b"limit", reason))
+        assert raised.value.reason == reason
+
+
+async def test_a_limit_answer_is_read_whole_and_the_next_answer_still_parses() -> None:
+    client, server = await _client_answering(15)
+    with pytest.raises(LimitError):
+        await client.kv.get("k")
+    result = await client.kv.get("k")
+    assert result is not None and result.value == b"second"
     await client.close()
     server.close()

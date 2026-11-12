@@ -135,7 +135,7 @@ async def kv_delete(
         OpCode.KV_DELETE,
         namespace,
         _key(key),
-        encode_delete_body(opts.cas_version, opts.routing_key, txn),
+        encode_delete_body(opts.cas_version, txn),
     )
     return decode_delete_answer(response.data)
 
@@ -149,7 +149,7 @@ async def kv_incr(
 ) -> tuple[int | None, int | None]:
     """kv.incr, inside transaction ``txn`` when given: (version, value)."""
     response = await client._send_and_check(
-        OpCode.KV_INCR, namespace, _key(key), encode_incr_body(opts.delta, opts.routing_key, txn)
+        OpCode.KV_INCR, namespace, _key(key), encode_incr_body(opts.delta, txn)
     )
     return decode_incr_answer(response.data)
 
@@ -167,7 +167,7 @@ async def kv_expire(
         OpCode.KV_EXPIRE,
         namespace,
         _key(key),
-        encode_expire_body(ttl_ms, opts.cas_version, opts.routing_key, txn),
+        encode_expire_body(ttl_ms, opts.cas_version, txn),
     )
     decode_empty_answer("kv.expire", response.data)
 
@@ -181,7 +181,7 @@ async def kv_exists(
 ) -> ExistsResult:
     """kv.exists, inside transaction ``txn`` when given."""
     response = await client._send_and_check(
-        OpCode.KV_EXISTS, namespace, _key(key), encode_exists_body(opts.routing_key, txn)
+        OpCode.KV_EXISTS, namespace, _key(key), encode_exists_body(txn)
     )
     result = decode_exists_answer(response.data)
     result.stale = response.stale
@@ -280,8 +280,8 @@ class KVOperations:
 
         Args:
             keys: Keys to fetch (max 256). Empty list returns ``[]``.
-            options: Optional namespace override, and the routing key every
-                key was written with (all are then looked up on its shard).
+            options: Optional namespace override. The keys may live on any
+                shards: the server gathers them.
 
         Returns:
             List of :class:`MGetEntry`. ``found=False`` indicates a missing key.
@@ -297,12 +297,11 @@ class KVOperations:
         namespace = self._client.get_namespace(opts.namespace)
         encoded = [_key(k) for k in keys]
         names = [k if isinstance(k, str) else k.decode("utf-8", errors="replace") for k in keys]
-        encode_mget_body(encoded[:1], opts.routing_key)  # refuses a bad routing key up front
         out: list[MGetEntry] = []
         for run in split_mget_keys(encoded):
             done = 0
             while done < len(run):
-                body = encode_mget_body(run[done:], opts.routing_key)
+                body = encode_mget_body(run[done:])
                 response = await self._client._send_and_check(OpCode.KV_MGET, namespace, b"", body)
                 entries, next_index = decode_mget_answer(
                     response.data, names[len(out) : len(out) + len(run) - done]
@@ -368,7 +367,7 @@ class KVOperations:
             OpCode.KV_HISTORY,
             self._client.get_namespace(opts.namespace),
             _key(key),
-            encode_history_body(opts.limit, opts.before_version, opts.routing_key),
+            encode_history_body(opts.limit, opts.before_version),
             allow_not_found=True,
         )
         if _absent(response):
@@ -437,7 +436,7 @@ class KVOperations:
             OpCode.KV_JSON_GET,
             self._client.get_namespace(opts.namespace),
             _key(key),
-            encode_json_get_body(path, opts.routing_key),
+            encode_json_get_body(path),
             allow_not_found=True,
         )
         if _absent(response, stale_raises=True):
@@ -464,7 +463,7 @@ class KVOperations:
             OpCode.KV_JSON_SET,
             self._client.get_namespace(opts.namespace),
             _key(key),
-            encode_json_set_body(path, json_value, opts.routing_key),
+            encode_json_set_body(path, json_value),
         )
         return PutResult(version=decode_json_set_answer(response.data))
 
@@ -484,26 +483,30 @@ class KVOperations:
             OpCode.KV_JSON_DEL,
             self._client.get_namespace(opts.namespace),
             _key(key),
-            encode_json_del_body(path, opts.routing_key),
+            encode_json_del_body(path),
         )
         version = decode_json_del_answer(response.data)
         return None if version is None else PutResult(version=version)
 
-    async def begin(self, routing_key: str) -> "Transaction":
-        """Open a per-shard KV transaction pinned to ``routing_key``'s partition.
+    async def begin(self, key: str | bytes) -> "Transaction":
+        """Open a KV transaction on the shard that owns ``key``.
 
-        Every op inside the transaction is routed by ``routing_key``; the
-        server refuses one routed otherwise with reason WRONG_ROUTING_KEY.
+        The transaction is pinned to ``key``'s ``{tag}`` (the part between
+        the first ``{`` and the next ``}``; ``{}`` is a tag too, an empty
+        one), or to the whole key when it has none, a ``{`` with no ``}``
+        after it included. Every key in it must route the same way: give them all the same
+        ``{tag}``. The server refuses any other key with reason
+        KEYS_NOT_COLOCATED (a BadRequestError that didn't run).
 
         Returns a :class:`Transaction` handle. Use as an async context manager
         for automatic rollback on exception::
 
-            async with await client.kv.begin("user:123") as txn:
-                await txn.put("user:123:name", b"Jane")
-                await txn.incr("user:123:visits", 1)
+            async with await client.kv.begin("{user:123}") as txn:
+                await txn.put("{user:123}:name", b"Jane")
+                await txn.incr("{user:123}:visits")
                 await txn.commit()
         """
         from .kv_txn import begin as _begin
 
         namespace = self._client.get_namespace(None)
-        return await _begin(self._client, namespace, routing_key)
+        return await _begin(self._client, namespace, key)

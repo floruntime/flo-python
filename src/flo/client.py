@@ -543,14 +543,16 @@ class FloClient:
         batch_size: int = 10,
         block_ms: int = _DEFAULT_WORKER_BLOCK_MS,
         message_timeout: float = 300.0,
-        redeliver_pending_on_reconnect: bool = True,
-        claim_min_idle_ms: int = 0,
+        ack_timeout_ms: int | None = None,
+        max_deliver: int | None = None,
+        auto_touch: bool = False,
     ) -> "StreamWorker":
         """Create a new StreamWorker from this client.
 
-        The worker joins a consumer group on the specified stream, polls for
-        records, and dispatches them to the handler. Records are auto-acked
-        on success and auto-nacked on error.
+        The worker reads a consumer group on the specified stream and
+        dispatches its records to the handler. Each record is acked on
+        success and nacked on error; one not acked within the group's lease
+        is delivered again.
 
         Args:
             stream: Stream name to consume from.
@@ -559,18 +561,16 @@ class FloClient:
             consumer: Consumer ID (auto-generated if not provided).
             worker_id: Unique worker identifier (auto-generated if not provided).
             concurrency: Maximum number of concurrent record handlers.
-            batch_size: Number of records to fetch per poll.
+            batch_size: Records to read per poll, 1..100.
             block_ms: Long-poll wait per read in milliseconds, at most 300000.
                 0 means the 30000 default.
             message_timeout: Timeout for record handlers in seconds.
-            redeliver_pending_on_reconnect: Drain this consumer's pending
-                (delivered-but-unacked) entries via group_claim after a
-                reconnect, before resuming normal reads. Defaults to True
-                (required for at-least-once across reconnects). Set False for
-                at-most-once.
-            claim_min_idle_ms: Minimum idle time (ms) before the reconnect drain
-                claims an entry. 0 drains everything this consumer owns; > 0
-                also steals entries abandoned by dead consumers.
+            ack_timeout_ms: The group's lease, 5000..43200000. With it or
+                ``max_deliver``, the worker creates the group at start, and
+                fails if it exists with other settings.
+            max_deliver: Nacks or expiries before a record is dead, 1..255.
+            auto_touch: Touch each record every sixth of the group's lease
+                while its handler runs, so a long handler keeps its record.
 
         Returns:
             A new StreamWorker instance ready to start.
@@ -598,6 +598,7 @@ class FloClient:
             batch_size=batch_size,
             block_ms=block_ms,
             message_timeout=message_timeout,
-            redeliver_pending_on_reconnect=redeliver_pending_on_reconnect,
-            claim_min_idle_ms=claim_min_idle_ms,
+            ack_timeout_ms=ack_timeout_ms,
+            max_deliver=max_deliver,
+            auto_touch=auto_touch,
         )
