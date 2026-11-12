@@ -1161,7 +1161,8 @@ class StreamGroupAckOptions:
 class StreamGroupNackOptions:
     """Options for a nack: the records are read again after ``delay_ms``
     (at most a day), or are dead once their attempts are spent, or at once
-    with ``dead``. ``error`` (at most 1024 bytes) says why."""
+    with ``dead``. ``error`` (at most 255 bytes: it travels as an option,
+    whose length is one byte) says why."""
 
     namespace: str | None = None
     delay_ms: int = 0

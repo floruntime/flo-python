@@ -25,8 +25,10 @@ The server's op table hash is now `0xc688167b51fcc846` (`TABLE_HASH`).
   5 s to 12 h, and `max_deliver`, 1..255), `group_delete` and `group_info`
   (`StreamGroupInfo`: ready, leased, dead, holders, trimmed_pending)
 - `StreamWorker` options `ack_timeout_ms` and `max_deliver` (the worker
-  creates the group with them at start) and `auto_touch` (touch each record
-  every sixth of the lease while its handler runs). `StreamContext.deliveries`
+  creates the group with them at start) and `auto_touch` (touch a read's
+  unacked records every sixth of the lease from its arrival, those waiting
+  for a handler slot included; transient refusals are tried again).
+  `StreamContext.deliveries`
 - `LimitError` for the new status `LIMIT` (15), with reasons
   `MEMORY_BUDGET` (32), `TOO_MANY_ACTIONS` (33),
   `TOO_MANY_WORKFLOW_DEFINITIONS` (34) and `TOO_MANY_WORKFLOW_RUNS` (35).

@@ -492,8 +492,9 @@ class KVOperations:
         """Open a KV transaction on the shard that owns ``key``.
 
         The transaction is pinned to ``key``'s ``{tag}`` (the part between
-        the first ``{`` and the next ``}``), or to the whole key when it has
-        none. Every key in it must route the same way: give them all the same
+        the first ``{`` and the next ``}``; ``{}`` is a tag too, an empty
+        one), or to the whole key when it has none, a ``{`` with no ``}``
+        after it included. Every key in it must route the same way: give them all the same
         ``{tag}``. The server refuses any other key with reason
         KEYS_NOT_COLOCATED (a BadRequestError that didn't run).
 

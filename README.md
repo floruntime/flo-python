@@ -126,7 +126,9 @@ for e in await client.kv.mget(["user:1", "user:2"]):
 A key routes by its `{tag}`, the part between its first `{` and the next
 `}`, or by the whole key when it has none. Keys that share a `{tag}`, such as
 `{user:1}:name` and `{user:1}:email`, are stored on the same shard; that is
-what a transaction needs.
+what a transaction needs. An empty tag counts: every key holding `{}` routes
+alike. A `{` with no `}` after it isn't a tag, so that key routes by the
+whole key.
 
 ### History
 
@@ -595,7 +597,7 @@ Delivery is at-least-once: a result lost to a dropped connection is resent, and 
 
 Both workers register in the worker registry and heartbeat every 30 s, reporting the handlers they are running. One the server removed after missed heartbeats registers again, with the same options, when its next heartbeat is answered not found.
 
-`worker.drain()` stops taking work and lets the running handlers finish, heartbeats going on; the server is told, so it assigns the worker nothing more, and `start()` returns once the last handler has reported. A drain started on the server does the same. Neither waits out `block_ms`: `drain()` interrupts the worker's own poll connection, so an action worker's held await and a stream worker's held read end at once. A drain started on the server answers an action worker's held await at once, refused as `WORKER_DRAINING`; it doesn't wake a stream worker's held group read, so a stream worker learns of it from its next heartbeat (every 30 s) and only then interrupts its read and leaves. `worker.stop()` ends polling at once, also mid-reconnect or mid-drain; running handlers still finish, and a stream worker hands back the records of its last batch it hasn't started. Either one before or during `start()` ends that run, and a worker can be started again afterwards.
+`worker.drain()` stops taking work and lets the running handlers finish, heartbeats going on; the server is told, so it assigns the worker nothing more, and `start()` returns once the last handler has reported. A drain started on the server does the same. Neither waits out `block_ms`: `drain()` interrupts the worker's own poll connection, so an action worker's held await and a stream worker's held read end at once. A drain started on the server answers an action worker's held await at once, refused as `WORKER_DRAINING`; it doesn't wake a stream worker's held group read, so a stream worker learns of it from its next heartbeat (every 30 s) and only then interrupts its read and leaves. `worker.stop()` ends polling at once, also mid-reconnect or mid-drain; running handlers still finish, and a stream worker hands back (nacks) the records of its last batch it hasn't started; each one handed back spends one of its attempts. Either one before or during `start()` ends that run, and a worker can be started again afterwards.
 
 ### StreamWorker Example
 
@@ -628,7 +630,12 @@ A stream worker acks each record its handler returns from and nacks each one
 its handler raises on, naming the read's delivery. A record whose handler runs
 past the group's lease is read again elsewhere unless `auto_touch=True`, which
 touches it every sixth of the lease (at least 100 ms apart) counted from when
-its read came in. The worker learns the lease when it creates the group or
+its read came in, together with the rest of that read's records not yet acked
+or nacked, those still waiting for a handler slot included. A touch refused as
+overloaded or unavailable, or lost with the connection, is tried again at the
+next interval; one refused as conflict, not found or bad request stops. Each
+touch answer's expiry, as the server places it, can bring the next touch
+forward, so the worker's clock needn't agree with the server's. The worker learns the lease when it creates the group or
 finds it listed; until then (a group its first read makes) it paces by the
 shortest lease a group may have, 5 s. With `ack_timeout_ms` or `max_deliver` set, the worker
 creates the group at start and fails if it exists with other settings; with

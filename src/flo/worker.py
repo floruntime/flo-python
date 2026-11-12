@@ -421,7 +421,7 @@ class _RegisteredWorker:
     async def _on_control_once(
         self, what: str, send: Callable[[FloClient], Awaitable[None]]
     ) -> None:
-        """Send a closing request (deregister, group leave), reconnecting the
+        """Send a closing request (deregister), reconnecting the
         control connection once if it is down; never raises."""
         client = self._control()
         if client is None:
@@ -473,12 +473,19 @@ async def _touch_loop(
     arrived: float | None,
     stop: asyncio.Event,
     touch: Callable[[], Awaitable[bool]],
+    latest: Callable[[], float] | None = None,
 ) -> None:
     """Call touch every interval_s, counted from arrived (the loop time the
-    lease began) or now, until stop is set or touch returns False."""
+    lease began) or now, until stop is set or touch returns False. With
+    latest, a touch goes no later than the loop time it gives, and no sooner
+    than _MIN_TOUCH_INTERVAL_MS after the one before."""
     loop = asyncio.get_running_loop()
     due = (loop.time() if arrived is None else arrived) + interval_s
+    floor = _MIN_TOUCH_INTERVAL_MS / 1000
+    last = loop.time()
     while True:
+        if latest is not None:
+            due = min(due, max(latest(), last + floor))
         # Checked first: a wait_for with no time left times out before the
         # wait it wraps has run, however long stop has been set.
         if stop.is_set():
@@ -489,7 +496,8 @@ async def _touch_loop(
         except asyncio.TimeoutError:
             pass
         # A touch that ran long skips the times it missed.
-        while due <= loop.time():
+        last = loop.time()
+        while due <= last:
             due += interval_s
         if not await touch():
             return
@@ -1410,6 +1418,42 @@ class StreamContext:
         return self.record.headers if self.record.headers else {}
 
 
+class _HeldBatch:
+    """A group read's records not yet acked or nacked: auto_touch keeps them
+    all, from the read's arrival, in one touch naming the read's delivery,
+    including those still waiting for a handler slot."""
+
+    def __init__(self, delivery: GroupReadResult) -> None:
+        self.delivery = delivery
+        self.held = {(r.id.timestamp_ms, r.id.sequence): r for r in delivery.records}
+        # When the lease runs out, in loop time: first as the read's arrival
+        # plus the lease, then moved by each touch answer's change to the
+        # server's expires_at_ms. Only differences of the server's times are
+        # used, so the two clocks needn't agree.
+        self.deadline = 0.0
+        self.expires_at_ms = delivery.expires_at_ms
+        self.empty = asyncio.Event()
+        # The touch on the wire, which a release waits out: an ack sent while
+        # it is out could be answered before the touch is.
+        self.touching: asyncio.Future[Any] | None = None
+
+    def records(self) -> list[GroupRecord]:
+        return list(self.held.values())
+
+    def drop(self, records: list[GroupRecord]) -> None:
+        for r in records:
+            self.held.pop((r.id.timestamp_ms, r.id.sequence), None)
+        if not self.held:
+            self.empty.set()
+
+    async def release(self, records: list[GroupRecord]) -> None:
+        """Stop touching records about to be acked or nacked."""
+        self.drop(records)
+        if self.touching is not None and not self.touching.done():
+            with contextlib.suppress(Exception):
+                await asyncio.shield(self.touching)
+
+
 class StreamWorker(_RegisteredWorker):
     """High-level Flo worker for processing stream records via consumer groups.
 
@@ -1756,18 +1800,30 @@ class StreamWorker(_RegisteredWorker):
         now rather than when their lease runs out; either way it counts as one
         of their attempts."""
         assert self._semaphore is not None
+        batch = _HeldBatch(delivery)
+        if self.config.auto_touch:
+            # From arrival: records waiting for a slot are leased too.
+            toucher = asyncio.create_task(self._keep_touching(batch, arrived))
+            self._tasks.add(toucher)
+            toucher.add_done_callback(self._tasks.discard)
         started = 0
-        for record in delivery.records:
-            # A stop ends the wait; a drain handles the whole batch.
-            if not await _acquire_unless_set(self._semaphore, self._stop_event):
-                break
-            task = asyncio.create_task(self._process_record(delivery, record, arrived))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
-            started += 1
+        try:
+            for record in delivery.records:
+                # A stop ends the wait; a drain handles the whole batch.
+                if not await _acquire_unless_set(self._semaphore, self._stop_event):
+                    break
+                task = asyncio.create_task(self._process_record(batch, record))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+                started += 1
+        except BaseException:
+            # Cut short: the toucher must not outlive the records it kept.
+            batch.drop(delivery.records[started:])
+            raise
         rest = delivery.records[started:]
         if not rest:
             return
+        await batch.release(rest)
         cfg = self.config
         await self._on_ack_connection(
             f"nack of {len(rest)}",
@@ -1830,55 +1886,80 @@ class StreamWorker(_RegisteredWorker):
             self._leave_event,
         )
 
-    async def _keep_touching(
-        self,
-        delivery: GroupReadResult,
-        record: GroupRecord,
-        stop: asyncio.Event,
-        arrived: float,
-    ) -> None:
-        """Touch a record every _touch_pace(lease), counted from when its read
-        came in, until stop is set. A touch the record moved on from (it is
-        refused, or the request is) stops touching; a lost connection is
-        reconnected for it."""
+    async def _keep_touching(self, batch: _HeldBatch, arrived: float) -> None:
+        """Touch a read's unacked records every _touch_pace(lease), counted
+        from when the read came in, until none are left. A record the touch
+        is refused for has moved on and is dropped; a refused request that
+        can't succeed (conflict, not_found, bad_request) stops touching. Any
+        other refusal, an overloaded or unavailable leader say, is tried again
+        at the next interval, and a lost connection is reconnected for it."""
         cfg = self.config
         limits = _LimitNotice()
+        lease_s = self._touch_lease_ms() / 1000
+        interval_s = _touch_pace(self._touch_lease_ms())
+        batch.deadline = arrived + lease_s
 
         async def touch() -> bool:
+            records = batch.records()
+            if not records:
+                return False
             client = self._ack_client
             assert client is not None
             seen = self._ack_generation
+            what = f"Touch for {len(records)} record(s) from {records[0].id}"
+            batch.touching = asyncio.ensure_future(
+                client.stream.group_touch(cfg.stream, cfg.group, batch.delivery, records)
+            )
             try:
-                result = await client.stream.group_touch(cfg.stream, cfg.group, delivery, [record])
+                result = await asyncio.shield(batch.touching)
             except ServerError as e:
+                if e.status_code in _TOUCH_FINAL:
+                    logger.warning(f"{what} was refused, stopping: {e}")
+                    return False
                 if is_limit(e):
-                    limits.note(f"Touch for record {record.id}", e)
-                    return True
-                logger.warning(f"Touch for record {record.id} was refused, stopping: {e}")
-                return False
+                    limits.note(what, e)
+                else:
+                    logger.warning(f"{what} was refused: {e}; trying again")
+                return True
             except Exception as e:
-                logger.warning(f"Touch for record {record.id} lost: {e!r}")
+                logger.warning(f"{what} lost: {e!r}")
                 if is_connection_error(e) or isinstance(e, asyncio.TimeoutError):
                     with contextlib.suppress(Exception):
                         await self._reconnect_ack_client(seen)
                 return True
             limits.reset()
+            if result.applied and result.expires_at_ms:
+                moved = result.expires_at_ms - batch.expires_at_ms
+                if moved:
+                    batch.deadline += moved / 1000
+                    batch.expires_at_ms = result.expires_at_ms
+                else:
+                    # Not extended: more than half the lease is left, so the
+                    # next touch is due no sooner than its interval.
+                    now = asyncio.get_running_loop().time()
+                    batch.deadline = max(batch.deadline, now + lease_s / 2 + interval_s)
             if result.refused:
-                logger.warning(
-                    f"Touch for record {record.id} refused ({result.refused[0].why.name}), "
-                    "stopping: it is delivered again"
-                )
-                return False
-            return True
+                why = ", ".join(f"{r.id}: {r.why.name}" for r in result.refused)
+                logger.warning(f"{what} refused for {why}: delivered again, no longer touched")
+                gone = {(r.id.timestamp_ms, r.id.sequence) for r in result.refused}
+                batch.drop([r for r in records if (r.id.timestamp_ms, r.id.sequence) in gone])
+            return not batch.empty.is_set()
 
-        await _touch_loop(_touch_pace(self._touch_lease_ms()), arrived, stop, touch)
+        # By the time half the lease is left at the latest, as the server's
+        # answers place it: a touch extends only then.
+        await _touch_loop(
+            interval_s,
+            arrived,
+            batch.empty,
+            touch,
+            lambda: batch.deadline - lease_s / 2,
+        )
 
-    async def _process_record(
-        self, delivery: GroupReadResult, record: GroupRecord, arrived: float
-    ) -> None:
+    async def _process_record(self, batch: _HeldBatch, record: GroupRecord) -> None:
         """Process a single record: call handler, then ack or nack."""
         assert self._semaphore is not None
         cfg = self.config
+        delivery = batch.delivery
         try:
             ctx = StreamContext(
                 record=record,
@@ -1886,12 +1967,6 @@ class StreamWorker(_RegisteredWorker):
                 stream=cfg.stream,
                 group=cfg.group,
                 consumer=cfg.consumer,
-            )
-            stop_touching = asyncio.Event()
-            touching = (
-                asyncio.ensure_future(self._keep_touching(delivery, record, stop_touching, arrived))
-                if cfg.auto_touch
-                else None
             )
             self._running_handlers += 1
             error = ""
@@ -1904,12 +1979,7 @@ class StreamWorker(_RegisteredWorker):
                 error = str(e) or type(e).__name__
             finally:
                 self._running_handlers -= 1
-                if touching is not None:
-                    # Let a touch in flight finish: cancelled mid-request, it
-                    # would cost the ack connection.
-                    stop_touching.set()
-                    with contextlib.suppress(Exception):
-                        await asyncio.shield(touching)
+                await batch.release([record])
 
             # Outside the handler's error handling: an ack that can't be
             # delivered must not turn into a nack.
@@ -1929,6 +1999,7 @@ class StreamWorker(_RegisteredWorker):
         except Exception as e:
             logger.error(f"Failed to process record: {e}")
         finally:
+            batch.drop([record])
             self._semaphore.release()
 
     def stop(self) -> None:

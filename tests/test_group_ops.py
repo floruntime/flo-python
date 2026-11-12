@@ -447,3 +447,175 @@ async def test_a_worker_learns_the_lease_once_its_first_read_makes_the_group() -
 
 async def _noop(_ctx: object) -> None:
     return None
+
+
+def _touch_records(payload: bytes, consumer: str) -> list[int]:
+    """The sequences a touch names, from its value."""
+    value = _value_and_options(payload)[0]
+    at = len(_str16("g") + _str16(consumer))
+    _term, _index, count = struct.unpack_from("<QQI", value, at)
+    return [struct.unpack_from("<QQI", value, at + 20 + 20 * i)[1] for i in range(count)]
+
+
+async def test_auto_touch_keeps_records_waiting_for_a_slot_from_arrival(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from flo import worker as worker_mod
+
+    # Touch every 100 ms; three records, one slot, 250 ms a handler.
+    monkeypatch.setattr(worker_mod, "MIN_GROUP_LEASE_MS", 600)
+    reads = 0
+
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        nonlocal reads
+        if op == OpCode.STREAM_GROUP_READ:
+            reads += 1
+            return _frame(rid, StatusCode.OK, _records(3)) if reads == 1 else b""
+        if op == OpCode.STREAM_GROUP_TOUCH:
+            return _frame(rid, StatusCode.OK, struct.pack("<qI", 1, 1) + _refused())
+        if op in (OpCode.STREAM_GROUP_ACK, OpCode.STREAM_GROUP_NACK):
+            return _frame(rid, StatusCode.OK, REPORT_OK)
+        if op == OpCode.WORKER_HEARTBEAT:
+            return _frame(rid, StatusCode.OK, b"\x00")
+        if op == OpCode.STREAM_GROUP_LIST:
+            return _frame(rid, StatusCode.OK, b"\x00\x00\x00")
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Recording(reply)
+    server, addr = await fake.serve()
+
+    async def slow(_ctx: object) -> None:
+        await asyncio.sleep(0.25)
+
+    worker = FloClient(addr, timeout_ms=1000, retry=_FAST).new_stream_worker(
+        stream="s", group="g", handler=slow, block_ms=30000, concurrency=1, auto_touch=True
+    )
+    run = asyncio.create_task(worker.start())
+    try:
+        await _until(
+            lambda: [op for op, _ in fake.payloads].count(OpCode.STREAM_GROUP_ACK) == 3, 10
+        )
+    finally:
+        worker.stop()
+        await asyncio.wait_for(run, timeout=10)
+        await fake.shut(server)
+    ops = [op for op, _ in fake.payloads]
+    touched = [
+        _touch_records(p, worker.config.consumer)
+        for op, p in fake.payloads
+        if op == OpCode.STREAM_GROUP_TOUCH
+    ]
+    # The first touch, before any ack, keeps all three: two of them still
+    # wait for the slot.
+    assert touched[0] == [1, 2, 3]
+    assert ops.index(OpCode.STREAM_GROUP_TOUCH) < ops.index(OpCode.STREAM_GROUP_ACK)
+    # Acked records drop out of later touches, in order, until none is left.
+    assert [2, 3] in touched and [3] in touched
+    assert all(t == sorted(t) and t for t in touched)
+    last_ack = max(i for i, op in enumerate(ops) if op == OpCode.STREAM_GROUP_ACK)
+    assert OpCode.STREAM_GROUP_TOUCH not in ops[last_ack:]
+
+
+@pytest.mark.parametrize(
+    ("status", "keeps_touching"),
+    [
+        (StatusCode.UNAVAILABLE, True),
+        (StatusCode.OVERLOADED, True),
+        (StatusCode.CONFLICT, False),
+        (StatusCode.NOT_FOUND, False),
+        (StatusCode.BAD_REQUEST, False),
+    ],
+)
+async def test_auto_touch_retries_transient_refusals_and_stops_on_final_ones(
+    monkeypatch: pytest.MonkeyPatch, status: StatusCode, keeps_touching: bool
+) -> None:
+    from flo import worker as worker_mod
+
+    monkeypatch.setattr(worker_mod, "MIN_GROUP_LEASE_MS", 600)
+    reads = 0
+
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        nonlocal reads
+        if op == OpCode.STREAM_GROUP_READ:
+            reads += 1
+            return _frame(rid, StatusCode.OK, _records(1)) if reads == 1 else b""
+        if op == OpCode.STREAM_GROUP_TOUCH:
+            body = int(Reason.UNCLASSIFIED).to_bytes(2, "little") + bytes([Ran.NO]) + b"no"
+            return _frame(rid, status, body)
+        if op == OpCode.STREAM_GROUP_ACK:
+            return _frame(rid, StatusCode.OK, REPORT_OK)
+        if op == OpCode.WORKER_HEARTBEAT:
+            return _frame(rid, StatusCode.OK, b"\x00")
+        if op == OpCode.STREAM_GROUP_LIST:
+            return _frame(rid, StatusCode.OK, b"\x00\x00\x00")
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Recording(reply)
+    server, addr = await fake.serve()
+
+    async def slow(_ctx: object) -> None:
+        await asyncio.sleep(0.45)
+
+    worker = FloClient(addr, timeout_ms=1000, retry=_FAST).new_stream_worker(
+        stream="s", group="g", handler=slow, block_ms=30000, auto_touch=True
+    )
+    run = asyncio.create_task(worker.start())
+    try:
+        await _until(lambda: OpCode.STREAM_GROUP_ACK in [op for op, _ in fake.payloads], 10)
+    finally:
+        worker.stop()
+        await asyncio.wait_for(run, timeout=10)
+        await fake.shut(server)
+    touches = [op for op, _ in fake.payloads].count(OpCode.STREAM_GROUP_TOUCH)
+    # A touch every 100 ms over a 450 ms handler: about four.
+    assert touches >= 3 if keeps_touching else touches == 1
+
+
+async def test_auto_touch_recalibrates_from_the_servers_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from flo import worker as worker_mod
+
+    # A 6 s lease: a touch every second. The first touch's answer puts the
+    # lease's end 4 s earlier than the read's did, so only about 1 s of the
+    # half lease is left: the next touch goes at once, not a second later.
+    monkeypatch.setattr(worker_mod, "MIN_GROUP_LEASE_MS", 6_000)
+    read_expiry = 9_000_000
+    reads = 0
+
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        nonlocal reads
+        if op == OpCode.STREAM_GROUP_READ:
+            reads += 1
+            return _frame(rid, StatusCode.OK, _records(1)) if reads == 1 else b""
+        if op == OpCode.STREAM_GROUP_TOUCH:
+            answer = struct.pack("<qI", read_expiry - 4_000, 1) + _refused()
+            return _frame(rid, StatusCode.OK, answer)
+        if op == OpCode.STREAM_GROUP_ACK:
+            return _frame(rid, StatusCode.OK, REPORT_OK)
+        if op == OpCode.WORKER_HEARTBEAT:
+            return _frame(rid, StatusCode.OK, b"\x00")
+        if op == OpCode.STREAM_GROUP_LIST:
+            return _frame(rid, StatusCode.OK, b"\x00\x00\x00")
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Recording(reply)
+    server, addr = await fake.serve()
+
+    async def slow(_ctx: object) -> None:
+        await asyncio.sleep(1.5)
+
+    worker = FloClient(addr, timeout_ms=1000, retry=_FAST).new_stream_worker(
+        stream="s", group="g", handler=slow, block_ms=30000, auto_touch=True
+    )
+    run = asyncio.create_task(worker.start())
+    try:
+        await _until(lambda: OpCode.STREAM_GROUP_ACK in [op for op, _ in fake.payloads], 10)
+    finally:
+        worker.stop()
+        await asyncio.wait_for(run, timeout=10)
+        await fake.shut(server)
+    # One at 1 s by the pace, one 100 ms later by the server's expiry; then
+    # an unmoved expiry puts the pace back in charge (next at 2 s, after the
+    # handler).
+    assert [op for op, _ in fake.payloads].count(OpCode.STREAM_GROUP_TOUCH) == 2
