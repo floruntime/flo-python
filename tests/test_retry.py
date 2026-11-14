@@ -15,6 +15,7 @@ from flo import retry as retry_mod
 from flo.exceptions import (
     BadRequestError,
     ConflictError,
+    GroupHeldFullError,
     IncompleteResponseError,
     LimitError,
     OverloadedError,
@@ -423,6 +424,88 @@ async def test_a_stream_worker_at_a_limit_backs_off_without_spinning(
     said = [r.getMessage() for r in caplog.records if "at a limit" in r.getMessage()]
     assert len(said) == 2
     assert "MEMORY_BUDGET" in said[0] and "TOO_MANY_ACTIONS" in said[1]
+
+
+# ── group_held_full: overloaded, but not retried; a worker backs off ───────
+
+
+def _held_full(request_id: int) -> bytes:
+    body = int(Reason.GROUP_HELD_FULL).to_bytes(2, "little") + bytes([int(Ran.NO)])
+    body += b"overloaded: group 'g' of stream 's' holds 4 records (at most 4)"
+    return _frame(request_id, StatusCode.OVERLOADED, body)
+
+
+async def test_a_group_held_full_read_is_not_retried() -> None:
+    fake = _Scripted(lambda _n, _op, rid: _held_full(rid))
+    server, addr = await fake.serve()
+    client = await FloClient(addr, timeout_ms=1000, retry=_FAST).connect()
+    try:
+        with pytest.raises(GroupHeldFullError) as raised:
+            await client.stream.group_read("s", "g", "c")
+        assert isinstance(raised.value, OverloadedError)
+        assert (raised.value.reason, raised.value.ran) == (Reason.GROUP_HELD_FULL, Ran.NO)
+        assert len(fake.ids) == 1
+        assert not retry_mod.is_refused_unrun(raised.value)
+        assert retry_mod.is_group_held_full(raised.value)
+    finally:
+        await client.close()
+        await fake.shut(server)
+
+
+async def test_a_queue_full_enqueue_is_retried_until_it_drains() -> None:
+    def reply(n: int, _op: int, rid: int) -> bytes:
+        if n < 2:
+            body = int(Reason.QUEUE_FULL).to_bytes(2, "little") + bytes([int(Ran.NO)]) + b"full"
+            return _frame(rid, StatusCode.OVERLOADED, body)
+        return _frame(rid, StatusCode.OK, struct.pack("<Q", 9))
+
+    fake = _Scripted(reply)
+    server, addr = await fake.serve()
+    client = await FloClient(addr, timeout_ms=1000, retry=_FAST).connect()
+    try:
+        assert await client.queue.enqueue("q", b"x") == 9
+        assert len(fake.ids) == 3
+    finally:
+        await client.close()
+        await fake.shut(server)
+
+
+async def test_a_stream_worker_at_group_held_full_logs_once_and_backs_off(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(retry_mod, "_WORKER_INITIAL_BACKOFF_S", 0.01)
+    monkeypatch.setattr(retry_mod, "_HALTED_MAX_BACKOFF_S", 0.2)
+    reads = 0
+
+    def reply(_n: int, op: int, rid: int) -> bytes:
+        nonlocal reads
+        if op == OpCode.STREAM_GROUP_READ:
+            reads += 1
+            return _held_full(rid)
+        if op == OpCode.WORKER_HEARTBEAT:
+            return _frame(rid, StatusCode.OK, b"\x00")
+        return _frame(rid, StatusCode.OK, b"")
+
+    fake = _Scripted(reply)
+    server, addr = await fake.serve()
+    parent = FloClient(addr, timeout_ms=1000, retry=RetryPolicy(max_attempts=4))
+
+    async def handler(_ctx: object) -> None:
+        return None
+
+    worker = parent.new_stream_worker(stream="s", group="g", handler=handler, block_ms=100)
+    caplog.set_level(logging.INFO, logger="flo")
+    run = asyncio.create_task(worker.start())
+    try:
+        await _until_true(lambda: reads >= 6, timeout=10)
+        assert not run.done()
+    finally:
+        worker.stop()
+        await asyncio.wait_for(run, timeout=5)
+        await fake.shut(server)
+    assert reads < 40
+    said = [r for r in caplog.records if "unacked or dead" in r.getMessage()]
+    assert len(said) == 1 and said[0].levelno == logging.ERROR
 
 
 async def _until_true(cond: Callable[[], bool], timeout: float) -> None:

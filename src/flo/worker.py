@@ -38,6 +38,7 @@ from .retry import (
     _halted_backoff,
     _sleep_unless_stopped,
     _worker_backoff,
+    is_group_held_full,
     is_limit,
     is_refused_unrun,
     is_shard_halted,
@@ -442,8 +443,9 @@ class _RegisteredWorker:
 
 
 class _LimitNotice:
-    """Logs a limit refusal once per reason while it lasts: a loop backing
-    off from one would otherwise log it on every try. A success resets it."""
+    """Logs a limit or full-group refusal once per reason while it lasts: a
+    loop backing off from one would otherwise log it on every try. A success
+    resets it."""
 
     def __init__(self) -> None:
         self._seen: set[int] = set()
@@ -453,9 +455,15 @@ class _LimitNotice:
         if e.reason in self._seen:
             return
         self._seen.add(e.reason)
+        if is_group_held_full(e):
+            logger.error(
+                f"{what} refused: the group holds too many records unacked or dead: {e}. "
+                "Backing off until its consumers ack or nack"
+            )
+            return
         logger.error(
-            f"{what} refused: the node is at a limit ({e.reason.name}): {e}. "
-            "Backing off until something is deleted or the limit raised"
+            f"{what} refused: at a limit ({e.reason.name}): {e}. "
+            "Backing off until something is deleted"
         )
 
     def reset(self) -> None:
@@ -463,7 +471,7 @@ class _LimitNotice:
 
 
 def _nack_error(message: str) -> str:
-    """A nack's error, cut to what its option carries, on a character boundary."""
+    """A handler's error, cut to what a nack carries, on a character boundary."""
     raw = message.encode("utf-8")[:MAX_GROUP_NACK_ERROR]
     return raw.decode("utf-8", errors="ignore")
 
@@ -1778,7 +1786,7 @@ class StreamWorker(_RegisteredWorker):
                     d = halted.next()
                     logger.warning(f"Stream read refused, shard halted: {e}; retrying in {d:.3f}s")
                     await _sleep_unless_stopped(leave, d)
-                elif is_limit(e):
+                elif is_limit(e) or is_group_held_full(e):
                     d = halted.next()
                     limits.note("Stream read", e)
                     await _sleep_unless_stopped(leave, d)
@@ -1795,10 +1803,10 @@ class StreamWorker(_RegisteredWorker):
                     await _sleep_unless_stopped(leave, d)
 
     async def _dispatch(self, delivery: GroupReadResult, arrived: float) -> None:
-        """Hand each record to a handler as a slot frees. On stop, the
-        records not yet started are nacked, so the group hands them out again
-        now rather than when their lease runs out; either way it counts as one
-        of their attempts."""
+        """Hand each record to a handler as a slot frees. On stop, or if the
+        worker's task is cancelled, the records not yet started are abandoned:
+        the group hands them out again now, with no failure counted, rather
+        than when their lease runs out."""
         assert self._semaphore is not None
         batch = _HeldBatch(delivery)
         if self.config.auto_touch:
@@ -1818,17 +1826,32 @@ class StreamWorker(_RegisteredWorker):
                 started += 1
         except BaseException:
             # Cut short: the toucher must not outlive the records it kept.
-            batch.drop(delivery.records[started:])
+            # The hand-back runs as its own task, which start() waits for
+            # before closing the ack connection.
+            rest = delivery.records[started:]
+            batch.drop(rest)
+            if rest:
+                task = asyncio.ensure_future(self._abandon(delivery, rest))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
             raise
         rest = delivery.records[started:]
         if not rest:
             return
         await batch.release(rest)
+        await self._abandon(delivery, rest)
+
+    async def _abandon(self, delivery: GroupReadResult, rest: list[GroupRecord]) -> None:
+        """Hand back records no handler started: ready again at once, the
+        delivery counted but no failure, so a stop spends none of their
+        attempts. Never for a record whose handler failed: abandon never
+        dead-letters, so a poison record would cycle forever."""
         cfg = self.config
+        abandon = StreamGroupNackOptions(abandon=True)
         await self._on_ack_connection(
-            f"nack of {len(rest)}",
+            f"abandon of {len(rest)}",
             rest[0].id,
-            lambda c: c.stream.group_nack(cfg.stream, cfg.group, delivery, rest),
+            lambda c: c.stream.group_nack(cfg.stream, cfg.group, delivery, rest, abandon),
         )
 
     async def _handle_reconnect(self) -> bool:
@@ -2006,7 +2029,8 @@ class StreamWorker(_RegisteredWorker):
         """Signal the stream worker to stop.
 
         Ends polling, interrupting a blocking read or a reconnect, and a
-        drain's wait; records of the last batch not yet started are nacked.
+        drain's wait; records of the last batch not yet started are handed
+        back unstarted (abandoned), so they spend none of their attempts.
         Running handlers finish and ack before start() returns. A stop before
         start() ends that run at once.
         """

@@ -238,6 +238,21 @@ class OverloadedError(ServerError):
         super().__init__(message, StatusCode.OVERLOADED)
 
 
+class QueueFullError(OverloadedError):
+    """An enqueue found the queue, or the shard's queues and groups together,
+    at their caps (reason QUEUE_FULL); the message names which. It drains as
+    messages are completed, so the client retries it like any overloaded refusal
+    and raises this once its retries run out."""
+
+
+class GroupHeldFullError(OverloadedError):
+    """A group read took nothing new: the group's consumers hold too many
+    records they haven't acked, or it holds dead ones (reason
+    GROUP_HELD_FULL); the message names the group's or the shard's caps.
+    Reading again won't help until they ack or nack, so the client never
+    retries it; a stream worker logs it and backs off."""
+
+
 class RateLimitedError(ServerError):
     """Request rate limit exceeded."""
 
@@ -269,14 +284,16 @@ class OutcomePendingError(ServerError):
 
 
 class LimitError(ServerError):
-    """The node is at one of its limits; ``reason`` names which
-    (MEMORY_BUDGET, TOO_MANY_ACTIONS, TOO_MANY_WORKFLOW_DEFINITIONS or
+    """The node or shard is at one of its limits; ``reason`` names which
+    (TOO_MANY_ACTIONS, MEMORY_BUDGET, TOO_MANY_WORKFLOW_DEFINITIONS or
     TOO_MANY_WORKFLOW_RUNS) and the message says more. It never ran.
 
-    Terminal: retrying won't clear it, so the client never retries it. It
-    isn't permanent: deleting something, giving the node more room, or
-    raising the setting does. For a worker, start() fails with the limit
-    error; a limit hit while running is logged and backed off.
+    Terminal: retrying won't clear it, so the client never retries it. The
+    limits are fixed in the server's build, not settings an operator raises:
+    deleting something clears it (TOO_MANY_ACTIONS counts the actions on one
+    shard, so delete an action there; MEMORY_BUDGET also clears when the node
+    has more memory). For a worker, start() fails with the limit error; a
+    limit hit while running is logged and backed off.
     """
 
     def __init__(self, message: str = StatusCode.LIMIT.message()):
@@ -326,11 +343,9 @@ def raise_for_status(status: StatusCode, data: bytes = b"") -> None:
     # A refusal's body: [reason:u16][ran:u8][message].
     if len(data) < 3:
         raise IncompleteResponseError(f"a refusal body of {len(data)} bytes")
-    try:
-        reason = Reason(int.from_bytes(data[0:2], "little"))
-        ran = Ran(data[2])
-    except ValueError as e:
-        raise IncompleteResponseError(f"a refusal with reason and ran {data[0:3].hex()}") from e
+    # A reason or ran this SDK doesn't know decodes as UNKNOWN_<n>.
+    reason = Reason(int.from_bytes(data[0:2], "little"))
+    ran = Ran(data[2])
     message = status.message()
     if len(data) > 3:
         with contextlib.suppress(UnicodeDecodeError, ValueError):
@@ -338,6 +353,10 @@ def raise_for_status(status: StatusCode, data: bytes = b"") -> None:
     error = _error_for(status, message)
     if status == StatusCode.CONFLICT and reason == Reason.STALE_REPORT:
         error = StaleReportError(message)
+    elif status == StatusCode.OVERLOADED and reason == Reason.QUEUE_FULL:
+        error = QueueFullError(message)
+    elif status == StatusCode.OVERLOADED and reason == Reason.GROUP_HELD_FULL:
+        error = GroupHeldFullError(message)
     error.reason = reason
     error.ran = ran
     raise error

@@ -42,7 +42,6 @@ from .wire import (
     MAX_GROUP_BATCH,
     MAX_GROUP_LEASE_MS,
     MAX_GROUP_NACK_DELAY_MS,
-    MAX_GROUP_NACK_ERROR,
     MIN_GROUP_LEASE_MS,
     OptionsBuilder,
     build_stream_batch_value,
@@ -54,6 +53,7 @@ from .wire import (
     parse_stream_append_response,
     parse_stream_info_response,
     parse_stream_read_response,
+    serialize_group_nack_value,
     serialize_group_report_value,
     serialize_group_value,
 )
@@ -410,10 +410,18 @@ class StreamOperations:
         the group), so ``result.lost`` lists only the records that go to
         another delivery: their lease ran out, or another consumer holds them.
         Resending an ack is safe.
+
+        Raises:
+            NotFoundError: The stream has no such group.
         """
-        return await self._report(
-            OpCode.STREAM_GROUP_ACK, "stream group ack", stream, group, delivery, records, options
+        opts = options or StreamGroupAckOptions()
+        response = await self._client._send_and_check(
+            OpCode.STREAM_GROUP_ACK,
+            self._client.get_namespace(opts.namespace),
+            stream.encode("utf-8"),
+            serialize_group_report_value(group, delivery, records),
         )
+        return parse_group_report_response("stream group ack", response.data)
 
     async def group_nack(
         self,
@@ -426,34 +434,42 @@ class StreamOperations:
         """Nack a group read's records, all of them unless ``records`` names
         some: each is ready again after ``delay_ms``, or dead once nacked or
         expired ``max_deliver`` times (at once with ``dead``). Records it
-        doesn't apply to come back in ``refused``."""
+        doesn't apply to come back in ``refused``.
+
+        With ``abandon`` the records are handed back unstarted: ready at once,
+        the delivery counted, no failure. Abandon never dead-letters, so use
+        it only for records never started (a consumer stopping), and nack on
+        errors; abandoning on every error cycles a poison record forever.
+
+        Raises:
+            ValidationError: ``error`` is over 1024 bytes, or ``abandon`` is
+                given with ``dead``, ``delay_ms`` or ``error``.
+            NotFoundError: The stream has no such group.
+        """
         opts = options or StreamGroupNackOptions()
         builder = OptionsBuilder()
         if not 0 <= opts.delay_ms <= MAX_GROUP_NACK_DELAY_MS:
             raise ValidationError(
                 f"delay_ms must be 0..{MAX_GROUP_NACK_DELAY_MS}, got {opts.delay_ms}"
             )
+        if opts.abandon and (opts.dead or opts.delay_ms or opts.error):
+            raise ValidationError(
+                "abandon hands records back unstarted, so it takes no dead, delay_ms or error"
+            )
         if opts.delay_ms:
             builder.add_u64(OptionTag.DELAY_MS, opts.delay_ms)
         if opts.dead:
             builder.add_flag(OptionTag.DEAD)
-        if opts.error:
-            error = opts.error.encode("utf-8")
-            if len(error) > MAX_GROUP_NACK_ERROR:
-                raise ValidationError(
-                    f"a nack's error is at most {MAX_GROUP_NACK_ERROR} bytes, got {len(error)}"
-                )
-            builder.add_bytes(OptionTag.ERROR_TEXT, error)
-        return await self._report(
+        if opts.abandon:
+            builder.add_flag(OptionTag.ABANDON)
+        response = await self._client._send_and_check(
             OpCode.STREAM_GROUP_NACK,
-            "stream group nack",
-            stream,
-            group,
-            delivery,
-            records,
-            opts,
+            self._client.get_namespace(opts.namespace),
+            stream.encode("utf-8"),
+            serialize_group_nack_value(group, delivery, records, opts.error),
             builder.build(),
         )
+        return parse_group_report_response("stream group nack", response.data)
 
     async def group_touch(
         self,
@@ -465,7 +481,11 @@ class StreamOperations:
     ) -> GroupTouchResult:
         """Keep a group read's records: with half their lease or less left,
         it runs a full lease from now, up to 12 h from their read; with more
-        left, nothing changes. Touch at least every half lease."""
+        left, nothing changes. Touch at least every half lease.
+
+        Raises:
+            NotFoundError: The stream has no such group.
+        """
         opts = options or StreamGroupAckOptions()
         response = await self._client._send_and_check(
             OpCode.STREAM_GROUP_TOUCH,
@@ -474,27 +494,6 @@ class StreamOperations:
             serialize_group_report_value(group, delivery, records),
         )
         return parse_group_touch_response(response.data)
-
-    async def _report(
-        self,
-        op: OpCode,
-        name: str,
-        stream: str,
-        group: str,
-        delivery: GroupReadResult,
-        records: list[GroupRecord] | None,
-        options: StreamGroupAckOptions | StreamGroupNackOptions | None,
-        tlv: bytes = b"",
-    ) -> GroupReportResult:
-        namespace = options.namespace if options is not None else None
-        response = await self._client._send_and_check(
-            op,
-            self._client.get_namespace(namespace),
-            stream.encode("utf-8"),
-            serialize_group_report_value(group, delivery, records),
-            tlv,
-        )
-        return parse_group_report_response(name, response.data)
 
     async def group_info(
         self, stream: str, group: str, namespace: str | None = None

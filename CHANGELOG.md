@@ -9,10 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 The op table hash moves with the server in this release: this SDK talks only
 to the flo it pins, and the pin lands with the release.
-The server's op table hash is now `0xc688167b51fcc846` (`TABLE_HASH`).
+The server's op table hash is now `0xc1f93eb0ed86a281` (`TABLE_HASH`).
 
 ### Added
 
+- `Reason.QUEUE_FULL` (36) and `GROUP_HELD_FULL` (37), both under status
+  overloaded. `QueueFullError` (an `OverloadedError`) is retried like any
+  overloaded refusal that didn't run: a full queue drains as messages are
+  completed. `GroupHeldFullError` (an `OverloadedError`) is never retried: a
+  group read takes nothing new until the group's consumers ack or nack. The
+  stream worker logs it once and backs off, as for a limit;
+  `retry.is_group_held_full` tells it apart
+- `StreamGroupNackOptions.abandon` (`OptionTag.ABANDON`, 0x34) hands records
+  back unstarted: ready at once, the delivery counted, no failure. It takes
+  no `dead`, `delay_ms` or `error`, and never dead-letters
+- A refusal reason or `ran` this SDK doesn't know decodes as `UNKNOWN_<n>`,
+  keeping the number and the server's message, instead of raising
+  `IncompleteResponseError`
 - Consumer groups lease each record. `stream.group_read` returns a
   `GroupReadResult` (the delivery's `term`, `index`, `expires_at_ms` and
   `consumer`) of `GroupRecord`s, each with its `deliveries`.
@@ -34,7 +47,7 @@ The server's op table hash is now `0xc688167b51fcc846` (`TABLE_HASH`).
   `TOO_MANY_WORKFLOW_DEFINITIONS` (34) and `TOO_MANY_WORKFLOW_RUNS` (35).
   It is never retried. For a worker, start() fails with the limit error; a
   limit hit while running is logged and backed off, once per reason
-- `OptionTag.DEAD` (0x32) and `ERROR_TEXT` (0x33)
+- `OptionTag.DEAD` (0x32)
 
 - `queue.complete`, `queue.fail` and `queue.touch` (`QUEUE_COMPLETE`,
   `QUEUE_FAIL`, `QUEUE_TOUCH`, 0x182-0x184) report on a dequeue's messages:
@@ -93,6 +106,15 @@ The server's op table hash is now `0xc688167b51fcc846` (`TABLE_HASH`).
 
 ### Changed
 
+- A group nack carries its error in the body, at most 1024 bytes (was an
+  option of at most 255); over 1024 raises `ValidationError` before sending
+- An ack, nack or touch to a group that isn't there raises `NotFoundError`,
+  not a result with every record `GONE`
+- The stream worker hands back the records of its last batch it hasn't
+  started with abandon, on stop and when its task is cancelled: they spend
+  no attempt (a plain nack spent one)
+- `LimitError` and the README say the limits are fixed in the server's
+  build, not raised by a setting; `TOO_MANY_ACTIONS` counts per shard
 - Queues are at-least-once: a dequeue leases its messages until they're
   completed, failed or expired, and one not completed within its lease is
   delivered again with `deliveries` one higher; five failures or expiries
@@ -153,6 +175,9 @@ The server's op table hash is now `0xc688167b51fcc846` (`TABLE_HASH`).
 
 ### Breaking
 
+- `PeekedMessage.attempts` and `DeadLetter.attempts` are now `deliveries`, as
+  the server names them
+- `OptionTag.ERROR_TEXT` (0x33) is gone: a nack's error is in its body
 - `stream.group_join`, `group_leave` and `group_claim` are gone, with
   `StreamGroupJoinOptions`, `StreamClaimResult` and the op codes for join,
   leave, claim and configure_sweeper: the server refuses them. A group read
@@ -204,7 +229,7 @@ The server's op table hash is now `0xc688167b51fcc846` (`TABLE_HASH`).
   server's 300000)
 - `queue.peek` calls `QUEUE_PEEK` (0x180; 0x17C is retired, and answered
   empty) with a `limit` of 1..100 (default 20), and returns a `PeekResult`
-  of `PeekedMessage` (seq, priority, attempts, enqueued time, size and up to
+  of `PeekedMessage` (seq, priority, deliveries, enqueued time, size and up to
   4 KiB of payload) with `more`
 
 - Listing workers in a namespace never created raises `NoNamespaceError`, so

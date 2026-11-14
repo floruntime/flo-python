@@ -18,7 +18,7 @@ VERSION: int = 0x03
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0xC688167B51FCC846
+TABLE_HASH: int = 0xC1F93EB0ED86A281
 # Response header flag: a shard that can't apply its next entry (halted at
 # it, or blocked reading it from disk) answered a read from its state just
 # before that entry. The read succeeded.
@@ -26,8 +26,9 @@ RESPONSE_STALE: int = 0x01
 
 
 class Reason(IntEnum):
-    """Why the server refused a request. Mirrors the server's list; the table
-    hash covers it, so a server can't send one this SDK doesn't know."""
+    """Why the server refused a request. Mirrors the server's list. A reason
+    this SDK doesn't know decodes as a pseudo-member named UNKNOWN_<n> that
+    keeps its number, so its refusal still raises with the server's message."""
 
     UNKNOWN_OP = 1
     MALFORMED = 2
@@ -86,23 +87,62 @@ class Reason(IntEnum):
     JOB_RUNNING = 31
     # The node's memory budget is spent (status LIMIT).
     MEMORY_BUDGET = 32
-    # The node holds as many actions as it registers (status LIMIT).
+    # The shard holds as many actions as it registers (status LIMIT).
     TOO_MANY_ACTIONS = 33
     # The node holds as many workflow definitions as it keeps (status LIMIT).
     TOO_MANY_WORKFLOW_DEFINITIONS = 34
     # The node holds as many workflow runs as it keeps (status LIMIT).
     TOO_MANY_WORKFLOW_RUNS = 35
+    # The queue, or the shard's queues and groups together, are at their caps
+    # (status OVERLOADED). It drains as messages are acked: back off and send
+    # again.
+    QUEUE_FULL = 36
+    # A group read took nothing new: the group's consumers hold too many
+    # records they haven't acked, or it holds dead ones (status OVERLOADED).
+    # Reading again won't help until they ack or nack.
+    GROUP_HELD_FULL = 37
+
+    @classmethod
+    def _missing_(cls, value: object) -> "Reason | None":
+        if not isinstance(value, int) or not 0 <= value <= 0xFFFF:
+            return None
+        return _pseudo(cls, value)
+
+    def __reduce_ex__(self, proto: object) -> tuple[type["Reason"], tuple[int]]:
+        return self.__class__, (int(self),)
 
 
 class Ran(IntEnum):
     """Whether a refused request took effect: retry logic reads this, not the
-    message."""
+    message. A value this SDK doesn't know decodes as UNKNOWN_<n>, which is
+    never NO, so it is never retried."""
 
     NO = 0
     # It took effect; don't resend it.
     YES = 1
     # It may still take effect; check before resending.
     UNKNOWN = 2
+
+    @classmethod
+    def _missing_(cls, value: object) -> "Ran | None":
+        if not isinstance(value, int) or not 0 <= value <= 255:
+            return None
+        return _pseudo(cls, value)
+
+    def __reduce_ex__(self, proto: object) -> tuple[type["Ran"], tuple[int]]:
+        return self.__class__, (int(self),)
+
+
+_E = TypeVar("_E", bound=IntEnum)
+
+
+def _pseudo(cls: type[_E], value: int) -> _E:
+    """A value an enum doesn't know, kept by number: its answer still has a
+    body on the wire, and failing here would abandon it unread."""
+    member = int.__new__(cls, value)
+    member._name_ = f"UNKNOWN_{value}"
+    member._value_ = value
+    return member
 
 
 HEADER_SIZE: int = 32
@@ -286,7 +326,7 @@ class StatusCode(IntEnum):
     # The namespace the request names doesn't exist; NOT_FOUND means a
     # missing key.
     NO_NAMESPACE = 14
-    # The node is at one of its limits; the reason names which. It
+    # The node or shard is at one of its limits; the reason names which. It
     # never ran, and retrying won't clear it.
     LIMIT = 15
 
@@ -296,10 +336,7 @@ class StatusCode(IntEnum):
         # here would abandon it unread, so it becomes a pseudo-member instead.
         if not isinstance(value, int) or not 0 <= value <= 255:
             return None
-        member = int.__new__(cls, value)
-        member._name_ = f"UNKNOWN_{value}"
-        member._value_ = value
-        return member
+        return _pseudo(cls, value)
 
     def __reduce_ex__(self, proto: object) -> tuple[type["StatusCode"], tuple[int]]:
         # Rebuilt from its value, not its name: a pseudo-member such as
@@ -328,7 +365,7 @@ class StatusCode(IntEnum):
                 "Committed, not applied: its shard halted; don't resend it unchanged"
             ),
             StatusCode.NO_NAMESPACE: "Namespace not found",
-            StatusCode.LIMIT: "At a limit: delete something, or raise the limit",
+            StatusCode.LIMIT: "At a limit: delete something first",
         }
         return messages.get(self, f"Unknown status {int(self)}")
 
@@ -364,7 +401,7 @@ class OptionTag(IntEnum):
     ACK_TIMEOUT_MS = 0x30  # u32: A group's lease, 5 s to 12 h (default 30 s)
     MAX_DELIVER = 0x31  # u8: Nacks or expiries before a record is dead, 1..255 (default 5)
     DEAD = 0x32  # void: A nack makes its records dead now
-    ERROR_TEXT = 0x33  # string: Why a nack's records failed
+    ABANDON = 0x34  # void: A nack hands its records back unstarted: ready at once, no failure
 
     # Time-Series Options (0x60 - 0x6F)
     TS_FROM_MS = 0x60  # i64: Start of time range (inclusive, unix ms)
@@ -619,7 +656,7 @@ class PeekedMessage:
 
     seq: int
     priority: int
-    attempts: int
+    deliveries: int
     enqueued_at_ms: int
     size: int
     payload: bytes
@@ -643,7 +680,7 @@ class DeadLetter:
     size: int
     payload: bytes
     enqueued_at_ms: int
-    attempts: int
+    deliveries: int
     priority: int
     moved_at_ms: int
 
@@ -1161,13 +1198,19 @@ class StreamGroupAckOptions:
 class StreamGroupNackOptions:
     """Options for a nack: the records are read again after ``delay_ms``
     (at most a day), or are dead once their attempts are spent, or at once
-    with ``dead``. ``error`` (at most 255 bytes: it travels as an option,
-    whose length is one byte) says why."""
+    with ``dead``. ``error`` (at most 1024 bytes of UTF-8) says why.
+
+    ``abandon`` hands the records back unstarted instead: ready at once,
+    the delivery counted but no failure, and it takes no ``dead``,
+    ``delay_ms`` or ``error``. Abandon never dead-letters, so a consumer
+    that abandons on every error cycles a poison record forever: abandon
+    only records it never started (it is stopping), and nack on errors."""
 
     namespace: str | None = None
     delay_ms: int = 0
     dead: bool = False
     error: str = ""
+    abandon: bool = False
 
 
 # =============================================================================

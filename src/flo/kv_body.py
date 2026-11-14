@@ -874,7 +874,7 @@ def decode_peek_answer(data: bytes) -> PeekResult:
         PeekedMessage(
             seq=a.u64(),
             priority=a.u32(),
-            attempts=a.u32(),
+            deliveries=a.u32(),
             enqueued_at_ms=a.i64(),
             size=a.u32(),
             payload=a.bytes16(),
