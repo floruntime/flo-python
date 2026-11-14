@@ -36,6 +36,31 @@ if TYPE_CHECKING:
 logger = logging.getLogger("flo")
 
 
+async def _open_within(
+    host: str, port: int, timeout: float
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """open_connection, given up after timeout seconds (asyncio.TimeoutError).
+
+    Not wait_for: before Python 3.12, a cancel that lands as the connect
+    finishes, as a refused one does at once, is dropped and the connect's
+    result or error returned instead. A reconnect loop would then retry on
+    past the deadline of whoever cancelled it.
+    """
+    connect = asyncio.ensure_future(asyncio.open_connection(host, port))
+    try:
+        done, _ = await asyncio.wait({connect}, timeout=timeout)
+    except asyncio.CancelledError:
+        connect.cancel()
+        # Connected just as the cancel landed: don't leak the connection.
+        if connect.done() and not connect.cancelled() and connect.exception() is None:
+            connect.result()[1].close()
+        raise
+    if not done:
+        connect.cancel()
+        raise asyncio.TimeoutError
+    return connect.result()
+
+
 class FloClient:
     """Async client for Flo server.
 
@@ -164,10 +189,7 @@ class FloClient:
             ConnectionFailedError: If connection fails.
         """
         try:
-            self._reader, self._writer = await asyncio.wait_for(
-                asyncio.open_connection(self._host, self._port),
-                timeout=self._timeout,
-            )
+            self._reader, self._writer = await _open_within(self._host, self._port, self._timeout)
             if self._debug:
                 logger.debug(f"[flo] Connected to {self._endpoint}")
             return self
@@ -227,10 +249,7 @@ class FloClient:
         while True:
             attempt += 1
             try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(self._host, self._port),
-                    timeout=self._timeout,
-                )
+                reader, writer = await _open_within(self._host, self._port, self._timeout)
                 # A concurrent reconnect may have installed its connection
                 # first; close it rather than leak it.
                 replaced = self._writer
