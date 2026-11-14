@@ -97,9 +97,9 @@ class Reason(IntEnum):
     # (status OVERLOADED). It drains as messages are acked: back off and send
     # again.
     QUEUE_FULL = 36
-    # A group read took nothing new: the group's consumers hold too many
-    # records they haven't acked, or it holds dead ones (status OVERLOADED).
-    # Reading again won't help until they ack or nack.
+    # A group read took nothing new: the group is at its cap (records out and
+    # dead together), or the shard's queues and groups are at theirs (status
+    # OVERLOADED). Reading again won't help until room is made.
     GROUP_HELD_FULL = 37
 
     @classmethod

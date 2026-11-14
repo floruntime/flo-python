@@ -457,8 +457,9 @@ class _LimitNotice:
         self._seen.add(e.reason)
         if is_group_held_full(e):
             logger.error(
-                f"{what} refused: the group holds too many records unacked or dead: {e}. "
-                "Backing off until its consumers ack or nack"
+                f"{what} refused: the group, or its shard, is full: {e}. Backing off "
+                "until room is made: acks and nacks, dead records removed (group "
+                "deleted or stream trimmed), or for the shard, others draining"
             )
             return
         logger.error(
@@ -1842,10 +1843,11 @@ class StreamWorker(_RegisteredWorker):
         await self._abandon(delivery, rest)
 
     async def _abandon(self, delivery: GroupReadResult, rest: list[GroupRecord]) -> None:
-        """Hand back records no handler started: ready again at once, the
-        delivery counted but no failure, so a stop spends none of their
-        attempts. Never for a record whose handler failed: abandon never
-        dead-letters, so a poison record would cycle forever."""
+        """Hand back records no handler started, or whose handler the worker
+        itself cut short: ready again at once, the delivery counted but no
+        failure, so a stop spends none of their attempts. Never for a record
+        whose handler failed: abandon never dead-letters, so a poison record
+        would cycle forever."""
         cfg = self.config
         abandon = StreamGroupNackOptions(abandon=True)
         await self._on_ack_connection(
@@ -1979,10 +1981,14 @@ class StreamWorker(_RegisteredWorker):
         )
 
     async def _process_record(self, batch: _HeldBatch, record: GroupRecord) -> None:
-        """Process a single record: call handler, then ack or nack."""
+        """Process a single record: call handler, then ack or nack. A handler
+        cut short by the worker itself (cancelled while it stops, or this task
+        cancelled) is abandoned instead: at max_deliver 1 a nack would
+        dead-letter a record that never failed."""
         assert self._semaphore is not None
         cfg = self.config
         delivery = batch.delivery
+        cancelled = False
         try:
             ctx = StreamContext(
                 record=record,
@@ -1993,25 +1999,59 @@ class StreamWorker(_RegisteredWorker):
             )
             self._running_handlers += 1
             error = ""
+            outcome = "nack"
+            # Not wait_for: a CancelledError from outside this task must be
+            # told apart from one the handler raised.
+            run = asyncio.ensure_future(self._handler(ctx))
             try:
-                await asyncio.wait_for(self._handler(ctx), timeout=cfg.message_timeout)
-                handled = True
-            except Exception as e:
-                logger.error(f"Record processing failed (stream={cfg.stream}, id={record.id}): {e}")
-                handled = False
-                error = str(e) or type(e).__name__
+                await asyncio.wait({run}, timeout=cfg.message_timeout)
+            except asyncio.CancelledError:
+                run.cancel()
+                cancelled = True
+                outcome = "abandon"
+                logger.warning(f"Record handler cancelled with the worker: {record.id}")
             finally:
+                if not cancelled and not run.done():
+                    run.cancel()
+                    with contextlib.suppress(BaseException):
+                        await run
+                    error = f"handler timed out after {cfg.message_timeout}s"
+                    logger.error(
+                        f"Record processing timed out (stream={cfg.stream}, id={record.id})"
+                    )
                 self._running_handlers -= 1
                 await batch.release([record])
+            if not cancelled and not error:
+                try:
+                    run.result()
+                    outcome = "ack"
+                except asyncio.CancelledError:
+                    # The handler was cut short. Only while the worker stops
+                    # is that the worker's doing; otherwise it is a failure.
+                    if self._stop_event.is_set():
+                        outcome = "abandon"
+                        logger.warning(f"Record handler cancelled while stopping: {record.id}")
+                    else:
+                        error = "handler cancelled"
+                        logger.error(
+                            f"Record handler cancelled (stream={cfg.stream}, id={record.id})"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"Record processing failed (stream={cfg.stream}, id={record.id}): {e}"
+                    )
+                    error = str(e) or type(e).__name__
 
             # Outside the handler's error handling: an ack that can't be
             # delivered must not turn into a nack.
-            if handled:
+            if outcome == "ack":
                 await self._on_ack_connection(
                     "ack",
                     record.id,
                     lambda c: c.stream.group_ack(cfg.stream, cfg.group, delivery, [record]),
                 )
+            elif outcome == "abandon":
+                await self._abandon(delivery, [record])
             else:
                 nack = StreamGroupNackOptions(error=_nack_error(error))
                 await self._on_ack_connection(
@@ -2024,13 +2064,16 @@ class StreamWorker(_RegisteredWorker):
         finally:
             batch.drop([record])
             self._semaphore.release()
+        if cancelled:
+            raise asyncio.CancelledError
 
     def stop(self) -> None:
         """Signal the stream worker to stop.
 
         Ends polling, interrupting a blocking read or a reconnect, and a
         drain's wait; records of the last batch not yet started are handed
-        back unstarted (abandoned), so they spend none of their attempts.
+        back unstarted (abandoned), so they spend none of their attempts, and
+        so is a record whose handler is cancelled while the worker stops.
         Running handlers finish and ack before start() returns. A stop before
         start() ends that run at once.
         """

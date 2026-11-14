@@ -24,7 +24,7 @@ class RetryPolicy:
     repairs it. Neither is outcome_pending: that write committed. Nor is
     limit (``LimitError``): it never ran, but retrying won't clear it. Nor is
     overloaded with reason GROUP_HELD_FULL (``GroupHeldFullError``): a group
-    read takes nothing new until the group's consumers ack or nack. A full
+    read takes nothing new until the group or its shard has room. A full
     queue (``QueueFullError``) is retried: it drains as messages are acked.
 
     Attributes:
@@ -97,10 +97,10 @@ def is_refused_unrun(exc: BaseException) -> bool:
 
 
 def is_group_held_full(exc: BaseException) -> bool:
-    """Whether exc is a group read that took nothing new because the group's
-    consumers hold too many records unacked (or it holds dead ones). Never
-    retried by the client: reading again won't help until they ack or nack.
-    A stream worker logs it once and backs off."""
+    """Whether exc is a group read that took nothing new because the group
+    (records out and dead together) or its shard's queues and groups are at
+    their caps. Never retried by the client: reading again won't help until
+    room is made. A stream worker logs it once and backs off."""
     return (
         isinstance(exc, ServerError)
         and exc.status_code == StatusCode.OVERLOADED

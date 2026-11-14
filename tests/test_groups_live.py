@@ -211,7 +211,7 @@ async def test_live_abandoned_records_are_ready_at_once_and_never_dead(
     await client.stream.group_delete("events", "g", ns)
 
 
-async def test_live_a_stopped_worker_abandons_the_records_it_has_not_started(
+async def test_live_a_stopped_worker_abandons_its_cut_short_and_unstarted_records(
     client: FloClient,
 ) -> None:
     ns = fresh_namespace()
@@ -219,15 +219,18 @@ async def test_live_a_stopped_worker_abandons_the_records_it_has_not_started(
     for i in range(3):
         await client.stream.append("events", f"e{i}".encode(), StreamAppendOptions(namespace=ns))
     started = asyncio.Event()
+    gate: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     seen: list[bytes] = []
 
     async def handler(ctx) -> None:  # type: ignore[no-untyped-def]
         seen.append(ctx.payload)
         started.set()
-        await asyncio.sleep(0.5)
+        await gate  # cancelled by the shutdown below
 
-    # One slot, a 60 s lease and max_deliver 1: the two records waiting for a
-    # slot come back only if handed back, and only undead if no failure counts.
+    # One slot, a 60 s lease and max_deliver 1: records come back at once
+    # only if handed back, and undead only if no failure counts. The started
+    # one's handler is cancelled while the worker stops, so it is handed back
+    # too; the two waiting for a slot never started.
     worker = parent.new_stream_worker(
         stream="events",
         group="w",
@@ -242,15 +245,20 @@ async def test_live_a_stopped_worker_abandons_the_records_it_has_not_started(
     try:
         await asyncio.wait_for(started.wait(), 10)
         worker.stop()
+        gate.cancel()
         await asyncio.wait_for(run, timeout=10)
     finally:
         await parent.close()
     assert seen == [b"e0"]
     read = StreamGroupReadOptions(namespace=ns, count=10)
     back = await client.stream.group_read("events", "w", "c2", read)
-    assert [(r.payload, r.deliveries) for r in back.records] == [(b"e1", 2), (b"e2", 2)]
+    assert sorted((r.payload, r.deliveries) for r in back.records) == [
+        (b"e0", 2),
+        (b"e1", 2),
+        (b"e2", 2),
+    ]
     info = await client.stream.group_info("events", "w", ns)
-    assert (info.dead, info.leased) == (0, 2)
+    assert (info.dead, info.leased) == (0, 3)
     await client.stream.group_delete("events", "w", ns)
 
 

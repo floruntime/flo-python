@@ -246,11 +246,13 @@ class QueueFullError(OverloadedError):
 
 
 class GroupHeldFullError(OverloadedError):
-    """A group read took nothing new: the group's consumers hold too many
-    records they haven't acked, or it holds dead ones (reason
-    GROUP_HELD_FULL); the message names the group's or the shard's caps.
-    Reading again won't help until they ack or nack, so the client never
-    retries it; a stream worker logs it and backs off."""
+    """A group read took nothing new (reason GROUP_HELD_FULL); the message
+    names which cap. At the group's cap (records ready, leased and dead
+    together), acks and nacks make room, but dead records stay until the
+    group is deleted or a trim of the stream cuts them. At the shard's cap
+    (its queues and groups together), other groups and queues draining makes
+    room. Reading again won't help until then, so the client never retries
+    it; a stream worker logs it and backs off."""
 
 
 class RateLimitedError(ServerError):

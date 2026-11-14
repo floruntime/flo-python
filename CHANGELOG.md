@@ -17,7 +17,8 @@ The server's op table hash is now `0xc1f93eb0ed86a281` (`TABLE_HASH`).
   overloaded. `QueueFullError` (an `OverloadedError`) is retried like any
   overloaded refusal that didn't run: a full queue drains as messages are
   completed. `GroupHeldFullError` (an `OverloadedError`) is never retried: a
-  group read takes nothing new until the group's consumers ack or nack. The
+  group read takes nothing new until the group (whose dead records count, and
+  stay until it is deleted or the stream trimmed) or its shard has room. The
   stream worker logs it once and backs off, as for a limit;
   `retry.is_group_held_full` tells it apart
 - `StreamGroupNackOptions.abandon` (`OptionTag.ABANDON`, 0x34) hands records
@@ -111,8 +112,10 @@ The server's op table hash is now `0xc1f93eb0ed86a281` (`TABLE_HASH`).
 - An ack, nack or touch to a group that isn't there raises `NotFoundError`,
   not a result with every record `GONE`
 - The stream worker hands back the records of its last batch it hasn't
-  started with abandon, on stop and when its task is cancelled: they spend
-  no attempt (a plain nack spent one)
+  started with abandon, on stop and when its task is cancelled, and so a
+  record whose handler is cancelled while the worker stops: they spend no
+  attempt (a plain nack spent one). A handler that raises while the worker
+  isn't stopping still nacks
 - `LimitError` and the README say the limits are fixed in the server's
   build, not raised by a setting; `TOO_MANY_ACTIONS` counts per shard
 - Queues are at-least-once: a dequeue leases its messages until they're

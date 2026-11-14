@@ -504,7 +504,7 @@ async def test_a_stream_worker_at_group_held_full_logs_once_and_backs_off(
         await asyncio.wait_for(run, timeout=5)
         await fake.shut(server)
     assert reads < 40
-    said = [r for r in caplog.records if "unacked or dead" in r.getMessage()]
+    said = [r for r in caplog.records if "is full" in r.getMessage()]
     assert len(said) == 1 and said[0].levelno == logging.ERROR
 
 
