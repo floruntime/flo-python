@@ -221,10 +221,11 @@ seq = await client.queue.enqueue("tasks", payload, EnqueueOptions(priority=10, d
 
 A queue holds at most its cap of messages and bytes (ready, leased and dead
 together), and a shard's queues their cap of bytes; both are server settings.
-Past either, an enqueue raises `OverloadedError` (ran `NO`, its message naming
-the queue and its caps). The client retries it like any overloaded refusal
-that didn't run, for about 350 ms, before raising it: consume or purge the
-queue first.
+Past either, an enqueue is refused as overloaded with reason `QUEUE_FULL`
+(ran `NO`, its message naming the queue and its caps). It drains as messages
+are completed, so the client retries it like any overloaded refusal that
+didn't run, for about 350 ms, before raising `QueueFullError` (an
+`OverloadedError`): back off and send again, or consume or purge the queue.
 
 ### Dequeue, Complete, Fail, Touch
 
@@ -353,6 +354,15 @@ out is read again, with `deliveries` one higher, so delivery is at least once.
 A record nacked or expired `max_deliver` times (5 by default) is dead and
 isn't read again.
 
+A group holds at most its cap of records and bytes (ready, leased and dead
+together), and a shard's queues and groups together their cap of bytes. A
+read that can take nothing new for either raises `GroupHeldFullError` (an
+`OverloadedError`, reason `GROUP_HELD_FULL`; the message says which cap).
+Reading again won't help until room is made, so the client doesn't retry it.
+At the group's cap, acks and nacks make room, but dead records count too and
+stay until the group is deleted or a trim of the stream cuts them. At the
+shard's cap, other groups and queues on the shard draining makes room.
+
 A group's lease (`ack_timeout_ms`, 5 s to 12 h, 30 s by default) and
 `max_deliver` (1 to 255) are fixed when it is created; the first read of a
 group that doesn't exist creates it at the defaults. A group name is at most
@@ -390,9 +400,18 @@ A report the server can't apply to a record (its lease ran out and it was
 read again, another consumer holds it, or it was acked already) still
 succeeds: that record comes back in `result.refused` with why, and
 `result.lost` lists the ones that aren't `GONE` (acked, which is done).
-Resending an ack is safe. A handler that needs longer than the lease calls
-`group_touch` at least every half lease: with half the lease or less left, the
-lease runs a full lease from now, up to 12 h from the read.
+Resending an ack is safe. A report to a group that isn't there (deleted, say)
+raises `NotFoundError`; it isn't answered record by record. A handler that
+needs longer than the lease calls `group_touch` at least every half lease:
+with half the lease or less left, the lease runs a full lease from now, up to
+12 h from the read.
+
+A nack's `error` is at most 1024 bytes (`ValidationError` past that).
+`StreamGroupNackOptions(abandon=True)` hands records back unstarted: ready at
+once, the delivery counted but no failure, and it takes no `dead`, `delay_ms`
+or `error`. Abandon never dead-letters, so a consumer that abandons on every
+error cycles a poison record forever: abandon only the records it never
+started (it is stopping), and nack the ones that failed.
 
 ```python
 info = await client.stream.group_info("events", "processors")  # ready, leased, dead
@@ -597,7 +616,7 @@ Delivery is at-least-once: a result lost to a dropped connection is resent, and 
 
 Both workers register in the worker registry and heartbeat every 30 s, reporting the handlers they are running. One the server removed after missed heartbeats registers again, with the same options, when its next heartbeat is answered not found.
 
-`worker.drain()` stops taking work and lets the running handlers finish, heartbeats going on; the server is told, so it assigns the worker nothing more, and `start()` returns once the last handler has reported. A drain started on the server does the same. Neither waits out `block_ms`: `drain()` interrupts the worker's own poll connection, so an action worker's held await and a stream worker's held read end at once. A drain started on the server answers an action worker's held await at once, refused as `WORKER_DRAINING`; it doesn't wake a stream worker's held group read, so a stream worker learns of it from its next heartbeat (every 30 s) and only then interrupts its read and leaves. `worker.stop()` ends polling at once, also mid-reconnect or mid-drain; running handlers still finish, and a stream worker hands back (nacks) the records of its last batch it hasn't started; each one handed back spends one of its attempts. Either one before or during `start()` ends that run, and a worker can be started again afterwards.
+`worker.drain()` stops taking work and lets the running handlers finish, heartbeats going on; the server is told, so it assigns the worker nothing more, and `start()` returns once the last handler has reported. A drain started on the server does the same. Neither waits out `block_ms`: `drain()` interrupts the worker's own poll connection, so an action worker's held await and a stream worker's held read end at once. A drain started on the server answers an action worker's held await at once, refused as `WORKER_DRAINING`; it doesn't wake a stream worker's held group read, so a stream worker learns of it from its next heartbeat (every 30 s) and only then interrupts its read and leaves. `worker.stop()` ends polling at once, also mid-reconnect or mid-drain; running handlers still finish, and a stream worker hands back (abandons) the records of its last batch it hasn't started, as it does if its task is cancelled: they are ready again at once, and spend none of their attempts. A record whose handler is cancelled while the worker stops (or whose task the worker's cancellation cuts short) is abandoned the same way, so a rolling restart doesn't dead-letter it at `max_deliver` 1; a handler that raises, `CancelledError` included, while the worker isn't stopping is nacked. Either one before or during `start()` ends that run, and a worker can be started again afterwards.
 
 ### StreamWorker Example
 
@@ -708,15 +727,21 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 | `StaleReportError` | A `ConflictError` with reason `STALE_REPORT`: an action complete, fail or touch for a delivery the run has moved on from (the message says how) |
 | `UnauthorizedError` | Authentication failed |
 | `OverloadedError` | Server is overloaded, and the client's retries ran out |
+| `QueueFullError` | An `OverloadedError` with reason `QUEUE_FULL`: an enqueue found the queue, or its shard's queues and groups, at their caps, and the client's retries ran out |
+| `GroupHeldFullError` | An `OverloadedError` with reason `GROUP_HELD_FULL`: a group read took nothing new because the group is at its cap (records out and dead together) or the shard's queues and groups are at theirs. Never retried |
 | `UnavailableError` | No leader, or the shard isn't taking writes or is offline, and the client's retries ran out (the message says why, and whether an operator must act first) |
 | `StaleNotFoundError` | `kv.get` or `kv.json_get` found no key, but a halted or read-blocked shard answered: absent only as of the entry it couldn't apply |
-| `LimitError` | Status `LIMIT` (15): the node is at one of its limits; `reason` says which (`TOO_MANY_ACTIONS`, `MEMORY_BUDGET`, `TOO_MANY_WORKFLOW_DEFINITIONS`, `TOO_MANY_WORKFLOW_RUNS`). It didn't run. Terminal, never retried (see below) |
+| `LimitError` | Status `LIMIT` (15): the node or shard is at one of its limits; `reason` says which (`TOO_MANY_ACTIONS`, `MEMORY_BUDGET`, `TOO_MANY_WORKFLOW_DEFINITIONS`, `TOO_MANY_WORKFLOW_RUNS`). It didn't run. Terminal, never retried (see below) |
 | `OutcomePendingError` | The write committed but hasn't applied: its shard halted at or before it (reason `SHARD_HALTED`, ran `UNKNOWN`; the message says whether it applies when the shard resumes). Never retried |
 | `InternalServerError` | Server internal error; not retryable (may mean committed but not applied) |
 | `GenericServerError` | Any other error status, including one this SDK doesn't know (`status_code` carries it) |
 | `ConnectionFailedError` | Failed to connect |
 | `RequestTimeoutError` | No response within the timeout |
 | `InvalidChecksumError` | Response CRC32C mismatch |
+
+A refusal's `reason` (and `ran`) that this SDK doesn't know decodes as a
+`Reason` named `UNKNOWN_<n>` that keeps its number; the error still carries
+the server's message.
 
 ### Retries
 
@@ -725,8 +750,9 @@ didn't run it (`error.ran == Ran.NO`), the client sends it again itself, as a
 new request, after a jittered wait. Because the server never ran it, this is
 safe for writes too. That covers a leader that isn't ready yet (reason
 `LEADER_UNKNOWN`), including a node catching up after a restart, and a
-stream read whose records are still being read back from disk. Any other
-refusal, or one that may have run, comes straight back.
+stream read whose records are still being read back from disk, and a full
+queue (`QUEUE_FULL`). Any other refusal, or one that may have run, comes
+straight back, `GROUP_HELD_FULL` included.
 
 `UnavailableError` with ran `NO` is routine, not a fault: a first read of
 records that left the warm store is answered so while the shard reads them
@@ -734,12 +760,14 @@ back from disk. A group read refused this way leased nothing, so sending the
 same one again is safe; the stream worker's read loop does so with a backoff,
 without logging an error.
 
-A `LimitError` is never retried: the node is at one of its limits
+A `LimitError` is never retried: the node or shard is at one of its limits
 (today, registering past the 10,000 actions a shard holds), and retrying won't
-clear it. It isn't permanent either: deleting something, giving the node more
-room, or raising the setting does. For a worker, start() fails with the limit error; a limit hit while running is logged and backed off.
+clear it. The limits are fixed in the server's build, not settings an operator
+raises; deleting something clears it (for `TOO_MANY_ACTIONS`, an action on
+that shard). For a worker, start() fails with the limit error; a limit hit while running is logged and backed off.
 The poll and touch loops log it once per reason, at error, and back off (up
-to 30 s) until it clears.
+to 30 s) until it clears. A stream worker's read loop does the same for
+`GroupHeldFullError`, until the group or the shard has room again.
 
 Two refusals from a halted shard are never retried, and come back after one
 attempt for the caller to decide:

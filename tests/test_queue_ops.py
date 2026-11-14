@@ -20,6 +20,7 @@ from flo.exceptions import (
     BlockTooLongError,
     IncompleteResponseError,
     OverloadedError,
+    QueueFullError,
     UnavailableError,
     ValidationError,
     raise_for_status,
@@ -253,9 +254,9 @@ async def test_a_consumer_dequeues_completes_and_sees_per_message_refusals() -> 
     ) + b"\x02" + struct.pack("<QIQI", 4, 1, 5, 2)
 
 
-async def test_an_enqueue_to_a_full_queue_is_retried_then_raised_overloaded() -> None:
+async def test_an_enqueue_to_a_full_queue_is_retried_then_raised_queue_full() -> None:
     full = _refusal(
-        Reason.UNCLASSIFIED,
+        Reason.QUEUE_FULL,
         Ran.NO,
         b"overloaded: queue 'q' is full: it holds 2 messages (at most 2) and 10 held bytes "
         b"(at most 1024), ready, leased and dead; consume or purge it",
@@ -264,12 +265,13 @@ async def test_an_enqueue_to_a_full_queue_is_retried_then_raised_overloaded() ->
     server, addr = await fake.serve()
     client = await FloClient(addr, timeout_ms=1000, retry=_FAST).connect()
     try:
-        with pytest.raises(OverloadedError) as raised:
+        with pytest.raises(QueueFullError) as raised:
             await client.queue.enqueue("q", b"x", EnqueueOptions(delay_ms=5000))
     finally:
         await client.close()
         await fake.shut(server)
-    assert raised.value.ran == Ran.NO
+    assert isinstance(raised.value, OverloadedError)
+    assert (raised.value.reason, raised.value.ran) == (Reason.QUEUE_FULL, Ran.NO)
     assert "is full" in str(raised.value)
     assert len(fake.ids) == _FAST.max_attempts
     # delay_ms travels as its option, a u64:

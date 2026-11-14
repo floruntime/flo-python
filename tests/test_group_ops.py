@@ -20,7 +20,12 @@ from flo import (
     StreamGroupNackOptions,
     StreamGroupReadOptions,
 )
-from flo.exceptions import BadRequestError, IncompleteResponseError, ValidationError
+from flo.exceptions import (
+    BadRequestError,
+    IncompleteResponseError,
+    NotFoundError,
+    ValidationError,
+)
 from flo.types import OpCode, OptionTag, QueueRefusalReason, Ran, Reason, StatusCode, StreamID
 from flo.wire import (
     OptionsIterator,
@@ -143,9 +148,22 @@ async def test_group_settings_and_names_out_of_bounds_are_refused_before_sending
     ]
     delivery = GroupReadResult(records=[_rec(1, 1, 1)], term=1, index=1, consumer="c")
     refused += [
-        client.stream.group_nack("s", "g", delivery, None, StreamGroupNackOptions(error="x" * 256)),
+        client.stream.group_nack(
+            "s", "g", delivery, None, StreamGroupNackOptions(error="x" * 1025)
+        ),
         client.stream.group_nack(
             "s", "g", delivery, None, StreamGroupNackOptions(delay_ms=86_400_001)
+        ),
+        # Abandon hands records back unstarted: the server refuses it with
+        # any of these.
+        client.stream.group_nack(
+            "s", "g", delivery, None, StreamGroupNackOptions(abandon=True, dead=True)
+        ),
+        client.stream.group_nack(
+            "s", "g", delivery, None, StreamGroupNackOptions(abandon=True, delay_ms=1)
+        ),
+        client.stream.group_nack(
+            "s", "g", delivery, None, StreamGroupNackOptions(abandon=True, error="x")
         ),
     ]
     for call in refused:
@@ -210,11 +228,73 @@ async def test_a_consumer_reads_acks_nacks_and_touches_by_its_delivery() -> None
     )
     assert _value_and_options(ack)[0] == head + struct.pack("<QQIQQI", 3, 40, 1, 1000, 1, 1)
     value, options = _value_and_options(nack)
-    assert value == head + struct.pack("<QQIQQI", 3, 40, 1, 1000, 2, 1)
+    # The error follows the records in the body: [error_len:u16][error].
+    assert value == head + struct.pack("<QQIQQI", 3, 40, 1, 1000, 2, 1) + _str16("boom")
     assert {o.tag: o.data for o in OptionsIterator(options)} == {
         OptionTag.DELAY_MS: struct.pack("<Q", 500),
-        OptionTag.ERROR_TEXT: b"boom",
     }
+
+
+async def _one_nack(options: StreamGroupNackOptions) -> tuple[bytes, dict[int, bytes]]:
+    fake = _Recording(lambda _n, _op, rid: _frame(rid, StatusCode.OK, REPORT_OK))
+    server, addr = await fake.serve()
+    client = await FloClient(addr, namespace="ns", timeout_ms=1000, retry=_FAST).connect()
+    delivery = GroupReadResult(records=[_rec(7, 1, 2)], term=3, index=40, consumer="c1")
+    try:
+        await client.stream.group_nack("s", "g", delivery, None, options)
+    finally:
+        await client.close()
+        await fake.shut(server)
+    ((op, payload),) = fake.payloads
+    assert op == OpCode.STREAM_GROUP_NACK
+    value, options_bytes = _value_and_options(payload)
+    head = _str16("g") + _str16("c1") + struct.pack("<QQIQQI", 3, 40, 1, 7, 1, 2)
+    assert value.startswith(head)
+    return value[len(head) :], {o.tag: o.data for o in OptionsIterator(options_bytes)}
+
+
+async def test_a_nack_carries_a_1024_byte_error_in_its_body() -> None:
+    error = "é" * 512  # 1024 bytes of UTF-8
+    tail, options = await _one_nack(StreamGroupNackOptions(error=error))
+    assert tail == struct.pack("<H", 1024) + error.encode("utf-8")
+    assert options == {}
+
+
+async def test_a_nack_with_no_error_ends_with_a_zero_length() -> None:
+    tail, _ = await _one_nack(StreamGroupNackOptions(dead=True))
+    assert tail == b"\x00\x00"
+
+
+async def test_an_abandon_is_a_void_option_and_an_empty_error() -> None:
+    tail, options = await _one_nack(StreamGroupNackOptions(abandon=True))
+    assert tail == b"\x00\x00"
+    assert options == {OptionTag.ABANDON: b""}
+    assert OptionTag.ABANDON == 0x34
+
+
+@pytest.mark.parametrize(
+    "op", [OpCode.STREAM_GROUP_ACK, OpCode.STREAM_GROUP_NACK, OpCode.STREAM_GROUP_TOUCH]
+)
+async def test_a_report_to_a_missing_group_raises_not_found(op: OpCode) -> None:
+    body = int(Reason.NOT_FOUND).to_bytes(2, "little") + bytes([Ran.NO])
+    body += b"not found: consumer group not found"
+    fake = _Recording(lambda _n, _op, rid: _frame(rid, StatusCode.NOT_FOUND, body))
+    server, addr = await fake.serve()
+    client = await FloClient(addr, namespace="ns", timeout_ms=1000, retry=_FAST).connect()
+    delivery = GroupReadResult(records=[_rec(7, 1, 1)], term=3, index=40, consumer="c1")
+    send = {
+        OpCode.STREAM_GROUP_ACK: client.stream.group_ack,
+        OpCode.STREAM_GROUP_NACK: client.stream.group_nack,
+        OpCode.STREAM_GROUP_TOUCH: client.stream.group_touch,
+    }[op]
+    try:
+        with pytest.raises(NotFoundError) as raised:
+            await send("s", "g", delivery)
+        assert raised.value.reason == Reason.NOT_FOUND
+        assert str(raised.value) == "not found: consumer group not found"
+    finally:
+        await client.close()
+        await fake.shut(server)
 
 
 async def test_a_stale_group_report_succeeds_and_names_each_record_it_skipped() -> None:

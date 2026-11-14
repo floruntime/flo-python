@@ -14,10 +14,11 @@ import pytest
 
 from flo import FloClient, RetryPolicy
 from flo import worker as worker_mod
-from flo.types import HEADER_SIZE, OpCode, Ran, Reason, StatusCode, WorkerStatus
-from flo.wire import REQUEST_HEADER_FORMAT
+from flo.types import HEADER_SIZE, OpCode, OptionTag, Ran, Reason, StatusCode, WorkerStatus
+from flo.wire import REQUEST_HEADER_FORMAT, OptionsIterator
 from flo.worker import ActionContext, ActionWorker, StreamContext, StreamWorker
 
+from .test_group_ops import _value_and_options
 from .test_result_resend import ACTION, NO_TASK, _task, _until
 from .test_retry import _frame
 from .test_stream_worker_ack import REPORT_OK, _records
@@ -457,6 +458,114 @@ async def test_a_stream_stop_hands_back_the_records_it_has_not_started() -> None
         (1000, 2, 1),
         (1000, 3, 1),
     ]
+    # Abandoned, not failed: no error, and the abandon flag, so no attempt is
+    # spent on records no handler started.
+    assert value[at + 60 :] == b"\x00\x00"
+    _, options = _value_and_options(nack)
+    assert {o.tag: o.data for o in OptionsIterator(options)} == {OptionTag.ABANDON: b""}
+
+
+def _nack_kind(payload: bytes) -> tuple[bool, bytes]:
+    """Whether a nack abandons, and the error at the end of its body (one
+    record named)."""
+    _, options = _value_and_options(payload)
+    abandon = OptionTag.ABANDON in {o.tag for o in OptionsIterator(options)}
+    value = _value(payload)
+    group_len = struct.unpack_from("<H", value)[0]
+    consumer_len = struct.unpack_from("<H", value, 2 + group_len)[0]
+    at = 4 + group_len + consumer_len + 20 + 20
+    (n,) = struct.unpack_from("<H", value, at)
+    return abandon, value[at + 2 : at + 2 + n]
+
+
+async def test_a_handler_cancelled_while_the_worker_stops_is_abandoned_not_nacked() -> None:
+    reg = Registry(lambda n: _records(1) if n == 0 else "park")
+    started = asyncio.Event()
+    gate: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    async def handler(_ctx: Any) -> None:
+        started.set()
+        await gate  # cancelled by the shutdown below
+
+    worker = _stream_worker(await reg.listen(), handler)
+    run = asyncio.create_task(worker.start())
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        worker.stop()
+        gate.cancel()
+        await asyncio.wait_for(run, 5)
+    finally:
+        await reg.close()
+    assert reg.of(OpCode.STREAM_GROUP_ACK) == []
+    (nack,) = reg.of(OpCode.STREAM_GROUP_NACK)
+    assert _nack_kind(nack) == (True, b"")
+
+
+async def test_a_running_handler_whose_task_is_cancelled_is_abandoned() -> None:
+    reg = Registry(lambda n: _records(1) if n == 0 else "park")
+    started = asyncio.Event()
+
+    async def handler(_ctx: Any) -> None:
+        started.set()
+        await asyncio.sleep(30)
+
+    worker = _stream_worker(await reg.listen(), handler)
+    run = asyncio.create_task(worker.start())
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        for task in list(worker._tasks):
+            task.cancel()
+        await _until(lambda: bool(reg.of(OpCode.STREAM_GROUP_NACK)), timeout=5)
+        worker.stop()
+        await asyncio.wait_for(run, 5)
+    finally:
+        await reg.close()
+    (nack,) = reg.of(OpCode.STREAM_GROUP_NACK)
+    assert _nack_kind(nack) == (True, b"")
+
+
+@pytest.mark.parametrize(
+    ("raised", "error"),
+    [(ValueError("bad input"), b"bad input"), (asyncio.CancelledError(), b"handler cancelled")],
+    ids=["exception", "cancelled"],
+)
+async def test_a_handler_failing_while_the_worker_runs_is_nacked_not_abandoned(
+    raised: BaseException, error: bytes
+) -> None:
+    reg = Registry(lambda n: _records(1) if n == 0 else "park")
+
+    async def handler(_ctx: Any) -> None:
+        raise raised
+
+    worker = _stream_worker(await reg.listen(), handler)
+    run = asyncio.create_task(worker.start())
+    try:
+        await _until(lambda: bool(reg.of(OpCode.STREAM_GROUP_NACK)), timeout=5)
+        worker.stop()
+        await asyncio.wait_for(run, 5)
+    finally:
+        await reg.close()
+    (nack,) = reg.of(OpCode.STREAM_GROUP_NACK)
+    assert _nack_kind(nack) == (False, error)
+
+
+async def test_a_cancelled_stream_worker_abandons_the_records_it_has_not_started() -> None:
+    reg = Registry(lambda n: _records(3) if n == 0 else "park")
+    started, finished = asyncio.Event(), asyncio.Event()
+    worker = _stream_worker(await reg.listen(), _held(0.3, started, finished), concurrency=1)
+    run = asyncio.create_task(worker.start())
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        run.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(run, 5)
+    finally:
+        await reg.close()
+    (nack,) = reg.of(OpCode.STREAM_GROUP_NACK)
+    _, options = _value_and_options(nack)
+    assert {o.tag: o.data for o in OptionsIterator(options)} == {OptionTag.ABANDON: b""}
+    value = _value(nack)
+    assert value.endswith(struct.pack("<QQI", 1000, 3, 1) + b"\x00\x00")
 
 
 @pytest.mark.parametrize(

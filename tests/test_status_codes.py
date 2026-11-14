@@ -8,11 +8,16 @@ import pytest
 
 from flo import FloClient, RetryPolicy
 from flo.exceptions import (
+    BadRequestError,
+    ConflictError,
     GenericServerError,
+    GroupHeldFullError,
     IncompleteResponseError,
     LimitError,
     NoNamespaceError,
     NotFoundError,
+    OverloadedError,
+    QueueFullError,
     ServerError,
     TableMismatchError,
     UnavailableError,
@@ -191,11 +196,82 @@ def test_a_refusal_carries_its_reason_and_ran() -> None:
     assert str(raised.value) == "do not resend"
 
 
-# b"\x01\x01" is reason 257: read as a byte it would pass as unknown_op.
-@pytest.mark.parametrize("body", [b"\x01\x00", b"\xff\xff\x00", b"\x01\x00\x09", b"\x01\x01\x00"])
-def test_a_body_that_is_not_a_refusal_is_refused(body: bytes) -> None:
+@pytest.mark.parametrize("body", [b"", b"\x01", b"\x01\x00"])
+def test_a_body_too_short_for_a_refusal_is_refused(body: bytes) -> None:
     with pytest.raises(IncompleteResponseError):
         raise_for_status(StatusCode.BAD_REQUEST, body)
+
+
+# b"\x01\x01" is reason 257: read as a byte it would pass as unknown_op.
+@pytest.mark.parametrize(
+    ("body", "reason", "ran"),
+    [(b"\xff\xff\x00", 65535, 0), (b"\x01\x01\x00", 257, 0), (b"\x01\x00\x09", 1, 9)],
+)
+def test_an_unknown_reason_or_ran_decodes_keeping_its_number(
+    body: bytes, reason: int, ran: int
+) -> None:
+    with pytest.raises(BadRequestError) as raised:
+        raise_for_status(StatusCode.BAD_REQUEST, body + b"the server's words")
+    assert int(raised.value.reason) == reason
+    assert int(raised.value.ran) == ran
+    assert str(raised.value) == "the server's words"
+    if reason not in Reason._value2member_map_:
+        assert raised.value.reason.name == f"UNKNOWN_{reason}"
+    # Never NO, so never taken as safe to resend.
+    assert raised.value.ran != Ran.NO or ran == 0
+
+
+def test_an_unknown_reason_survives_pickle_and_copy() -> None:
+    import copy
+    import pickle
+
+    assert pickle.loads(pickle.dumps(Reason(999))) == 999
+    assert copy.deepcopy(Ran(7)) == 7
+
+
+async def test_a_refusal_with_an_unknown_reason_is_read_whole_and_the_next_answer_parses() -> None:
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        served = 0
+        try:
+            while True:
+                header = await reader.readexactly(HEADER_SIZE)
+                _, n, rid, *_ = struct.unpack(REQUEST_HEADER_FORMAT, header)
+                await reader.readexactly(n)
+                if served == 0:
+                    body = (900).to_bytes(2, "little") + bytes([Ran.NO]) + b"a reason from later"
+                    writer.write(_frame(rid, StatusCode.CONFLICT, body))
+                else:
+                    writer.write(_frame(rid, 0, struct.pack("<QI", 7, 6) + b"second\x00"))
+                served += 1
+        except (asyncio.IncompleteReadError, ConnectionError):
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    client = FloClient(f"127.0.0.1:{port}", timeout_ms=1000, retry=RetryPolicy(max_attempts=1))
+    await client.connect()
+    try:
+        with pytest.raises(ConflictError) as raised:
+            await client.kv.get("k")
+        assert int(raised.value.reason) == 900
+        assert raised.value.reason.name == "UNKNOWN_900"
+        assert str(raised.value) == "a reason from later"
+        assert client.is_connected
+        result = await client.kv.get("k")
+        assert result is not None and result.value == b"second"
+    finally:
+        await client.close()
+        server.close()
+
+
+def test_queue_full_and_group_held_full_are_overloaded_with_their_own_errors() -> None:
+    assert (Reason.QUEUE_FULL, Reason.GROUP_HELD_FULL) == (36, 37)
+    with pytest.raises(QueueFullError) as q:
+        raise_for_status(StatusCode.OVERLOADED, _refusal(b"queue full", Reason.QUEUE_FULL))
+    assert isinstance(q.value, OverloadedError) and q.value.reason == Reason.QUEUE_FULL
+    with pytest.raises(GroupHeldFullError) as g:
+        raise_for_status(StatusCode.OVERLOADED, _refusal(b"held full", Reason.GROUP_HELD_FULL))
+    assert isinstance(g.value, OverloadedError) and str(g.value) == "held full"
 
 
 def test_status_15_is_a_limit_carrying_its_reason_and_message() -> None:

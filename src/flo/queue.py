@@ -296,7 +296,7 @@ class QueueOperations:
 
 def parse_dlq_page(data: bytes) -> DlqPage:
     """A dead letter page: [count:u32]([seq:u64][size:u32][len:u32][payload]
-    [enqueued_at_ms:i64][attempts:u32][priority:u8][moved_at_ms:i64])*
+    [enqueued_at_ms:i64][deliveries:u32][priority:u8][moved_at_ms:i64])*
     [total:u64][has_more:u8][last_seq:u64]."""
     pos = 0
 
@@ -315,14 +315,14 @@ def parse_dlq_page(data: bytes) -> DlqPage:
     for _ in range(count):
         seq, size, n = struct.unpack("<QII", take(16))
         payload = take(n)
-        enqueued_at_ms, attempts, priority, moved_at_ms = struct.unpack("<qIBq", take(21))
+        enqueued_at_ms, deliveries, priority, moved_at_ms = struct.unpack("<qIBq", take(21))
         messages.append(
             DeadLetter(
                 seq=seq,
                 size=size,
                 payload=payload,
                 enqueued_at_ms=enqueued_at_ms,
-                attempts=attempts,
+                deliveries=deliveries,
                 priority=priority,
                 moved_at_ms=moved_at_ms,
             )

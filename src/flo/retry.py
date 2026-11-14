@@ -22,7 +22,10 @@ class RetryPolicy:
     a new id; the server routes it afresh. Unavailable with reason
     SHARD_HALTED is not retried: the shard takes no writes until an operator
     repairs it. Neither is outcome_pending: that write committed. Nor is
-    limit (``LimitError``): it never ran, but retrying won't clear it.
+    limit (``LimitError``): it never ran, but retrying won't clear it. Nor is
+    overloaded with reason GROUP_HELD_FULL (``GroupHeldFullError``): a group
+    read takes nothing new until the group or its shard has room. A full
+    queue (``QueueFullError``) is retried: it drains as messages are acked.
 
     Attributes:
         max_attempts: Tries in all, the first included; 1 (or less) turns
@@ -74,7 +77,7 @@ def _refused_unrun(status: StatusCode, data: bytes) -> bool:
     try:
         raise_for_status(status, data)
     except ServerError as e:
-        return e.ran == Ran.NO and e.reason != Reason.SHARD_HALTED
+        return is_refused_unrun(e)
     except Exception:
         return False
     return False
@@ -83,12 +86,25 @@ def _refused_unrun(status: StatusCode, data: bytes) -> bool:
 def is_refused_unrun(exc: BaseException) -> bool:
     """Whether exc is a refusal the server says it didn't run, of a kind worth
     trying again soon. Not a halted shard's: it takes no writes until an
-    operator repairs it (see is_shard_halted)."""
+    operator repairs it (see is_shard_halted). Nor a full group's (see
+    is_group_held_full)."""
     return (
         isinstance(exc, ServerError)
         and exc.status_code in _RETRYABLE
         and exc.ran == Ran.NO
-        and exc.reason != Reason.SHARD_HALTED
+        and exc.reason not in (Reason.SHARD_HALTED, Reason.GROUP_HELD_FULL)
+    )
+
+
+def is_group_held_full(exc: BaseException) -> bool:
+    """Whether exc is a group read that took nothing new because the group
+    (records out and dead together) or its shard's queues and groups are at
+    their caps. Never retried by the client: reading again won't help until
+    room is made. A stream worker logs it once and backs off."""
+    return (
+        isinstance(exc, ServerError)
+        and exc.status_code == StatusCode.OVERLOADED
+        and exc.reason == Reason.GROUP_HELD_FULL
     )
 
 
@@ -106,9 +122,9 @@ def is_shard_halted(exc: BaseException) -> bool:
 
 
 def is_limit(exc: BaseException) -> bool:
-    """Whether exc is a limit refusal: the node is at one of its limits.
-    Never retried by the client, as retrying won't clear it; a worker loop
-    backs off until something is deleted or the limit raised."""
+    """Whether exc is a limit refusal: the node or shard is at one of its
+    limits. Never retried by the client, as retrying won't clear it; a worker
+    loop backs off until something is deleted."""
     return isinstance(exc, ServerError) and exc.status_code == StatusCode.LIMIT
 
 
@@ -141,9 +157,9 @@ def _policy_backoff(policy: RetryPolicy) -> _Backoff:
 # the bottom after a poll that succeeds.
 _WORKER_INITIAL_BACKOFF_S = 0.1
 _WORKER_MAX_BACKOFF_S = 5.0
-# A halted shard stays halted until an operator repairs it, and a limit holds
-# until something is deleted or the limit raised, so a worker asks again less
-# often; it resumes on its own once either clears.
+# A halted shard stays halted until an operator repairs it, a limit holds
+# until something is deleted, and a full group until its consumers ack or
+# nack, so a worker asks again less often; it resumes on its own once it clears.
 _HALTED_MAX_BACKOFF_S = 30.0
 
 

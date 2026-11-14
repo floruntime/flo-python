@@ -562,8 +562,8 @@ MAX_GROUP_BATCH = 100
 MIN_GROUP_LEASE_MS = 5_000
 MAX_GROUP_LEASE_MS = 43_200_000
 MAX_GROUP_NACK_DELAY_MS = 86_400_000
-# A nack's error travels as an option, whose length is one byte.
-MAX_GROUP_NACK_ERROR = 255
+# The longest error a nack carries, in bytes.
+MAX_GROUP_NACK_ERROR = 1024
 
 
 def _str16(what: str, s: str, most: int) -> bytes:
@@ -599,6 +599,15 @@ def serialize_group_report_value(
         + b"".join(
             struct.pack("<QQI", r.id.timestamp_ms, r.id.sequence, r.deliveries) for r in picked
         )
+    )
+
+
+def serialize_group_nack_value(
+    group: str, delivery: GroupReadResult, records: list[GroupRecord] | None, error: str
+) -> bytes:
+    """A nack's value: a report's, then [error_len:u16][error], 0 for none."""
+    return serialize_group_report_value(group, delivery, records) + _str16(
+        "a nack's error", error, MAX_GROUP_NACK_ERROR
     )
 
 

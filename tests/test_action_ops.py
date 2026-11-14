@@ -212,7 +212,7 @@ def test_a_peek_sends_its_limit_and_decodes_the_messages() -> None:
     page = decode_peek_answer(b"\x01" + msg + b"\x01")
     assert page.more is True
     [m] = page.messages
-    assert (m.seq, m.priority, m.attempts, m.enqueued_at_ms, m.size, m.payload) == (
+    assert (m.seq, m.priority, m.deliveries, m.enqueued_at_ms, m.size, m.payload) == (
         9,
         0,
         1,
@@ -233,7 +233,7 @@ def _dead(seq: int, payload: bytes) -> bytes:
 def test_a_dlq_page_decodes_its_letters_and_trailer() -> None:
     data = struct.pack("<I", 2) + _dead(4, b"a") + _dead(6, b"bc") + struct.pack("<QBQ", 7, 1, 6)
     page = parse_dlq_page(data)
-    assert [(d.seq, d.size, d.payload, d.attempts, d.priority) for d in page.messages] == [
+    assert [(d.seq, d.size, d.payload, d.deliveries, d.priority) for d in page.messages] == [
         (4, 11, b"a", 3, 2),
         (6, 12, b"bc", 3, 2),
     ]

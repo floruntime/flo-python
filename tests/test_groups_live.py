@@ -19,7 +19,7 @@ from flo import (
     StreamGroupNackOptions,
     StreamGroupReadOptions,
 )
-from flo.exceptions import BadRequestError, ConflictError
+from flo.exceptions import BadRequestError, ConflictError, NotFoundError, ValidationError
 from flo.types import Ran, Reason
 
 
@@ -158,6 +158,131 @@ async def test_live_a_stream_worker_handles_and_acks_each_record(client: FloClie
         await asyncio.wait_for(run, timeout=10)
     assert sorted(seen) == [b"e0", b"e1", b"e2"]
     assert (info.pending, info.dead) == (0, 0)
+
+
+async def test_live_a_nack_with_a_1024_byte_error_applies(client: FloClient) -> None:
+    # The server keeps a nack's error with the record but serves no read of
+    # it, so the round trip is the nack applied and the record back.
+    ns = fresh_namespace()
+    await client.stream.group_create("events", "g", StreamGroupCreateOptions(namespace=ns))
+    await client.stream.append("events", b"x", StreamAppendOptions(namespace=ns))
+    read = StreamGroupReadOptions(namespace=ns, count=1)
+    got = await client.stream.group_read("events", "g", "c1", read)
+    error = "é" * 512
+    assert len(error.encode("utf-8")) == 1024
+    nacked = await client.stream.group_nack(
+        "events", "g", got, options=StreamGroupNackOptions(namespace=ns, error=error)
+    )
+    assert (nacked.applied, nacked.refused) == (1, [])
+    back = await client.stream.group_read("events", "g", "c1", read)
+    assert [(r.payload, r.deliveries) for r in back.records] == [(b"x", 2)]
+    # One byte more is refused before sending.
+    with pytest.raises(ValidationError):
+        await client.stream.group_nack(
+            "events", "g", back, options=StreamGroupNackOptions(namespace=ns, error=error + "x")
+        )
+    await client.stream.group_delete("events", "g", ns)
+
+
+async def test_live_abandoned_records_are_ready_at_once_and_never_dead(
+    client: FloClient,
+) -> None:
+    # max_deliver 1: one failure would make the record dead.
+    ns = fresh_namespace()
+    await client.stream.group_create(
+        "events", "g", StreamGroupCreateOptions(namespace=ns, ack_timeout_ms=60_000, max_deliver=1)
+    )
+    await client.stream.append("events", b"x", StreamAppendOptions(namespace=ns))
+    read = StreamGroupReadOptions(namespace=ns, count=1)
+    abandon = StreamGroupNackOptions(namespace=ns, abandon=True)
+    for deliveries in (1, 2, 3):
+        got = await client.stream.group_read("events", "g", "c1", read)
+        assert [(r.payload, r.deliveries) for r in got.records] == [(b"x", deliveries)]
+        assert (await client.stream.group_nack("events", "g", got, options=abandon)).applied == 1
+    info = await client.stream.group_info("events", "g", ns)
+    assert (info.ready, info.leased, info.dead) == (1, 0, 0)
+    # A nack that fails it is a failure: dead at once at max_deliver 1.
+    got = await client.stream.group_read("events", "g", "c1", read)
+    assert [r.deliveries for r in got.records] == [4]
+    failed = StreamGroupNackOptions(namespace=ns, error="boom")
+    assert (await client.stream.group_nack("events", "g", got, options=failed)).applied == 1
+    info = await client.stream.group_info("events", "g", ns)
+    assert (info.ready, info.dead) == (0, 1)
+    await client.stream.group_delete("events", "g", ns)
+
+
+async def test_live_a_stopped_worker_abandons_its_cut_short_and_unstarted_records(
+    client: FloClient,
+) -> None:
+    ns = fresh_namespace()
+    parent = FloClient(client._endpoint, namespace=ns, timeout_ms=35000)
+    for i in range(3):
+        await client.stream.append("events", f"e{i}".encode(), StreamAppendOptions(namespace=ns))
+    started = asyncio.Event()
+    gate: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    seen: list[bytes] = []
+
+    async def handler(ctx) -> None:  # type: ignore[no-untyped-def]
+        seen.append(ctx.payload)
+        started.set()
+        await gate  # cancelled by the shutdown below
+
+    # One slot, a 60 s lease and max_deliver 1: records come back at once
+    # only if handed back, and undead only if no failure counts. The started
+    # one's handler is cancelled while the worker stops, so it is handed back
+    # too; the two waiting for a slot never started.
+    worker = parent.new_stream_worker(
+        stream="events",
+        group="w",
+        handler=handler,
+        concurrency=1,
+        batch_size=3,
+        block_ms=500,
+        ack_timeout_ms=60_000,
+        max_deliver=1,
+    )
+    run = asyncio.create_task(worker.start())
+    try:
+        await asyncio.wait_for(started.wait(), 10)
+        worker.stop()
+        gate.cancel()
+        await asyncio.wait_for(run, timeout=10)
+    finally:
+        await parent.close()
+    assert seen == [b"e0"]
+    read = StreamGroupReadOptions(namespace=ns, count=10)
+    back = await client.stream.group_read("events", "w", "c2", read)
+    assert sorted((r.payload, r.deliveries) for r in back.records) == [
+        (b"e0", 2),
+        (b"e1", 2),
+        (b"e2", 2),
+    ]
+    info = await client.stream.group_info("events", "w", ns)
+    assert (info.dead, info.leased) == (0, 3)
+    await client.stream.group_delete("events", "w", ns)
+
+
+async def test_live_a_report_to_a_deleted_group_is_not_found(client: FloClient) -> None:
+    ns = fresh_namespace()
+    await client.stream.group_create("events", "g", StreamGroupCreateOptions(namespace=ns))
+    await client.stream.append("events", b"x", StreamAppendOptions(namespace=ns))
+    got = await client.stream.group_read(
+        "events", "g", "c1", StreamGroupReadOptions(namespace=ns, count=1)
+    )
+    assert got.records
+    await client.stream.group_delete("events", "g", ns)
+    with pytest.raises(NotFoundError):
+        await client.stream.group_ack(
+            "events", "g", got, options=StreamGroupAckOptions(namespace=ns)
+        )
+    with pytest.raises(NotFoundError):
+        await client.stream.group_nack(
+            "events", "g", got, options=StreamGroupNackOptions(namespace=ns, abandon=True)
+        )
+    with pytest.raises(NotFoundError):
+        await client.stream.group_touch(
+            "events", "g", got, options=StreamGroupAckOptions(namespace=ns)
+        )
 
 
 async def test_live_a_transaction_over_one_tag_and_a_key_outside_it(client: FloClient) -> None:
