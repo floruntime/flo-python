@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 The op table hash moves with the server in this release: this SDK talks only
 to the flo it pins, and the pin lands with the release.
-The server's op table hash is now `0xc1f93eb0ed86a281` (`TABLE_HASH`).
+The server's op table hash is now `0x4b8c7cf1921fc323` (`TABLE_HASH`).
 
 ### Added
 
