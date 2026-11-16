@@ -233,8 +233,10 @@ class TSOperations:
         so a point there for the whole read is read exactly once. The
         cursor is opaque.
 
-        A refused filter or cursor raises BadRequestError, and a not-found
-        answer NotFoundError.
+        A refused filter or cursor raises BadRequestError. A read that
+        matches no series of the field (a measurement never written, or a
+        tag filter no series has) raises NotFoundError; a series with no
+        points in the range answers an empty page.
 
         Example:
             opts = TSReadOptions(tags="host=a")

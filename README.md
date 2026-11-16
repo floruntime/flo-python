@@ -344,6 +344,12 @@ result = await client.stream.read("events", StreamReadOptions(tail=True, count=1
 result = await client.stream.read("events", StreamReadOptions(start=last, block_ms=30000))
 ```
 
+A read of a stream that doesn't exist (never created or appended to, or
+deleted) raises `NotFoundError`, while one that exists with nothing to read is
+empty. A blocking read (`block_ms` > 0) of a stream not created yet waits for
+its first append instead. A consumer that may start before its stream exists
+catches `NotFoundError` and starts again.
+
 ### Consumer Groups
 
 Consumer groups let many consumers work through a stream, each record leased
@@ -477,9 +483,11 @@ latest = await client.ts.read("cpu", TSReadOptions(limit=1, order=TSOrder.NEWEST
 
 A tag filter that isn't `key=value` pairs, or a cursor that isn't one a page
 answered, is refused (`BadRequestError`), as is an empty measurement name. A
-refusal on any page, `NotFoundError` included, is raised from `iter_points`
-rather than ending it; a reader that may start before its series exists
-catches `NotFoundError` and starts again.
+read that matches no series of the field (a measurement never written, or a
+tag filter no series has) raises `NotFoundError`; a series with no points in
+the range is an empty page. A refusal on any page, `NotFoundError` included,
+is raised from `iter_points` rather than ending it; a reader that may start
+before its series exists catches `NotFoundError` and starts again.
 
 `datetime` helpers convert at the edges, to the microsecond (`datetime` holds
 no finer): `ns_from_datetime(dt)` takes an aware `datetime`, and

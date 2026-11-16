@@ -117,6 +117,14 @@ class StreamOperations:
         Returns:
             StreamReadResult with list of records.
 
+        Raises:
+            NotFoundError: The stream doesn't exist (never created or
+                appended to, or deleted); one that exists with nothing to
+                read is empty. A blocking read (block_ms > 0) of a stream not
+                created yet waits for its first append instead. A consumer
+                that may start before its stream exists catches it and starts
+                again.
+
         Example:
             # Read from beginning
             result = await client.stream.read("events")

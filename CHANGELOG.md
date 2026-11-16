@@ -34,6 +34,13 @@ The server's op table hash is now `0x4b8c7cf1921fc323` (`TABLE_HASH`).
 
 ### Changed
 
+- `stream.read` of a stream that doesn't exist (never created, or deleted)
+  raises `NotFoundError`, as the server now answers; an existing stream
+  with nothing to read is still empty, and a blocking read of a stream not
+  created yet still waits for its first append. `ts.read` and `iter_points`
+  raise `NotFoundError` when no series of the field matches. A consumer
+  that may start before its stream or series exists catches it and starts
+  again
 - A stream worker whose read is answered not found fails `start()` with
   `NotFoundError` instead of retrying as if the stream were empty
 - A worker task cancelled while its handler runs waits (up to the handler
