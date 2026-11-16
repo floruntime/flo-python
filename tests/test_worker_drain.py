@@ -24,8 +24,9 @@ from .test_retry import _frame
 from .test_stream_worker_ack import REPORT_OK, _records
 
 # How the fake answers the nth poll (await or group read): bytes to send,
-# None for an empty answer after a short wait, or "park" to never answer.
-Poll = Callable[[int], "bytes | None | str"]
+# None for an empty answer after a short wait, "park" to never answer, or a
+# (status, body) refusal.
+Poll = Callable[[int], "bytes | None | str | tuple[StatusCode, bytes]"]
 
 
 def _value(payload: bytes) -> bytes:
@@ -128,6 +129,9 @@ class Registry:
                     if answer is None:
                         await asyncio.sleep(0.02)
                         answer = NO_TASK if op == OpCode.ACTION_AWAIT else _records(0)
+                    if isinstance(answer, tuple):
+                        writer.write(_frame(request_id, *answer))
+                        continue
                     assert isinstance(answer, bytes)
                     writer.write(_frame(request_id, StatusCode.OK, answer))
                     continue

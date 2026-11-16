@@ -172,6 +172,16 @@ async def _cancel(task: "asyncio.Future[Any]") -> None:
         task.exception()  # retrieved: it finished or failed as it was cancelled
 
 
+async def _settle(run: "asyncio.Future[Any]", timeout: float | None) -> None:
+    """Wait up to `timeout` for a cancelled handler run to end, retrieving
+    its outcome. Not `suppress(BaseException)` around `await run`: that also
+    swallows a cancel aimed at this task, which must propagate."""
+    if not run.done():
+        await asyncio.wait({run}, timeout=timeout)
+    if run.done() and not run.cancelled():
+        run.exception()
+
+
 def _lost(e: BaseException) -> bool:
     """Whether a request failed for want of a connection, not by refusal."""
     return is_connection_error(e) or isinstance(e, asyncio.TimeoutError)
@@ -243,6 +253,9 @@ class _RegisteredWorker:
         self._leave_event = asyncio.Event()
         self._notice_due = False
         self._heartbeat_task: asyncio.Task[None] | None = None
+        # Clear while start() runs: close() waits on it.
+        self._run_ended = asyncio.Event()
+        self._run_ended.set()
 
     @property
     def _worker_id(self) -> str:
@@ -328,6 +341,22 @@ class _RegisteredWorker:
         self._drain_event.clear()
         self._leave_event.clear()
         self._notice_due = False
+
+    async def _await_run(self, timeout: float) -> None:
+        """Wait up to `timeout` seconds for a running start() to return, so
+        the outcomes of its running handlers are sent before the caller
+        closes the connections they go on."""
+        if self._run_ended.is_set():
+            return
+        waiter = asyncio.ensure_future(self._run_ended.wait())
+        try:
+            done, _ = await asyncio.wait({waiter}, timeout=timeout)
+        finally:
+            waiter.cancel()
+        if not done:
+            logger.warning(
+                f"Worker run didn't end within {timeout}s of close(); closing its connections"
+            )
 
     async def _heartbeat(self) -> None:
         """Send one heartbeat, registering again if the server removed this
@@ -897,6 +926,7 @@ class ActionWorker(_RegisteredWorker):
         )
 
         self._running = True
+        self._run_ended.clear()
         registered = False
         try:
             # A dedicated connection, with the parent client's endpoint and
@@ -970,6 +1000,7 @@ class ActionWorker(_RegisteredWorker):
                 self._client = None
             self._running = False
             self._end_run()
+            self._run_ended.set()
             logger.info("Worker stopped")
 
     @property
@@ -1213,9 +1244,11 @@ class ActionWorker(_RegisteredWorker):
             await asyncio.wait({run}, timeout=self.config.action_timeout)
         except asyncio.CancelledError:
             # This task was cancelled from outside, not by its handler: hand
-            # the run back untried, so no attempt is spent.
+            # the run back untried, so no attempt is spent, once the handler
+            # has ended.
             run.cancel()
             logger.warning(f"Action cancelled: {task.action}")
+            await _settle(run, self.config.action_timeout)
             return fail("Action cancelled", cancelled=True, abandoned=True)
         finally:
             if touching is not None:
@@ -1225,12 +1258,15 @@ class ActionWorker(_RegisteredWorker):
                 with contextlib.suppress(Exception):
                     await asyncio.shield(touching)
         if not run.done():
-            run.cancel()
-            with contextlib.suppress(BaseException):
-                await run
             # A failure like any other: the run goes again while attempts
             # are left. Only NonRetryableError fails it at once.
             logger.error(f"Action timed out: {task.action}")
+            run.cancel()
+            try:
+                await _settle(run, self.config.action_timeout)
+            except asyncio.CancelledError:
+                # Cancelled from outside meanwhile: report, then re-raise.
+                return fail("Action timed out", cancelled=True)
             return fail("Action timed out")
         try:
             result = run.result()
@@ -1312,9 +1348,12 @@ class ActionWorker(_RegisteredWorker):
         logger.info("Stopping worker...")
         self._signal_stop()
 
-    async def close(self) -> None:
-        """Stop and close the worker."""
+    async def close(self, timeout: float = 30.0) -> None:
+        """Stop the worker and wait up to ``timeout`` seconds for start() to
+        return: its running handlers finish and their results are sent. Then
+        close its connections, cutting short whatever is still running."""
         self.stop()
+        await self._await_run(timeout)
         if self._result_client:
             await self._result_client.close()
         if self._client:
@@ -1562,6 +1601,8 @@ class StreamWorker(_RegisteredWorker):
             LimitError: Registering or setting up the group was refused at a
                 limit. start() fails with the limit error; a limit hit while
                 running is logged and backed off.
+            NotFoundError: A read found no such stream. A worker that may
+                start before its stream exists catches it and starts again.
         """
         logger.info(
             f"Starting stream worker (stream={self.config.stream}, "
@@ -1570,6 +1611,7 @@ class StreamWorker(_RegisteredWorker):
         )
 
         self._running = True
+        self._run_ended.clear()
         registered = False
         try:
             worker_timeout_ms = int(self._parent_client._timeout * 1000)
@@ -1634,6 +1676,7 @@ class StreamWorker(_RegisteredWorker):
 
             self._running = False
             self._end_run()
+            self._run_ended.set()
             logger.info("Stream worker stopped")
 
     async def _setup_group(self) -> None:
@@ -1774,6 +1817,11 @@ class StreamWorker(_RegisteredWorker):
                     # A stop or drain interrupted the read. Reconnecting would
                     # also reconnect the ack connection under the handlers.
                     break
+                if isinstance(e, NotFoundError):
+                    # No such stream: start() fails with it. Retrying would
+                    # look like an empty stream; a caller that starts before
+                    # the stream exists catches it and starts again.
+                    raise
                 if is_connection_error(e):
                     logger.warning("Stream worker lost connection, reconnecting...")
                     try:
@@ -2005,20 +2053,21 @@ class StreamWorker(_RegisteredWorker):
             run = asyncio.ensure_future(self._handler(ctx))
             try:
                 await asyncio.wait({run}, timeout=cfg.message_timeout)
+                if not run.done():
+                    error = f"handler timed out after {cfg.message_timeout}s"
+                    logger.error(
+                        f"Record processing timed out (stream={cfg.stream}, id={record.id})"
+                    )
+                    run.cancel()
+                    # A cancel aimed at this task meanwhile lands below.
+                    await _settle(run, cfg.message_timeout)
             except asyncio.CancelledError:
                 run.cancel()
                 cancelled = True
                 outcome = "abandon"
                 logger.warning(f"Record handler cancelled with the worker: {record.id}")
+                await _settle(run, cfg.message_timeout)
             finally:
-                if not cancelled and not run.done():
-                    run.cancel()
-                    with contextlib.suppress(BaseException):
-                        await run
-                    error = f"handler timed out after {cfg.message_timeout}s"
-                    logger.error(
-                        f"Record processing timed out (stream={cfg.stream}, id={record.id})"
-                    )
                 self._running_handlers -= 1
                 await batch.release([record])
             if not cancelled and not error:
@@ -2080,9 +2129,13 @@ class StreamWorker(_RegisteredWorker):
         logger.info("Stopping stream worker...")
         self._signal_stop()
 
-    async def close(self) -> None:
-        """Stop and close the stream worker."""
+    async def close(self, timeout: float = 30.0) -> None:
+        """Stop the stream worker and wait up to ``timeout`` seconds for
+        start() to return: running handlers finish and ack, and the records
+        not started are handed back. Then close its connections, cutting
+        short whatever is still running."""
         self.stop()
+        await self._await_run(timeout)
         if self._client:
             await self._client.close()
         if self._ack_client:

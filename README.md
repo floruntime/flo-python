@@ -34,6 +34,7 @@ asyncio.run(main())
 - **KV Store**: Versioned key-value storage with MVCC, TTL, and optimistic locking
 - **Queues**: Priority task queues, at-least-once: a dequeue leases its messages until they're completed
 - **Streams**: Append-only logs with consumer groups for distributed processing
+- **Time series**: Points in nanoseconds, read a page at a time either way, and FloQL
 - **Actions**: Registered tasks with configurable timeouts and retries
 - **Workers**: Distributed task execution with lease management and heartbeats
 - **Async/await**: Native asyncio support for high-performance applications
@@ -361,7 +362,8 @@ read that can take nothing new for either raises `GroupHeldFullError` (an
 Reading again won't help until room is made, so the client doesn't retry it.
 At the group's cap, acks and nacks make room, but dead records count too and
 stay until the group is deleted or a trim of the stream cuts them. At the
-shard's cap, other groups and queues on the shard draining makes room.
+shard's cap, this group's own acks free room, as do other groups and queues on
+the shard draining.
 
 A group's lease (`ack_timeout_ms`, 5 s to 12 h, 30 s by default) and
 `max_deliver` (1 to 255) are fixed when it is created; the first read of a
@@ -420,6 +422,100 @@ groups = await client.stream.group_list("events")
 members = await client.stream.group_members("events", "processors")  # consumers holding records
 await client.stream.group_delete("events", "processors")
 ```
+
+## Time-Series Operations
+
+Every time on the wire is Unix nanoseconds, a Python `int`. A point's
+measurement is the request key; its field defaults to `value`, and its tags
+(`"k=v,k2=v2"` or a dict) name the series.
+
+### Write
+
+```python
+import time
+from flo import TSWriteOptions
+
+r = await client.ts.write("cpu", 0.42, TSWriteOptions(tags={"host": "a"}, time_ns=time.time_ns()))
+print(r.time_ns)  # the point's time, in ns
+
+# No time (or 0): the server's time, answered in r.time_ns.
+await client.ts.write("cpu", 0.40, TSWriteOptions(tags={"host": "a"}))
+```
+
+A time before 1970 is refused (`BadRequestError`), and a value that isn't
+finite is refused before it is sent.
+
+### Read
+
+`ts.read` answers one page: the points of every series that matches the
+field and tag filter, merged by time and then by write order, oldest first or
+`TSOrder.NEWEST_FIRST`, at most `limit` (1..4096, 4096 by default), within
+`from_ns`..`to_ns` (inclusive) when given. Ask again with the page's cursor
+until it is `None`; a short page doesn't mean the last one. A page goes on
+strictly after the cursor (before it, newest first), so a point there for the
+whole read is read exactly once. The cursor is opaque bytes.
+
+```python
+from flo import TSOrder, TSReadOptions
+
+opts = TSReadOptions(tags="host=a", limit=1000)
+while True:
+    page = await client.ts.read("cpu", opts)
+    for p in page.points:
+        print(p.time_ns, p.value)
+    if page.cursor is None:
+        break
+    opts.cursor = page.cursor
+
+# Or let the iterator page: every point, newest first.
+async for p in client.ts.iter_points("cpu", TSReadOptions(order=TSOrder.NEWEST_FIRST)):
+    print(p.time_ns, p.value)
+
+# The latest point.
+latest = await client.ts.read("cpu", TSReadOptions(limit=1, order=TSOrder.NEWEST_FIRST))
+```
+
+A tag filter that isn't `key=value` pairs, or a cursor that isn't one a page
+answered, is refused (`BadRequestError`), as is an empty measurement name. A
+refusal on any page, `NotFoundError` included, is raised from `iter_points`
+rather than ending it; a reader that may start before its series exists
+catches `NotFoundError` and starts again.
+
+`datetime` helpers convert at the edges, to the microsecond (`datetime` holds
+no finer): `ns_from_datetime(dt)` takes an aware `datetime`, and
+`datetime_from_ns(ns)` and `TSPoint.time` give one in UTC. The ns `int` stays
+the exact value.
+
+### FloQL
+
+```python
+series = await client.ts.floql("cpu[1h] | avg()")
+for s in series:
+    for p in s.points:
+        print(s.key, p.time_ns, p.value)
+```
+
+FloQL doesn't page: an answer of more than 4096 raw points is refused
+(`BadRequestError`, with the server's text). Aggregate them, narrow the
+query, or page through them with `ts.read`.
+
+## Processing
+
+```python
+job_id = await client.processing.submit(open("pipeline.yaml").read())
+status = await client.processing.status(job_id)
+print(status.status, status.runtime.records_in, status.runtime.late_points)
+```
+
+A TS source reads its field up to its `lateness_ms` window behind the
+field's newest point (30 s by default, at most a day; 0 reads with no
+window), so it lags by up to the window. A point that arrives later than
+that is never read by the source, and is counted: `runtime.late_points`
+says at least that many of the job's source points came in more than
+`runtime.late_edge_ms` behind their field's newest. The server counts at
+fixed edges (0 s, 1 s, 5 s, 15 s, 30 s, 1 m, 5 m, 1 h), against the smallest
+at or above the job's largest window. Both are `None` for a job with no TS
+source, or a window past an hour.
 
 ## Action Operations
 
@@ -617,6 +713,10 @@ Delivery is at-least-once: a result lost to a dropped connection is resent, and 
 Both workers register in the worker registry and heartbeat every 30 s, reporting the handlers they are running. One the server removed after missed heartbeats registers again, with the same options, when its next heartbeat is answered not found.
 
 `worker.drain()` stops taking work and lets the running handlers finish, heartbeats going on; the server is told, so it assigns the worker nothing more, and `start()` returns once the last handler has reported. A drain started on the server does the same. Neither waits out `block_ms`: `drain()` interrupts the worker's own poll connection, so an action worker's held await and a stream worker's held read end at once. A drain started on the server answers an action worker's held await at once, refused as `WORKER_DRAINING`; it doesn't wake a stream worker's held group read, so a stream worker learns of it from its next heartbeat (every 30 s) and only then interrupts its read and leaves. `worker.stop()` ends polling at once, also mid-reconnect or mid-drain; running handlers still finish, and a stream worker hands back (abandons) the records of its last batch it hasn't started, as it does if its task is cancelled: they are ready again at once, and spend none of their attempts. A record whose handler is cancelled while the worker stops (or whose task the worker's cancellation cuts short) is abandoned the same way, so a rolling restart doesn't dead-letter it at `max_deliver` 1; a handler that raises, `CancelledError` included, while the worker isn't stopping is nacked. Either one before or during `start()` ends that run, and a worker can be started again afterwards.
+
+`await worker.close(timeout=30.0)` stops the worker and waits up to `timeout` seconds for `start()` to return, so running handlers' completes, fails, acks and nacks, and a stream worker's hand-backs, are sent before it closes the worker's connections. Past the timeout it closes them anyway, cutting short whatever still runs.
+
+A stream worker whose read is answered not found fails `start()` with `NotFoundError` rather than reading on as if the stream were empty. A worker that may start before its stream exists catches it and starts again.
 
 ### StreamWorker Example
 

@@ -13,6 +13,24 @@ The server's op table hash is now `0xc1f93eb0ed86a281` (`TABLE_HASH`).
 
 ### Added
 
+- `client.ts`: `write`, `read` (one page), `iter_points` (every page) and
+  `floql`. A read takes `field`, `tags`, `from_ns`/`to_ns` (inclusive),
+  `limit` (1..4096) and `order` (`TSOrder.OLDEST_FIRST` or `NEWEST_FIRST`),
+  and answers the points of every matching series merged by time, then
+  write order, with an opaque cursor that is `None` on the last page. A
+  page goes on strictly past the cursor, so no point is read twice or
+  skipped; page until the cursor is `None`, not until a page is short
+- Times are Unix ns `int`s: `TSWriteOptions.time_ns` (`OptionTag.TS_TIMESTAMP_NS`,
+  0x67, an i64; none or 0 is the server's time), `TSWriteResult.time_ns`,
+  `TSPoint.time_ns`, `FloQLPoint.time_ns`. `ns_from_datetime` and
+  `datetime_from_ns` (and `TSPoint.time`) convert at the microsecond
+- `ProcessingRuntime.late_edge_ms` and `late_points`: at least that many of
+  a job's TS source points came in later than the edge at or above its
+  lateness window, so its sources never read them; both `None` for a job
+  with no TS source
+- `ActionWorker.close(timeout=30.0)` and `StreamWorker.close(timeout=30.0)`
+  wait up to `timeout` for `start()` to return, so in-flight completes,
+  fails, acks, nacks and hand-backs are sent before the connections close
 - `Reason.QUEUE_FULL` (36) and `GROUP_HELD_FULL` (37), both under status
   overloaded. `QueueFullError` (an `OverloadedError`) is retried like any
   overloaded refusal that didn't run: a full queue drains as messages are
@@ -107,6 +125,14 @@ The server's op table hash is now `0xc1f93eb0ed86a281` (`TABLE_HASH`).
 
 ### Changed
 
+- A stream worker whose read is answered not found fails `start()` with
+  `NotFoundError` instead of retrying as if the stream were empty
+- A worker task cancelled while its handler runs waits (up to the handler
+  timeout) for the handler to end before handing the work back; a cancel
+  aimed at the task while a timed-out handler ends is no longer swallowed
+- A FloQL answer of more than 4096 raw points is refused by the server
+  (`BadRequestError`, with its text); aggregate, narrow, or page with
+  `ts.read`
 - A group nack carries its error in the body, at most 1024 bytes (was an
   option of at most 255); over 1024 raises `ValidationError` before sending
 - An ack, nack or touch to a group that isn't there raises `NotFoundError`,
@@ -178,6 +204,8 @@ The server's op table hash is now `0xc1f93eb0ed86a281` (`TABLE_HASH`).
 
 ### Breaking
 
+- `OptionTag.TS_TIMESTAMP` is `TS_TIMESTAMP_NS`: the server reads it as ns,
+  so a time sent as ms lands near 1970. A time before 1970 is refused
 - `PeekedMessage.attempts` and `DeadLetter.attempts` are now `deliveries`, as
   the server names them
 - `OptionTag.ERROR_TEXT` (0x33) is gone: a nack's error is in its body

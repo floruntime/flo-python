@@ -250,9 +250,10 @@ class GroupHeldFullError(OverloadedError):
     names which cap. At the group's cap (records ready, leased and dead
     together), acks and nacks make room, but dead records stay until the
     group is deleted or a trim of the stream cuts them. At the shard's cap
-    (its queues and groups together), other groups and queues draining makes
-    room. Reading again won't help until then, so the client never retries
-    it; a stream worker logs it and backs off."""
+    (its queues and groups together), this group's own acks free room, as do
+    other groups and queues on the shard draining. Reading again won't help
+    until then, so the client never retries it; a stream worker logs it and
+    backs off."""
 
 
 class RateLimitedError(ServerError):
