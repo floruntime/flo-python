@@ -15,8 +15,17 @@ def _s(v: str) -> bytes:
 
 YAML = b"name: pipe\n"
 # This node's runtime of the job, then its definition.
-RUNTIME = b"\x01" + struct.pack("<QQqQQQ", 10, 9, 500, 12, 40, 3000)
+# The late edge maxInt(u64): no TS source, so no late count.
+NO_EDGE = (1 << 64) - 1
+RUNTIME = b"\x01" + struct.pack("<QQqQQQQQ", 10, 9, 500, 12, 40, 3000, NO_EDGE, 0)
 TAIL = RUNTIME + struct.pack("<I", len(YAML)) + YAML
+
+
+def _tail(late_edge_ms: int, late_points: int) -> bytes:
+    runtime = b"\x01" + struct.pack(
+        "<QQqQQQQQ", 10, 9, 500, 12, 40, 3000, late_edge_ms, late_points
+    )
+    return runtime + struct.pack("<I", len(YAML)) + YAML
 
 
 def _status(status: int, reason: bytes, tail: bytes = TAIL) -> bytes:
@@ -41,9 +50,28 @@ def test_status() -> None:
             tick_avg_us=12,
             tick_max_us=40,
             uptime_ms=3000,
+            late_edge_ms=None,
+            late_points=None,
         ),
         yaml=YAML,
     )
+
+
+def test_status_late_points_past_an_edge() -> None:
+    runtime = _parse_processing_status(_status(0, _s(""), _tail(30_000, 7))).runtime
+    assert (runtime.late_edge_ms, runtime.late_points) == (30_000, 7)
+
+
+def test_status_late_points_none_counted_yet() -> None:
+    runtime = _parse_processing_status(_status(0, _s(""), _tail(60_000, 0))).runtime
+    assert (runtime.late_edge_ms, runtime.late_points) == (60_000, 0)
+
+
+def test_status_late_edge_max_means_no_count() -> None:
+    # The count is ignored with the maxInt edge, whatever it holds.
+    runtime = _parse_processing_status(_status(0, _s(""), _tail(NO_EDGE, 5))).runtime
+    assert runtime.late_edge_ms is None
+    assert runtime.late_points is None
 
 
 @pytest.mark.parametrize("cut", range(1, len(TAIL) + 1))

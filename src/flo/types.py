@@ -5,6 +5,7 @@ Core types, constants, and data classes for the Flo client SDK.
 
 import struct
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import IntEnum
 from typing import Any, Generic, Optional, TypeVar
 
@@ -23,6 +24,7 @@ TABLE_HASH: int = 0xC1F93EB0ED86A281
 # it, or blocked reading it from disk) answered a read from its state just
 # before that entry. The read succeeded.
 RESPONSE_STALE: int = 0x01
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 class Reason(IntEnum):
@@ -410,7 +412,7 @@ class OptionTag(IntEnum):
     TS_AGGREGATION = 0x63  # string: Aggregation function name (avg, sum, count, min, max)
     TS_FIELD = 0x64  # string: Field name filter (empty = "value")
     TS_TAGS = 0x65  # string: Comma-separated tag filters "key=val,key2=val2"
-    TS_TIMESTAMP = 0x67  # i64: Explicit timestamp for write (0 = server-assigned)
+    TS_TIMESTAMP_NS = 0x67  # i64: a write's time in Unix ns (0 = the server's time; < 0 refused)
     TS_RAW_TTL = 0x68  # string: Raw data TTL (e.g., "7d")
     TS_DOWNSAMPLE = 0x69  # string: Downsample rule (e.g., "1m:avg:30d")
 
@@ -1787,6 +1789,14 @@ class ProcessingRuntime:
     tick_avg_us: int
     tick_max_us: int
     uptime_ms: int  # Since the earliest of them started
+    # At least late_points of the job's TS source fields' points came in
+    # more than late_edge_ms behind their field's newest point, so its
+    # sources never read them. The server counts at fixed edges:
+    # late_edge_ms is the smallest at or above the job's largest TS source
+    # lateness window. Both None when the job has no TS source here, or
+    # its window is past the largest edge (an hour).
+    late_edge_ms: int | None = None
+    late_points: int | None = None
 
 
 @dataclass
@@ -1837,3 +1847,122 @@ class ProcessingSyncResult:
 
     name: str
     job_id: str
+
+
+# =============================================================================
+# Time series
+# =============================================================================
+
+# The most points one ts.read page holds.
+MAX_TS_READ: int = 4096
+# A ts.read tag filter's longest text, in bytes.
+MAX_TS_TAG_FILTER: int = 1024
+
+
+class TSOrder(IntEnum):
+    """Which way a ts.read goes through the points."""
+
+    OLDEST_FIRST = 0
+    NEWEST_FIRST = 1
+
+
+@dataclass
+class TSPoint:
+    """One point of a ts.read: its time in Unix nanoseconds, and its value."""
+
+    time_ns: int
+    value: float
+
+    @property
+    def time(self) -> datetime:
+        """The time as a UTC datetime, cut to the microsecond: time_ns is exact."""
+        return datetime_from_ns(self.time_ns)
+
+
+@dataclass
+class TSReadOptions:
+    """Options for a ts.read page."""
+
+    namespace: str | None = None
+    field: str = "value"
+    # Only series whose tags include every pair: "k=v,k2=v2", or a dict.
+    tags: str | dict[str, str] = ""
+    # Inclusive bounds in Unix ns, 0 or more; None for no bound.
+    from_ns: int | None = None
+    to_ns: int | None = None
+    limit: int = MAX_TS_READ  # 1..4096 points per page
+    order: TSOrder = TSOrder.OLDEST_FIRST
+    # The cursor the page before answered; None for the first page.
+    cursor: bytes | None = None
+
+
+@dataclass
+class TSReadResult:
+    """A page of a ts.read: the points of every matching series merged in
+    time order (then write order), or newest first; and the cursor for the
+    next page, None on the last."""
+
+    points: list[TSPoint]
+    cursor: bytes | None
+    stale: bool = False
+
+    @property
+    def has_more(self) -> bool:
+        return self.cursor is not None
+
+
+@dataclass
+class TSWriteOptions:
+    """Options for a ts.write."""
+
+    namespace: str | None = None
+    field: str = "value"
+    # The series' tags: "k=v,k2=v2", or a dict.
+    tags: str | dict[str, str] = ""
+    # The point's time in Unix ns; None or 0 for the server's time.
+    time_ns: int | None = None
+
+
+@dataclass
+class TSWriteResult:
+    """A written point: its time in Unix ns (the server's, if none was
+    given) and the log index it was written at."""
+
+    time_ns: int
+    sequence: int
+    series_hash: int
+
+
+@dataclass
+class FloQLPoint:
+    """One point of a FloQL answer: its time in Unix nanoseconds, and its value."""
+
+    time_ns: int
+    value: float
+
+
+@dataclass
+class FloQLSeries:
+    """One series of a FloQL answer."""
+
+    key: str
+    field: str
+    points: list[FloQLPoint]
+
+
+_NS_PER_US = 1_000
+
+
+def ns_from_datetime(dt: datetime) -> int:
+    """An aware datetime as Unix nanoseconds, exact to its microsecond. A
+    naive one is refused (ValueError): its zone is a guess."""
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        raise ValueError("a datetime needs a time zone to be a point in time")
+    delta = dt - _EPOCH
+    us = (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+    return us * _NS_PER_US
+
+
+def datetime_from_ns(ns: int) -> datetime:
+    """Unix nanoseconds as a UTC datetime, cut to the microsecond."""
+    return _EPOCH + timedelta(microseconds=ns // _NS_PER_US)

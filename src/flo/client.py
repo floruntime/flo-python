@@ -114,6 +114,7 @@ class FloClient:
         from .processing import ProcessingOperations
         from .queue import QueueOperations
         from .streams import StreamOperations
+        from .ts import TSOperations
         from .workflows import WorkflowOperations
 
         self.kv = KVOperations(self)
@@ -123,6 +124,7 @@ class FloClient:
         self.worker = WorkerOperations(self)
         self.workflow = WorkflowOperations(self)
         self.processing = ProcessingOperations(self)
+        self.ts = TSOperations(self)
 
         if debug:
             logging.basicConfig(level=logging.DEBUG)

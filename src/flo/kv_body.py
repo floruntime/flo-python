@@ -1,6 +1,6 @@
 """The ops on the server's op table: KV, the action reports and reads,
 worker.list and worker.info, stream group reads, the queue's dequeue,
-reports and peek, and processing.remove.
+reports and peek, ts.read and ts.info, and processing.remove.
 
 The request is ``[namespace][key][body]``, the body coded by the op's
 schema, field by field in order. An optional field is a presence byte then
@@ -123,6 +123,7 @@ _TABLE_OPS = frozenset(
         OpCode.QUEUE_COMPLETE,
         OpCode.QUEUE_FAIL,
         OpCode.QUEUE_TOUCH,
+        OpCode.TS_READ,
         OpCode.TS_INFO,
         OpCode.PROCESSING_REMOVE,
     }
