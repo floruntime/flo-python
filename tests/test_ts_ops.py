@@ -421,7 +421,7 @@ async def test_query_sends_options_and_surfaces_the_window_refusal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     text = (
-        b"bad request: the range holds more than 1024 windows of this width; "
+        b"bad request: the matching points span more than 1024 windows of this width; "
         b"widen the window (it is in nanoseconds) or narrow the range"
     )
     client, calls = _paged(monkeypatch, [_refusal(StatusCode.BAD_REQUEST, text)])

@@ -234,7 +234,7 @@ async def test_live_a_query_of_more_than_1024_windows_is_refused(
     with pytest.raises(BadRequestError) as e:
         await client.ts.query(written.measurement, TSQueryOptions(window=1))
     assert str(e.value) == (
-        "bad request: the range holds more than 1024 windows of this width; "
+        "bad request: the matching points span more than 1024 windows of this width; "
         "widen the window (it is in nanoseconds) or narrow the range"
     )
 
