@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 _PROCESSING_STATUS_NAMES = ["running", "stopped", "cancelled", "failed", "completed"]
 # The most jobs one list page holds.
 _MAX_PROCESSING_LIST = 1024
+_NO_LATE_EDGE = (1 << 64) - 1
 
 
 class ProcessingOperations:
@@ -211,6 +212,7 @@ def _parse_processing_status(data: bytes) -> ProcessingStatusResult:
                  [reason_len:u16][reason]
                  [running:u8][records_in:u64][records_out:u64][watermark_ms:i64]
                  [tick_avg_us:u64][tick_max_us:u64][uptime_ms:u64]
+                 [late_edge_ms:u64][late_points:u64]
                  [yaml_len:u32][yaml]
     The reason is a failed job's, why a running one is held here, or empty.
     """
@@ -246,9 +248,18 @@ def _parse_processing_status(data: bytes) -> ProcessingStatusResult:
     running = take(1)[0]
     if running > 1:
         raise IncompleteResponseError(f"processing.status answer has a running of {running}")
-    records_in, records_out, watermark_ms, tick_avg_us, tick_max_us, uptime_ms = struct.unpack(
-        "<QQqQQQ", take(48)
-    )
+    (
+        records_in,
+        records_out,
+        watermark_ms,
+        tick_avg_us,
+        tick_max_us,
+        uptime_ms,
+        late_edge_ms,
+        late_points,
+    ) = struct.unpack("<QQqQQQQQ", take(64))
+    # maxInt(u64) for the edge: no TS source here, so no count.
+    counted = late_edge_ms != _NO_LATE_EDGE
     (yaml_len,) = struct.unpack("<I", take(4))
     yaml = take(yaml_len)
     if pos != len(data):
@@ -272,6 +283,8 @@ def _parse_processing_status(data: bytes) -> ProcessingStatusResult:
             tick_avg_us=tick_avg_us,
             tick_max_us=tick_max_us,
             uptime_ms=uptime_ms,
+            late_edge_ms=late_edge_ms if counted else None,
+            late_points=late_points if counted else None,
         ),
         yaml=yaml,
     )

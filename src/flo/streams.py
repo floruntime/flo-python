@@ -7,7 +7,7 @@ Uses StreamID-native positioning (timestamp_ms + sequence).
 import struct
 from typing import TYPE_CHECKING
 
-from .exceptions import IncompleteResponseError, ValidationError
+from .exceptions import IncompleteResponseError, ValidationError, not_found_error
 from .kv_body import (
     decode_group_list_answer,
     decode_group_members_answer,
@@ -117,6 +117,16 @@ class StreamOperations:
         Returns:
             StreamReadResult with list of records.
 
+        Raises:
+            NotFoundError: The stream doesn't exist (never created or
+                appended to, or deleted); one that exists with nothing to
+                read is empty. A blocking read (block_ms > 0) of a stream not
+                created yet waits for its first append instead. A consumer
+                that may start before its stream exists catches it and starts
+                again.
+            StaleNotFoundError: A not found from a node that may be behind:
+                the stream may exist. Read again rather than treat it as gone.
+
         Example:
             # Read from beginning
             result = await client.stream.read("events")
@@ -169,7 +179,10 @@ class StreamOperations:
             stream.encode("utf-8"),
             b"",
             builder.build(),
+            allow_not_found=True,
         )
+        if response.is_not_found():
+            raise not_found_error(response.status, response.data, response.stale)
 
         return parse_stream_read_response(response.data)
 

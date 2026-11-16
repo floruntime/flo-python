@@ -34,6 +34,7 @@ asyncio.run(main())
 - **KV Store**: Versioned key-value storage with MVCC, TTL, and optimistic locking
 - **Queues**: Priority task queues, at-least-once: a dequeue leases its messages until they're completed
 - **Streams**: Append-only logs with consumer groups for distributed processing
+- **Time series**: Points in nanoseconds, read a page at a time either way, and FloQL
 - **Actions**: Registered tasks with configurable timeouts and retries
 - **Workers**: Distributed task execution with lease management and heartbeats
 - **Async/await**: Native asyncio support for high-performance applications
@@ -343,6 +344,15 @@ result = await client.stream.read("events", StreamReadOptions(tail=True, count=1
 result = await client.stream.read("events", StreamReadOptions(start=last, block_ms=30000))
 ```
 
+A read of a stream that doesn't exist (never created or appended to, or
+deleted) raises `NotFoundError`, while one that exists with nothing to read is
+empty. A blocking read (`block_ms` > 0) of a stream not created yet waits for
+its first append instead. A consumer that may start before its stream exists
+catches `NotFoundError` and starts again. `StaleNotFoundError` (a
+`NotFoundError`) is a not found from a node that may be behind: the stream may
+exist but this node hasn't seen it yet, so read again rather than treat it as
+gone.
+
 ### Consumer Groups
 
 Consumer groups let many consumers work through a stream, each record leased
@@ -361,7 +371,8 @@ read that can take nothing new for either raises `GroupHeldFullError` (an
 Reading again won't help until room is made, so the client doesn't retry it.
 At the group's cap, acks and nacks make room, but dead records count too and
 stay until the group is deleted or a trim of the stream cuts them. At the
-shard's cap, other groups and queues on the shard draining makes room.
+shard's cap, this group's own acks free room, as do other groups and queues on
+the shard draining.
 
 A group's lease (`ack_timeout_ms`, 5 s to 12 h, 30 s by default) and
 `max_deliver` (1 to 255) are fixed when it is created; the first read of a
@@ -420,6 +431,129 @@ groups = await client.stream.group_list("events")
 members = await client.stream.group_members("events", "processors")  # consumers holding records
 await client.stream.group_delete("events", "processors")
 ```
+
+## Time-Series Operations
+
+Every time and window is Unix nanoseconds, a Python `int`. A point's
+measurement is the request key; its field defaults to `value`, and its tags
+(`"k=v,k2=v2"` or a dict) name the series.
+
+### Write
+
+```python
+import time
+from flo import TSWriteOptions
+
+r = await client.ts.write("cpu", 0.42, TSWriteOptions(tags={"host": "a"}, time_ns=time.time_ns()))
+print(r.time_ns)  # the point's time, in ns
+
+# No time (or 0): the server's time, answered in r.time_ns.
+await client.ts.write("cpu", 0.40, TSWriteOptions(tags={"host": "a"}))
+```
+
+A time before 1970 is refused (`BadRequestError`), and a value that isn't
+finite is refused before it is sent.
+
+### Read
+
+`ts.read` answers one page: the points of every series that matches the
+field and tag filter, merged by time and then by write order, oldest first or
+`TSOrder.NEWEST_FIRST`, at most `limit` (1..4096, 4096 by default), within
+`from_ns`..`to_ns` (inclusive) when given. Ask again with the page's cursor
+until it is `None`; a short page doesn't mean the last one. A page goes on
+strictly after the cursor (before it, newest first), so a point there for the
+whole read is read exactly once. The cursor is opaque bytes.
+
+```python
+from flo import TSOrder, TSReadOptions
+
+opts = TSReadOptions(tags="host=a", limit=1000)
+while True:
+    page = await client.ts.read("cpu", opts)
+    for p in page.points:
+        print(p.time_ns, p.value)
+    if page.cursor is None:
+        break
+    opts.cursor = page.cursor
+
+# Or let the iterator page: every point, newest first.
+async for p in client.ts.iter_points("cpu", TSReadOptions(order=TSOrder.NEWEST_FIRST)):
+    print(p.time_ns, p.value)
+
+# The latest point.
+latest = await client.ts.read("cpu", TSReadOptions(limit=1, order=TSOrder.NEWEST_FIRST))
+```
+
+A tag filter that isn't `key=value` pairs, or a cursor that isn't one a page
+answered, is refused (`BadRequestError`), as is an empty measurement name. A
+read that matches no series of the field (a measurement never written, or a
+tag filter no series has) raises `NotFoundError`; a series with no points in
+the range is an empty page. A refusal on any page, `NotFoundError` included,
+is raised from `iter_points` rather than ending it; a reader that may start
+before its series exists catches `NotFoundError` and starts again. As for
+streams, `StaleNotFoundError` means the series may exist but this node hasn't
+seen it yet: read again.
+
+`datetime` helpers convert at the edges, to the microsecond (`datetime` holds
+no finer): `ns_from_datetime(dt)` takes an aware `datetime`, and
+`datetime_from_ns(ns)` and `TSPoint.time` give one in UTC. The ns `int` stays
+the exact value.
+
+### Query and info
+
+```python
+from datetime import timedelta
+from flo import TSAggregation, TSQueryOptions
+
+# One value per 5-minute window; each bucket's start is Unix ns.
+buckets = await client.ts.query("cpu", TSQueryOptions(
+    from_ns=start_ns, to_ns=end_ns, window=timedelta(minutes=5), aggregation=TSAggregation.MAX))
+for b in buckets:
+    print(b.start_ns, b.value)
+
+info = await client.ts.info("cpu")
+print(info.series, info.points, info.oldest_ns, info.newest_ns)
+```
+
+A query's window is an `int` of ns or a `timedelta` (exact to its
+microsecond); without one, the server's minute. Windows start at multiples of
+the width from the epoch, and only windows holding a point are answered. A
+range holding points in more than 1024 windows is refused (`BadRequestError`,
+with the server's text): widen the window or narrow the range. `ts.info` of a
+measurement with no series raises `NotFoundError`.
+
+### FloQL
+
+```python
+series = await client.ts.floql("cpu[1h] | avg()")
+for s in series:
+    for p in s.points:
+        print(s.key, p.time_ns, p.value)
+```
+
+In the query text, a bare number in a range is epoch milliseconds and
+durations (`5m`, `30s`) are as FloQL writes them; the answer's times are ns.
+FloQL doesn't page: an answer of more than 4096 raw points is refused
+(`BadRequestError`, with the server's text). Aggregate them, narrow the
+query, or page through them with `ts.read`.
+
+## Processing
+
+```python
+job_id = await client.processing.submit(open("pipeline.yaml").read())
+status = await client.processing.status(job_id)
+print(status.status, status.runtime.records_in, status.runtime.late_points)
+```
+
+A TS source reads its field up to its `lateness_ms` window behind the
+field's newest point (30 s by default, at most a day; 0 reads with no
+window), so it lags by up to the window. A point that arrives later than
+that is never read by the source, and is counted: `runtime.late_points`
+says at least that many of the job's source points came in more than
+`runtime.late_edge_ms` behind their field's newest. The server counts at
+fixed edges (0 s, 1 s, 5 s, 15 s, 30 s, 1 m, 5 m, 1 h), against the smallest
+at or above the job's largest window. Both are `None` for a job with no TS
+source, or a window past an hour.
 
 ## Action Operations
 
@@ -618,6 +752,10 @@ Both workers register in the worker registry and heartbeat every 30 s, reporting
 
 `worker.drain()` stops taking work and lets the running handlers finish, heartbeats going on; the server is told, so it assigns the worker nothing more, and `start()` returns once the last handler has reported. A drain started on the server does the same. Neither waits out `block_ms`: `drain()` interrupts the worker's own poll connection, so an action worker's held await and a stream worker's held read end at once. A drain started on the server answers an action worker's held await at once, refused as `WORKER_DRAINING`; it doesn't wake a stream worker's held group read, so a stream worker learns of it from its next heartbeat (every 30 s) and only then interrupts its read and leaves. `worker.stop()` ends polling at once, also mid-reconnect or mid-drain; running handlers still finish, and a stream worker hands back (abandons) the records of its last batch it hasn't started, as it does if its task is cancelled: they are ready again at once, and spend none of their attempts. A record whose handler is cancelled while the worker stops (or whose task the worker's cancellation cuts short) is abandoned the same way, so a rolling restart doesn't dead-letter it at `max_deliver` 1; a handler that raises, `CancelledError` included, while the worker isn't stopping is nacked. Either one before or during `start()` ends that run, and a worker can be started again afterwards.
 
+`await worker.close()` stops the worker. close() waits up to 30 s (timeout=) for the running loop to send its completes, acks and hand-backs, then closes the client; anything unsent is redelivered when its lease expires.
+
+A stream worker whose read is answered not found fails `start()` with `NotFoundError` rather than reading on as if the stream were empty. A worker that may start before its stream exists catches it and starts again.
+
 ### StreamWorker Example
 
 ```python
@@ -730,7 +868,7 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 | `QueueFullError` | An `OverloadedError` with reason `QUEUE_FULL`: an enqueue found the queue, or its shard's queues and groups, at their caps, and the client's retries ran out |
 | `GroupHeldFullError` | An `OverloadedError` with reason `GROUP_HELD_FULL`: a group read took nothing new because the group is at its cap (records out and dead together) or the shard's queues and groups are at theirs. Never retried |
 | `UnavailableError` | No leader, or the shard isn't taking writes or is offline, and the client's retries ran out (the message says why, and whether an operator must act first) |
-| `StaleNotFoundError` | `kv.get` or `kv.json_get` found no key, but a halted or read-blocked shard answered: absent only as of the entry it couldn't apply |
+| `StaleNotFoundError` | A `NotFoundError` from a node that may be behind (a halted or read-blocked shard, or a follower that couldn't reach the leader): `kv.get` or `kv.json_get` found no key, or `stream.read`, `ts.read` or `ts.iter_points` no stream or series, but it may exist. Read again rather than treat it as gone |
 | `LimitError` | Status `LIMIT` (15): the node or shard is at one of its limits; `reason` says which (`TOO_MANY_ACTIONS`, `MEMORY_BUDGET`, `TOO_MANY_WORKFLOW_DEFINITIONS`, `TOO_MANY_WORKFLOW_RUNS`). It didn't run. Terminal, never retried (see below) |
 | `OutcomePendingError` | The write committed but hasn't applied: its shard halted at or before it (reason `SHARD_HALTED`, ran `UNKNOWN`; the message says whether it applies when the shard resumes). Never retried |
 | `InternalServerError` | Server internal error; not retryable (may mean committed but not applied) |

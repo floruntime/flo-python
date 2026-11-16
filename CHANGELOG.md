@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 The op table hash moves with the server in this release: this SDK talks only
 to the flo it pins, and the pin lands with the release.
+The server's op table hash is now `0x17f3632347cd6dd9` (`TABLE_HASH`).
+
+### Added
+
+- `client.ts`: `write`, `read` (one page), `iter_points` (every page) and
+  `floql`. A read takes `field`, `tags`, `from_ns`/`to_ns` (inclusive),
+  `limit` (1..4096) and `order` (`TSOrder.OLDEST_FIRST` or `NEWEST_FIRST`),
+  and answers the points of every matching series merged by time, then
+  write order, with an opaque cursor that is `None` on the last page. A
+  page goes on strictly past the cursor, so no point is read twice or
+  skipped; page until the cursor is `None`, not until a page is short
+- Times are Unix ns `int`s: `TSWriteOptions.time_ns` (`OptionTag.TS_TIMESTAMP_NS`,
+  0x67, an i64; none or 0 is the server's time), `TSWriteResult.time_ns`,
+  `TSPoint.time_ns`, `FloQLPoint.time_ns`. `ns_from_datetime` and
+  `datetime_from_ns` (and `TSPoint.time`) convert at the microsecond
+- `ts.query` (`TSQueryOptions`: `from_ns`, `to_ns`, a `window` as ns or a
+  `timedelta`, and `TSAggregation`) answers `TSBucket`s with `start_ns`;
+  `ts.info` answers a `TSInfo` with `oldest_ns` and `newest_ns`.
+  `ns_from_timedelta` converts exactly
+- `ProcessingRuntime.late_edge_ms` and `late_points`: at least that many of
+  a job's TS source points came in later than the edge at or above its
+  lateness window, so its sources never read them; both `None` for a job
+  with no TS source
+- `ActionWorker.close(timeout=30.0)` and `StreamWorker.close(timeout=30.0)`
+  wait up to `timeout` for `start()` to return, so in-flight completes,
+  fails, acks, nacks and hand-backs are sent before the connections close
+
+### Changed
+
+- `stream.read` of a stream that doesn't exist (never created, or deleted)
+  raises `NotFoundError`, as the server now answers; an existing stream
+  with nothing to read is still empty, and a blocking read of a stream not
+  created yet still waits for its first append. `ts.read` and `iter_points`
+  raise `NotFoundError` when no series of the field matches. A consumer
+  that may start before its stream or series exists catches it and starts
+  again. A not found answered stale (by a node that may be behind) is
+  `StaleNotFoundError`, as for `kv.get`: the stream or series may exist, so
+  read again
+- A stream worker whose read is answered not found fails `start()` with
+  `NotFoundError` instead of retrying as if the stream were empty
+- A worker task cancelled while its handler runs waits (up to the handler
+  timeout) for the handler to end before handing the work back; a cancel
+  aimed at the task while a timed-out handler ends is no longer swallowed
+- A FloQL answer of more than 4096 raw points is refused by the server
+  (`BadRequestError`, with its text); aggregate, narrow, or page with
+  `ts.read`
+
+### Breaking
+
+- `OptionTag.TS_TIMESTAMP` is `TS_TIMESTAMP_NS`: the server reads it as ns,
+  so a time sent as ms lands near 1970. A time before 1970 is refused
+- `OptionTag.TS_FROM_MS`, `TS_TO_MS` and `TS_WINDOW_MS` are `TS_FROM_NS`,
+  `TS_TO_NS` and `TS_WINDOW_NS`, i64s of ns. Every time-series time and
+  window is ns; no ms remains in the time-series API
+
+## [0.1.5] - 2026-11-15
+
+The op table hash moves with the server in this release: this SDK talks only
+to the flo it pins, and the pin lands with the release.
 The server's op table hash is now `0xc1f93eb0ed86a281` (`TABLE_HASH`).
 
 ### Added

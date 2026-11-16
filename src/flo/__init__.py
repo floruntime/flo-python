@@ -73,6 +73,7 @@ from .exceptions import (
 from .kv_txn import Transaction, TxnFinishedError, TxnUnsupportedOpError
 from .processing import ProcessingOperations
 from .retry import DEFAULT_RETRY_POLICY, RetryPolicy
+from .ts import TSOperations
 from .types import (
     ActionDeleteOptions,
     ActionInfo,
@@ -94,6 +95,8 @@ from .types import (
     DlqPage,
     EnqueueOptions,
     ExistsResult,
+    FloQLPoint,
+    FloQLSeries,
     GetJsonResult,
     GetOptions,
     GetResult,
@@ -171,6 +174,16 @@ from .types import (
     StreamTrimOptions,
     StreamTrimResult,
     TaskAssignment,
+    TSAggregation,
+    TSBucket,
+    TSInfo,
+    TSOrder,
+    TSPoint,
+    TSQueryOptions,
+    TSReadOptions,
+    TSReadResult,
+    TSWriteOptions,
+    TSWriteResult,
     VersionEntry,
     WaitFor,
     WorkerAwaitOptions,
@@ -202,6 +215,9 @@ from .types import (
     WorkflowStatusOptions,
     WorkflowSyncOptions,
     WorkflowSyncResult,
+    datetime_from_ns,
+    ns_from_datetime,
+    ns_from_timedelta,
 )
 from .worker import (
     ActionContext,
@@ -413,5 +429,21 @@ __all__ = [
     "ProcessingListResult",
     "ProcessingRemoveOptions",
     "ProcessingRuntime",
+    "FloQLPoint",
+    "FloQLSeries",
+    "TSOrder",
+    "TSAggregation",
+    "TSBucket",
+    "TSInfo",
+    "TSQueryOptions",
+    "ns_from_timedelta",
+    "TSPoint",
+    "TSReadOptions",
+    "TSReadResult",
+    "TSWriteOptions",
+    "TSWriteResult",
+    "datetime_from_ns",
+    "ns_from_datetime",
+    "TSOperations",
     "ProcessingSyncResult",
 ]

@@ -8,9 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 from .exceptions import (
     IncompleteResponseError,
-    ServerError,
     StaleNotFoundError,
-    raise_for_status,
+    not_found_error,
 )
 from .kv_body import (
     decode_delete_answer,
@@ -79,18 +78,10 @@ def _absent(response: RawResponse, *, stale_raises: bool = False) -> bool:
     absent."""
     if not response.is_not_found():
         return False
-    try:
-        raise_for_status(response.status, response.data)
-    except ServerError as e:
-        e.stale = response.stale
-        if e.reason != Reason.NOT_FOUND:
-            raise
-        if stale_raises and response.stale:
-            stale = StaleNotFoundError(str(e))
-            stale.reason, stale.ran = e.reason, e.ran
-            raise stale from None
-        return True
-    return False  # pragma: no cover - raise_for_status always raises here
+    e = not_found_error(response.status, response.data, response.stale)
+    if e.reason != Reason.NOT_FOUND or (stale_raises and isinstance(e, StaleNotFoundError)):
+        raise e
+    return True
 
 
 async def kv_get(

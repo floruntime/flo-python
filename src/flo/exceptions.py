@@ -183,10 +183,12 @@ class NotFoundError(ServerError):
 
 
 class StaleNotFoundError(NotFoundError):
-    """A halted or read-blocked shard didn't have the key, as of the entry
-    it couldn't apply (``stale`` is True). It may exist since: a write after
-    that entry hasn't applied. kv.get and kv.json_get raise it rather than report the key
-    absent."""
+    """A node answered not found from state it knows may be behind (``stale``
+    is True): a halted or read-blocked shard, as of the entry it couldn't
+    apply, or a follower that couldn't reach the leader. It may exist: read
+    again rather than treat it as gone. kv.get and kv.json_get raise it
+    rather than report the key absent; stream.read, ts.read and
+    ts.iter_points raise it for the stream or series."""
 
     stale = True
 
@@ -250,9 +252,10 @@ class GroupHeldFullError(OverloadedError):
     names which cap. At the group's cap (records ready, leased and dead
     together), acks and nacks make room, but dead records stay until the
     group is deleted or a trim of the stream cuts them. At the shard's cap
-    (its queues and groups together), other groups and queues draining makes
-    room. Reading again won't help until then, so the client never retries
-    it; a stream worker logs it and backs off."""
+    (its queues and groups together), this group's own acks free room, as do
+    other groups and queues on the shard draining. Reading again won't help
+    until then, so the client never retries it; a stream worker logs it and
+    backs off."""
 
 
 class RateLimitedError(ServerError):
@@ -327,6 +330,22 @@ def is_connection_error(exc: BaseException) -> bool:
     reply as the next answer.
     """
     return isinstance(exc, (UnexpectedEofError, NotConnectedError, RequestTimeoutError, OSError))
+
+
+def not_found_error(status: StatusCode, data: bytes, stale: bool) -> ServerError:
+    """The error a not-found answer raises. On a stale answer, a thing not
+    found (reason NOT_FOUND) is a StaleNotFoundError: the node hadn't seen it
+    yet, so it may exist."""
+    try:
+        raise_for_status(status, data)
+    except ServerError as e:
+        e.stale = stale
+        if stale and e.reason == Reason.NOT_FOUND:
+            found = StaleNotFoundError(str(e))
+            found.reason, found.ran = e.reason, e.ran
+            return found
+        return e
+    raise AssertionError("a not-found answer always raises")  # pragma: no cover
 
 
 def raise_for_status(status: StatusCode, data: bytes = b"") -> None:
