@@ -10,7 +10,7 @@ import struct
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
-from .exceptions import IncompleteResponseError, ValidationError
+from .exceptions import IncompleteResponseError, ValidationError, not_found_error
 from .types import (
     MAX_TS_READ,
     MAX_TS_TAG_FILTER,
@@ -236,7 +236,9 @@ class TSOperations:
         A refused filter or cursor raises BadRequestError. A read that
         matches no series of the field (a measurement never written, or a
         tag filter no series has) raises NotFoundError; a series with no
-        points in the range answers an empty page.
+        points in the range answers an empty page. StaleNotFoundError (a
+        NotFoundError) is a not found from a node that may be behind: the
+        series may exist, so read again rather than treat it as gone.
 
         Example:
             opts = TSReadOptions(tags="host=a")
@@ -254,7 +256,10 @@ class TSOperations:
             self._client.get_namespace(opts.namespace),
             measurement.encode("utf-8"),
             encode_read_body(opts),
+            allow_not_found=True,
         )
+        if response.is_not_found():
+            raise not_found_error(response.status, response.data, response.stale)
         points, cursor = decode_read_answer(response.data)
         return TSReadResult(points=points, cursor=cursor, stale=response.stale)
 

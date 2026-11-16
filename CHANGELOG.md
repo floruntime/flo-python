@@ -40,7 +40,9 @@ The server's op table hash is now `0x4b8c7cf1921fc323` (`TABLE_HASH`).
   created yet still waits for its first append. `ts.read` and `iter_points`
   raise `NotFoundError` when no series of the field matches. A consumer
   that may start before its stream or series exists catches it and starts
-  again
+  again. A not found answered stale (by a node that may be behind) is
+  `StaleNotFoundError`, as for `kv.get`: the stream or series may exist, so
+  read again
 - A stream worker whose read is answered not found fails `start()` with
   `NotFoundError` instead of retrying as if the stream were empty
 - A worker task cancelled while its handler runs waits (up to the handler

@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from flo import FloClient
-from flo.exceptions import NotFoundError
+from flo.exceptions import NotFoundError, StaleNotFoundError
 from flo.types import Ran, Reason, StatusCode
 from flo.wire import RawResponse
 
@@ -60,3 +60,54 @@ async def test_an_ok_empty_read_stays_empty(monkeypatch: pytest.MonkeyPatch) -> 
     kind = "ts"
     page = await client.ts.read("m")
     assert (page.points, page.cursor) == ([], None)
+
+
+# A follower that couldn't reach the leader answers its own not found, stale.
+READS: dict[str, Callable[[FloClient], Awaitable[Any]]] = {
+    "stream.read": lambda c: c.stream.read("s"),
+    "ts.read": lambda c: c.ts.read("m"),
+}
+MISSING = Reason.NOT_FOUND.to_bytes(2, "little") + bytes([Ran.NO]) + b"stream not found"
+
+
+def _not_found(client: FloClient, monkeypatch: pytest.MonkeyPatch, stale: bool) -> None:
+    async def answer(*_: Any, **__: Any) -> RawResponse:
+        return RawResponse(status=StatusCode.NOT_FOUND, data=MISSING, request_id=0, stale=stale)
+
+    monkeypatch.setattr(client, "_send_request", answer)
+
+
+@pytest.mark.parametrize("name", READS)
+async def test_a_stale_not_found_read_is_stale_not_found(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    client = FloClient("localhost:1")
+    _not_found(client, monkeypatch, stale=True)
+    with pytest.raises(StaleNotFoundError) as raised:
+        await READS[name](client)
+    # Still a NotFoundError, with the server's reason and text.
+    assert isinstance(raised.value, NotFoundError)
+    assert raised.value.stale is True
+    assert (raised.value.reason, str(raised.value)) == (Reason.NOT_FOUND, "stream not found")
+
+
+@pytest.mark.parametrize("name", READS)
+async def test_an_unstale_not_found_read_is_plain_not_found(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    client = FloClient("localhost:1")
+    _not_found(client, monkeypatch, stale=False)
+    with pytest.raises(NotFoundError) as raised:
+        await READS[name](client)
+    assert not isinstance(raised.value, StaleNotFoundError)
+    assert raised.value.stale is False
+
+
+async def test_the_page_walker_hands_back_a_stale_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FloClient("localhost:1")
+    _not_found(client, monkeypatch, stale=True)
+    with pytest.raises(StaleNotFoundError):
+        async for _ in client.ts.iter_points("m"):
+            pass

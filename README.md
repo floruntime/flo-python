@@ -348,7 +348,10 @@ A read of a stream that doesn't exist (never created or appended to, or
 deleted) raises `NotFoundError`, while one that exists with nothing to read is
 empty. A blocking read (`block_ms` > 0) of a stream not created yet waits for
 its first append instead. A consumer that may start before its stream exists
-catches `NotFoundError` and starts again.
+catches `NotFoundError` and starts again. `StaleNotFoundError` (a
+`NotFoundError`) is a not found from a node that may be behind: the stream may
+exist but this node hasn't seen it yet, so read again rather than treat it as
+gone.
 
 ### Consumer Groups
 
@@ -487,7 +490,9 @@ read that matches no series of the field (a measurement never written, or a
 tag filter no series has) raises `NotFoundError`; a series with no points in
 the range is an empty page. A refusal on any page, `NotFoundError` included,
 is raised from `iter_points` rather than ending it; a reader that may start
-before its series exists catches `NotFoundError` and starts again.
+before its series exists catches `NotFoundError` and starts again. As for
+streams, `StaleNotFoundError` means the series may exist but this node hasn't
+seen it yet: read again.
 
 `datetime` helpers convert at the edges, to the microsecond (`datetime` holds
 no finer): `ns_from_datetime(dt)` takes an aware `datetime`, and
@@ -838,7 +843,7 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 | `QueueFullError` | An `OverloadedError` with reason `QUEUE_FULL`: an enqueue found the queue, or its shard's queues and groups, at their caps, and the client's retries ran out |
 | `GroupHeldFullError` | An `OverloadedError` with reason `GROUP_HELD_FULL`: a group read took nothing new because the group is at its cap (records out and dead together) or the shard's queues and groups are at theirs. Never retried |
 | `UnavailableError` | No leader, or the shard isn't taking writes or is offline, and the client's retries ran out (the message says why, and whether an operator must act first) |
-| `StaleNotFoundError` | `kv.get` or `kv.json_get` found no key, but a halted or read-blocked shard answered: absent only as of the entry it couldn't apply |
+| `StaleNotFoundError` | A `NotFoundError` from a node that may be behind (a halted or read-blocked shard, or a follower that couldn't reach the leader): `kv.get` or `kv.json_get` found no key, or `stream.read`, `ts.read` or `ts.iter_points` no stream or series, but it may exist. Read again rather than treat it as gone |
 | `LimitError` | Status `LIMIT` (15): the node or shard is at one of its limits; `reason` says which (`TOO_MANY_ACTIONS`, `MEMORY_BUDGET`, `TOO_MANY_WORKFLOW_DEFINITIONS`, `TOO_MANY_WORKFLOW_RUNS`). It didn't run. Terminal, never retried (see below) |
 | `OutcomePendingError` | The write committed but hasn't applied: its shard halted at or before it (reason `SHARD_HALTED`, ran `UNKNOWN`; the message says whether it applies when the shard resumes). Never retried |
 | `InternalServerError` | Server internal error; not retryable (may mean committed but not applied) |
