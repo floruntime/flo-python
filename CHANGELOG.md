@@ -31,6 +31,31 @@ The server's op table hash is now `0x4b8c7cf1921fc323` (`TABLE_HASH`).
 - `ActionWorker.close(timeout=30.0)` and `StreamWorker.close(timeout=30.0)`
   wait up to `timeout` for `start()` to return, so in-flight completes,
   fails, acks, nacks and hand-backs are sent before the connections close
+
+### Changed
+
+- A stream worker whose read is answered not found fails `start()` with
+  `NotFoundError` instead of retrying as if the stream were empty
+- A worker task cancelled while its handler runs waits (up to the handler
+  timeout) for the handler to end before handing the work back; a cancel
+  aimed at the task while a timed-out handler ends is no longer swallowed
+- A FloQL answer of more than 4096 raw points is refused by the server
+  (`BadRequestError`, with its text); aggregate, narrow, or page with
+  `ts.read`
+
+### Breaking
+
+- `OptionTag.TS_TIMESTAMP` is `TS_TIMESTAMP_NS`: the server reads it as ns,
+  so a time sent as ms lands near 1970. A time before 1970 is refused
+
+## [0.1.5] - 2026-11-15
+
+The op table hash moves with the server in this release: this SDK talks only
+to the flo it pins, and the pin lands with the release.
+The server's op table hash is now `0xc1f93eb0ed86a281` (`TABLE_HASH`).
+
+### Added
+
 - `Reason.QUEUE_FULL` (36) and `GROUP_HELD_FULL` (37), both under status
   overloaded. `QueueFullError` (an `OverloadedError`) is retried like any
   overloaded refusal that didn't run: a full queue drains as messages are
@@ -125,14 +150,6 @@ The server's op table hash is now `0x4b8c7cf1921fc323` (`TABLE_HASH`).
 
 ### Changed
 
-- A stream worker whose read is answered not found fails `start()` with
-  `NotFoundError` instead of retrying as if the stream were empty
-- A worker task cancelled while its handler runs waits (up to the handler
-  timeout) for the handler to end before handing the work back; a cancel
-  aimed at the task while a timed-out handler ends is no longer swallowed
-- A FloQL answer of more than 4096 raw points is refused by the server
-  (`BadRequestError`, with its text); aggregate, narrow, or page with
-  `ts.read`
 - A group nack carries its error in the body, at most 1024 bytes (was an
   option of at most 255); over 1024 raises `ValidationError` before sending
 - An ack, nack or touch to a group that isn't there raises `NotFoundError`,
@@ -204,8 +221,6 @@ The server's op table hash is now `0x4b8c7cf1921fc323` (`TABLE_HASH`).
 
 ### Breaking
 
-- `OptionTag.TS_TIMESTAMP` is `TS_TIMESTAMP_NS`: the server reads it as ns,
-  so a time sent as ms lands near 1970. A time before 1970 is refused
 - `PeekedMessage.attempts` and `DeadLetter.attempts` are now `deliveries`, as
   the server names them
 - `OptionTag.ERROR_TEXT` (0x33) is gone: a nack's error is in its body

@@ -1349,9 +1349,9 @@ class ActionWorker(_RegisteredWorker):
         self._signal_stop()
 
     async def close(self, timeout: float = 30.0) -> None:
-        """Stop the worker and wait up to ``timeout`` seconds for start() to
-        return: its running handlers finish and their results are sent. Then
-        close its connections, cutting short whatever is still running."""
+        """Stop the worker. close() waits up to 30 s (timeout=) for the
+        running loop to send its completes, acks and hand-backs, then closes
+        the client; anything unsent is redelivered when its lease expires."""
         self.stop()
         await self._await_run(timeout)
         if self._result_client:
@@ -2130,10 +2130,9 @@ class StreamWorker(_RegisteredWorker):
         self._signal_stop()
 
     async def close(self, timeout: float = 30.0) -> None:
-        """Stop the stream worker and wait up to ``timeout`` seconds for
-        start() to return: running handlers finish and ack, and the records
-        not started are handed back. Then close its connections, cutting
-        short whatever is still running."""
+        """Stop the worker. close() waits up to 30 s (timeout=) for the
+        running loop to send its completes, acks and hand-backs, then closes
+        the client; anything unsent is redelivered when its lease expires."""
         self.stop()
         await self._await_run(timeout)
         if self._client:
