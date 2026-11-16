@@ -434,7 +434,7 @@ await client.stream.group_delete("events", "processors")
 
 ## Time-Series Operations
 
-Every time on the wire is Unix nanoseconds, a Python `int`. A point's
+Every time and window is Unix nanoseconds, a Python `int`. A point's
 measurement is the request key; its field defaults to `value`, and its tags
 (`"k=v,k2=v2"` or a dict) name the series.
 
@@ -499,6 +499,29 @@ no finer): `ns_from_datetime(dt)` takes an aware `datetime`, and
 `datetime_from_ns(ns)` and `TSPoint.time` give one in UTC. The ns `int` stays
 the exact value.
 
+### Query and info
+
+```python
+from datetime import timedelta
+from flo import TSAggregation, TSQueryOptions
+
+# One value per 5-minute window; each bucket's start is Unix ns.
+buckets = await client.ts.query("cpu", TSQueryOptions(
+    from_ns=start_ns, to_ns=end_ns, window=timedelta(minutes=5), aggregation=TSAggregation.MAX))
+for b in buckets:
+    print(b.start_ns, b.value)
+
+info = await client.ts.info("cpu")
+print(info.series, info.points, info.oldest_ns, info.newest_ns)
+```
+
+A query's window is an `int` of ns or a `timedelta` (exact to its
+microsecond); without one, the server's minute. Windows start at multiples of
+the width from the epoch, and only windows holding a point are answered. A
+range holding points in more than 1024 windows is refused (`BadRequestError`,
+with the server's text): widen the window or narrow the range. `ts.info` of a
+measurement with no series raises `NotFoundError`.
+
 ### FloQL
 
 ```python
@@ -508,6 +531,8 @@ for s in series:
         print(s.key, p.time_ns, p.value)
 ```
 
+In the query text, a bare number in a range is epoch milliseconds and
+durations (`5m`, `30s`) are as FloQL writes them; the answer's times are ns.
 FloQL doesn't page: an answer of more than 4096 raw points is refused
 (`BadRequestError`, with the server's text). Aggregate them, narrow the
 query, or page through them with `ts.read`.

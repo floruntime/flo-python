@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import struct
 from collections.abc import AsyncIterator
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from .exceptions import IncompleteResponseError, ValidationError, not_found_error
@@ -18,12 +19,17 @@ from .types import (
     FloQLSeries,
     OpCode,
     OptionTag,
+    TSAggregation,
+    TSBucket,
+    TSInfo,
     TSOrder,
     TSPoint,
+    TSQueryOptions,
     TSReadOptions,
     TSReadResult,
     TSWriteOptions,
     TSWriteResult,
+    ns_from_timedelta,
 )
 from .wire import OptionsBuilder
 
@@ -34,7 +40,6 @@ _I64_MAX = (1 << 63) - 1
 _I64_MIN = -(1 << 63)
 _MAX_FIELD = 0xFFFF
 _CURSOR_LEN = 16
-_NS_PER_MS = 1_000_000
 
 
 def _tags(tags: str | dict[str, str]) -> bytes:
@@ -147,8 +152,7 @@ def decode_write_answer(data: bytes) -> TSWriteResult:
 
 def decode_floql_answer(data: bytes) -> list[FloQLSeries]:
     """A FloQL answer: [count:u32]([key_len:u32][key][field_len:u32][field]
-    [points:u32]([time:i64][value:f64])*)*. The server still answers its
-    times in ms; they are given here as ns, as every other time is."""
+    [points:u32]([time_ns:i64][value:f64])*)*."""
     view = memoryview(data)
     at = 0
 
@@ -174,13 +178,109 @@ def decode_floql_answer(data: bytes) -> list[FloQLSeries]:
         field = text()
         (n,) = struct.unpack("<I", take(4))
         raw = take(16 * n)
-        pts = [
-            FloQLPoint(time_ns=t * _NS_PER_MS, value=v) for t, v in struct.iter_unpack("<qd", raw)
-        ]
+        pts = [FloQLPoint(time_ns=t, value=v) for t, v in struct.iter_unpack("<qd", raw)]
         out.append(FloQLSeries(key=key, field=field, points=pts))
     if at != len(view):
         raise IncompleteResponseError(f"ts.floql answer has {len(view) - at} bytes left over")
     return out
+
+
+def _query_ns(name: str, v: int) -> bytes:
+    if not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= _I64_MAX:
+        raise ValidationError(f"{name} must be ns, 0..2^63-1, got {v!r}")
+    return struct.pack("<q", v)
+
+
+def encode_query_options(opts: TSQueryOptions) -> bytes:
+    """ts.query's options: field, tags, from_ns, to_ns and window_ns (each
+    an i64 of ns), and the aggregation's name."""
+    b = OptionsBuilder()
+    if opts.field and opts.field != "value":
+        b.add_bytes(OptionTag.TS_FIELD, opts.field.encode("utf-8"))
+    tags = _tags(opts.tags)
+    if tags:
+        b.add_bytes(OptionTag.TS_TAGS, tags)
+    if opts.from_ns is not None:
+        b.add_bytes(OptionTag.TS_FROM_NS, _query_ns("from_ns", opts.from_ns))
+    if opts.to_ns is not None:
+        b.add_bytes(OptionTag.TS_TO_NS, _query_ns("to_ns", opts.to_ns))
+    if opts.window is not None:
+        w = opts.window
+        ns = ns_from_timedelta(w) if isinstance(w, timedelta) else w
+        if isinstance(ns, bool) or not isinstance(ns, int) or ns <= 0:
+            raise ValidationError(f"a window is more than 0 ns, got {w!r}")
+        b.add_bytes(OptionTag.TS_WINDOW_NS, _query_ns("window", ns))
+    b.add_bytes(OptionTag.TS_AGGREGATION, TSAggregation(opts.aggregation).value.encode())
+    return b.build()
+
+
+def decode_query_answer(data: bytes) -> list[TSBucket]:
+    """ts.query's answer: [series:u32]([key_len:u32][key][buckets:u32]
+    ([start_ns:i64][value:f64])*)*. The server answers one series, or none
+    when no window holds a point."""
+    view = memoryview(data)
+    at = 0
+
+    def take(n: int) -> memoryview:
+        nonlocal at
+        if at + n > len(view):
+            raise IncompleteResponseError("ts.query answer is cut short")
+        b = view[at : at + n]
+        at += n
+        return b
+
+    out: list[TSBucket] = []
+    (series,) = struct.unpack("<I", take(4))
+    for _ in range(series):
+        (n,) = struct.unpack("<I", take(4))
+        take(n)  # the measurement, as asked
+        (count,) = struct.unpack("<I", take(4))
+        raw = take(16 * count)
+        out.extend(TSBucket(start_ns=t, value=v) for t, v in struct.iter_unpack("<qd", raw))
+    if at != len(view):
+        raise IncompleteResponseError(f"ts.query answer has {len(view) - at} bytes left over")
+    return out
+
+
+def decode_info_answer(data: bytes) -> TSInfo:
+    """ts.info's answer: series u32, field_count u32, fields_capped bool,
+    fields [count:u16]([len:u16][name])*, points u64, then oldest_ns and
+    newest_ns, each [present:u8][i64]."""
+    view = memoryview(data)
+    at = 0
+
+    def take(n: int) -> memoryview:
+        nonlocal at
+        if at + n > len(view):
+            raise IncompleteResponseError("ts.info answer is cut short")
+        b = view[at : at + n]
+        at += n
+        return b
+
+    def flag() -> bool:
+        b = take(1)[0]
+        if b > 1:
+            raise IncompleteResponseError(f"ts.info answer has a bool of {b}")
+        return b == 1
+
+    def opt_i64() -> int | None:
+        return int(struct.unpack("<q", take(8))[0]) if flag() else None
+
+    series, field_count = struct.unpack("<II", take(8))
+    capped = flag()
+    fields: list[str] = []
+    (count,) = struct.unpack("<H", take(2))
+    for _ in range(count):
+        (n,) = struct.unpack("<H", take(2))
+        try:
+            fields.append(bytes(take(n)).decode("utf-8"))
+        except UnicodeDecodeError as e:
+            raise IncompleteResponseError("ts.info answer has a field that isn't UTF-8") from e
+    (points,) = struct.unpack("<Q", take(8))
+    oldest, newest = opt_i64(), opt_i64()
+    if at != len(view):
+        raise IncompleteResponseError(f"ts.info answer has {len(view) - at} bytes left over")
+    return TSInfo(series, field_count, capped, fields, points, oldest, newest)
 
 
 class TSOperations:
@@ -302,8 +402,53 @@ class TSOperations:
                 return
             cursor = page.cursor
 
+    async def query(
+        self,
+        measurement: str,
+        options: TSQueryOptions | None = None,
+    ) -> list[TSBucket]:
+        """One value per window of a measurement field's points: each
+        window's start in Unix ns, oldest first, for the windows that hold a
+        point. Windows start at multiples of the width from the epoch.
+
+        A range of more than 1024 windows of the width is refused
+        (BadRequestError, with the server's text): widen the window or
+        narrow the range.
+
+        Example:
+            buckets = await client.ts.query("cpu", TSQueryOptions(
+                from_ns=start, to_ns=end, window=timedelta(minutes=5),
+                aggregation=TSAggregation.MAX))
+        """
+        opts = options or TSQueryOptions()
+        response = await self._client._send_and_check(
+            OpCode.TS_QUERY,
+            self._client.get_namespace(opts.namespace),
+            measurement.encode("utf-8"),
+            b"",
+            encode_query_options(opts),
+        )
+        return decode_query_answer(response.data)
+
+    async def info(self, measurement: str, namespace: str | None = None) -> TSInfo:
+        """A measurement's series, fields, points, and its oldest and newest
+        points' times in Unix ns. A measurement with no series raises
+        NotFoundError (StaleNotFoundError from a node that may be behind)."""
+        response = await self._client._send_and_check(
+            OpCode.TS_INFO,
+            self._client.get_namespace(namespace),
+            measurement.encode("utf-8"),
+            b"",
+            allow_not_found=True,
+        )
+        if response.is_not_found():
+            raise not_found_error(response.status, response.data, response.stale)
+        return decode_info_answer(response.data)
+
     async def floql(self, query: str, namespace: str | None = None) -> list[FloQLSeries]:
-        """Run a FloQL query. Its answer's times are Unix nanoseconds.
+        """Run a FloQL query. Its answer's times are Unix nanoseconds. In the
+        query text, a bare number in a range is epoch milliseconds, and
+        durations (``5m``, ``30s``) are as FloQL writes them.
 
         An answer of more than 4096 raw points is refused (BadRequestError,
         with the server's text): aggregate them, narrow the query, or page

@@ -9,8 +9,16 @@ from dataclasses import dataclass
 import pytest
 import pytest_asyncio
 
-from flo import FloClient, TSOrder, TSReadOptions, TSWriteOptions
-from flo.exceptions import BadRequestError
+from flo import (
+    FloClient,
+    TSAggregation,
+    TSBucket,
+    TSOrder,
+    TSQueryOptions,
+    TSReadOptions,
+    TSWriteOptions,
+)
+from flo.exceptions import BadRequestError, NotFoundError
 from flo.types import OpCode, OptionTag
 from flo.wire import OptionsBuilder
 
@@ -190,3 +198,62 @@ async def test_live_an_empty_measurement_is_refused(client: FloClient) -> None:
     with pytest.raises(BadRequestError) as e:
         await client.ts.read("")
     assert str(e.value) == "bad request: measurement name is required"
+
+
+async def _small(client: FloClient, kind: str) -> tuple[str, list[tuple[int, float]]]:
+    """A measurement of 20 points at known ns times, none a whole ms, within
+    the last hour, in time order."""
+    measurement = f"py-ts-{kind}-{secrets.token_hex(4)}"
+    base = time.time_ns() - 1800 * 10**9 + 123_457
+    points = [(base + i * 700_000_001, float(i)) for i in range(20)]
+    for t, v in points:
+        await client.ts.write(measurement, v, TSWriteOptions(time_ns=t))
+    return measurement, points
+
+
+async def test_live_a_query_buckets_by_an_ns_window(client: FloClient) -> None:
+    measurement, points = await _small(client, "q")
+    window = 2_000_000_003  # not a whole ms
+    lo, hi = points[2][0], points[17][0]
+    got = await client.ts.query(
+        measurement,
+        TSQueryOptions(from_ns=lo, to_ns=hi, window=window, aggregation=TSAggregation.SUM),
+    )
+    want: dict[int, float] = {}
+    for t, v in points:
+        if lo <= t <= hi:
+            start = t // window * window
+            want[start] = want.get(start, 0.0) + v
+    assert got == [TSBucket(start, v) for start, v in sorted(want.items())]
+
+
+async def test_live_a_query_of_more_than_1024_windows_is_refused(
+    client: FloClient, written: Written
+) -> None:
+    # 2500 distinct times, a 1 ns window: a window for each.
+    with pytest.raises(BadRequestError) as e:
+        await client.ts.query(written.measurement, TSQueryOptions(window=1))
+    assert str(e.value) == (
+        "bad request: the range holds more than 1024 windows of this width; "
+        "widen the window (it is in nanoseconds) or narrow the range"
+    )
+
+
+async def test_live_floql_answers_the_ns_times_written(client: FloClient) -> None:
+    measurement, points = await _small(client, "fq")
+    [series] = await client.ts.floql(f"{measurement}[1h]")
+    assert [(p.time_ns, p.value) for p in series.points] == points
+
+
+async def test_live_info_oldest_and_newest_are_the_first_and_last_write(
+    client: FloClient,
+) -> None:
+    measurement, points = await _small(client, "info")
+    info = await client.ts.info(measurement)
+    assert (info.oldest_ns, info.newest_ns) == (points[0][0], points[-1][0])
+    assert (info.series, info.points, info.fields) == (1, len(points), ["value"])
+
+
+async def test_live_info_of_a_measurement_never_written_is_not_found(client: FloClient) -> None:
+    with pytest.raises(NotFoundError):
+        await client.ts.info(f"py-ts-none-{secrets.token_hex(4)}")

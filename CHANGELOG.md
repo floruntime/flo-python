@@ -24,6 +24,10 @@ The server's op table hash is now `0x4b8c7cf1921fc323` (`TABLE_HASH`).
   0x67, an i64; none or 0 is the server's time), `TSWriteResult.time_ns`,
   `TSPoint.time_ns`, `FloQLPoint.time_ns`. `ns_from_datetime` and
   `datetime_from_ns` (and `TSPoint.time`) convert at the microsecond
+- `ts.query` (`TSQueryOptions`: `from_ns`, `to_ns`, a `window` as ns or a
+  `timedelta`, and `TSAggregation`) answers `TSBucket`s with `start_ns`;
+  `ts.info` answers a `TSInfo` with `oldest_ns` and `newest_ns`.
+  `ns_from_timedelta` converts exactly
 - `ProcessingRuntime.late_edge_ms` and `late_points`: at least that many of
   a job's TS source points came in later than the edge at or above its
   lateness window, so its sources never read them; both `None` for a job
@@ -56,6 +60,9 @@ The server's op table hash is now `0x4b8c7cf1921fc323` (`TABLE_HASH`).
 
 - `OptionTag.TS_TIMESTAMP` is `TS_TIMESTAMP_NS`: the server reads it as ns,
   so a time sent as ms lands near 1970. A time before 1970 is refused
+- `OptionTag.TS_FROM_MS`, `TS_TO_MS` and `TS_WINDOW_MS` are `TS_FROM_NS`,
+  `TS_TO_NS` and `TS_WINDOW_NS`, i64s of ns. Every time-series time and
+  window is ns; no ms remains in the time-series API
 
 ## [0.1.5] - 2026-11-15
 

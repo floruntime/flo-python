@@ -6,7 +6,7 @@ Core types, constants, and data classes for the Flo client SDK.
 import struct
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import Any, Generic, Optional, TypeVar
 
 # =============================================================================
@@ -406,9 +406,9 @@ class OptionTag(IntEnum):
     ABANDON = 0x34  # void: A nack hands its records back unstarted: ready at once, no failure
 
     # Time-Series Options (0x60 - 0x6F)
-    TS_FROM_MS = 0x60  # i64: Start of time range (inclusive, unix ms)
-    TS_TO_MS = 0x61  # i64: End of time range (inclusive, 0 = now)
-    TS_WINDOW_MS = 0x62  # i64: Aggregation window size (ms)
+    TS_FROM_NS = 0x60  # i64: a query's start, inclusive, in Unix ns (0 = none)
+    TS_TO_NS = 0x61  # i64: a query's end, inclusive, in Unix ns (0 = none)
+    TS_WINDOW_NS = 0x62  # i64: a query's window width in ns (absent = a minute; 0 refused)
     TS_AGGREGATION = 0x63  # string: Aggregation function name (avg, sum, count, min, max)
     TS_FIELD = 0x64  # string: Field name filter (empty = "value")
     TS_TAGS = 0x65  # string: Comma-separated tag filters "key=val,key2=val2"
@@ -1933,6 +1933,55 @@ class TSWriteResult:
     series_hash: int
 
 
+class TSAggregation(str, Enum):
+    """How a ts.query folds each window's points into one value."""
+
+    AVG = "avg"
+    SUM = "sum"
+    MIN = "min"
+    MAX = "max"
+    COUNT = "count"
+
+
+@dataclass
+class TSQueryOptions:
+    """Options for a ts.query: one value per window of a measurement field."""
+
+    namespace: str | None = None
+    field: str = "value"
+    tags: str | dict[str, str] = ""
+    # Inclusive bounds in Unix ns; None for no bound.
+    from_ns: int | None = None
+    to_ns: int | None = None
+    # Each window's width: an int of ns, or a timedelta (exact to its
+    # microsecond). None for the server's default, a minute. Windows start
+    # at multiples of the width from the epoch.
+    window: int | timedelta | None = None
+    aggregation: TSAggregation = TSAggregation.AVG
+
+
+@dataclass
+class TSBucket:
+    """One window of a ts.query: its start in Unix ns, and its value."""
+
+    start_ns: int
+    value: float
+
+
+@dataclass
+class TSInfo:
+    """A measurement's series, fields, points, and its oldest and newest
+    points' times in Unix ns (None without points)."""
+
+    series: int
+    field_count: int  # Counted up to 256
+    fields_capped: bool  # More fields than were counted or listed
+    fields: list[str]
+    points: int
+    oldest_ns: int | None
+    newest_ns: int | None
+
+
 @dataclass
 class FloQLPoint:
     """One point of a FloQL answer: its time in Unix nanoseconds, and its value."""
@@ -1951,6 +2000,11 @@ class FloQLSeries:
 
 
 _NS_PER_US = 1_000
+
+
+def ns_from_timedelta(d: timedelta) -> int:
+    """A timedelta as ns, exactly: it holds whole microseconds."""
+    return ((d.days * 86_400 + d.seconds) * 1_000_000 + d.microseconds) * _NS_PER_US
 
 
 def ns_from_datetime(dt: datetime) -> int:

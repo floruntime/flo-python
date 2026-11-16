@@ -8,12 +8,17 @@ import pytest
 
 from flo import (
     FloClient,
+    TSAggregation,
+    TSBucket,
+    TSInfo,
     TSOrder,
     TSPoint,
+    TSQueryOptions,
     TSReadOptions,
     TSWriteOptions,
     datetime_from_ns,
     ns_from_datetime,
+    ns_from_timedelta,
 )
 from flo.exceptions import (
     BadRequestError,
@@ -24,8 +29,11 @@ from flo.exceptions import (
 from flo.kv_body import is_table_op
 from flo.ts import (
     decode_floql_answer,
+    decode_info_answer,
+    decode_query_answer,
     decode_read_answer,
     decode_write_answer,
+    encode_query_options,
     encode_read_body,
     encode_write_options,
 )
@@ -331,10 +339,129 @@ def test_floql_answer() -> None:
     def s(b: bytes) -> bytes:
         return struct.pack("<I", len(b)) + b
 
-    data = struct.pack("<I", 1) + s(b"cpu") + s(b"value") + struct.pack("<Iqd", 1, 5, 0.5)
+    data = struct.pack("<I", 1) + s(b"cpu") + s(b"value") + struct.pack("<Iqd", 1, ODD_NS, 0.5)
     [series] = decode_floql_answer(data)
     assert (series.key, series.field) == ("cpu", "value")
-    # The server answers ms; the SDK gives ns.
-    assert [(p.time_ns, p.value) for p in series.points] == [(5_000_000, 0.5)]
+    assert [(p.time_ns, p.value) for p in series.points] == [(ODD_NS, 0.5)]
     with pytest.raises(IncompleteResponseError):
         decode_floql_answer(data[:-1])
+
+
+# ── Query ────────────────────────────────────────────────────────────────
+
+
+def _opt(options: bytes, tag: int) -> bytes | None:
+    opt = OptionsIterator(options).find(tag)
+    return None if opt is None else opt.data
+
+
+def test_query_options_are_i64_ns() -> None:
+    opts = encode_query_options(
+        TSQueryOptions(
+            field="idle",
+            tags={"h": "a"},
+            from_ns=ODD_NS,
+            to_ns=ODD_NS + 1,
+            window=1_500_001,
+            aggregation=TSAggregation.MAX,
+        )
+    )
+    assert _opt(opts, 0x60) == struct.pack("<q", ODD_NS)
+    assert _opt(opts, 0x61) == struct.pack("<q", ODD_NS + 1)
+    assert _opt(opts, 0x62) == struct.pack("<q", 1_500_001)
+    assert _opt(opts, OptionTag.TS_AGGREGATION) == b"max"
+    assert _opt(opts, OptionTag.TS_FIELD) == b"idle"
+    assert _opt(opts, OptionTag.TS_TAGS) == b"h=a"
+
+
+def test_query_defaults_send_no_bounds_or_window() -> None:
+    opts = encode_query_options(TSQueryOptions())
+    assert [_opt(opts, t) for t in (0x60, 0x61, 0x62)] == [None, None, None]
+    assert _opt(opts, OptionTag.TS_AGGREGATION) == b"avg"
+
+
+def test_query_window_as_timedelta_is_exact_ns() -> None:
+    opts = encode_query_options(TSQueryOptions(window=timedelta(minutes=5, microseconds=3)))
+    assert _opt(opts, 0x62) == struct.pack("<q", 300_000_003_000)
+    assert ns_from_timedelta(timedelta(days=1)) == 86_400 * 10**9
+
+
+@pytest.mark.parametrize(
+    "opts",
+    [
+        TSQueryOptions(window=0),
+        TSQueryOptions(window=-1),
+        TSQueryOptions(window=timedelta(0)),
+        TSQueryOptions(from_ns=-1),
+        TSQueryOptions(to_ns=1 << 63),
+    ],
+)
+def test_query_options_refuse_what_the_server_would(opts: TSQueryOptions) -> None:
+    with pytest.raises(ValidationError):
+        encode_query_options(opts)
+
+
+def test_query_answer_buckets_start_in_ns() -> None:
+    data = (
+        struct.pack("<II", 1, 3)
+        + b"cpu"
+        + struct.pack("<I", 2)
+        + struct.pack("<qdqd", ODD_NS, 1.5, ODD_NS + 60 * 10**9, 2.5)
+    )
+    assert decode_query_answer(data) == [
+        TSBucket(ODD_NS, 1.5),
+        TSBucket(ODD_NS + 60 * 10**9, 2.5),
+    ]
+    assert decode_query_answer(struct.pack("<I", 0)) == []
+    with pytest.raises(IncompleteResponseError):
+        decode_query_answer(data[:-1])
+
+
+async def test_query_sends_options_and_surfaces_the_window_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = (
+        b"bad request: the range holds more than 1024 windows of this width; "
+        b"widen the window (it is in nanoseconds) or narrow the range"
+    )
+    client, calls = _paged(monkeypatch, [_refusal(StatusCode.BAD_REQUEST, text)])
+    with pytest.raises(BadRequestError, match="it is in nanoseconds"):
+        await client.ts.query("cpu", TSQueryOptions(from_ns=0, to_ns=ODD_NS, window=1))
+    [(op, key, value, options)] = calls
+    assert (op, key, value) == (OpCode.TS_QUERY, b"cpu", b"")
+    assert _opt(options, 0x62) == struct.pack("<q", 1)
+
+
+# ── Info ─────────────────────────────────────────────────────────────────
+
+
+def _info(oldest: int | None, newest: int | None) -> bytes:
+    def opt(v: int | None) -> bytes:
+        return b"\x00" if v is None else b"\x01" + struct.pack("<q", v)
+
+    fields = struct.pack("<H", 2) + struct.pack("<H", 5) + b"value" + struct.pack("<H", 4) + b"idle"
+    return struct.pack("<IIB", 3, 2, 0) + fields + struct.pack("<Q", 9) + opt(oldest) + opt(newest)
+
+
+def test_info_answer_times_are_ns() -> None:
+    assert decode_info_answer(_info(ODD_NS, ODD_NS + 7)) == TSInfo(
+        series=3,
+        field_count=2,
+        fields_capped=False,
+        fields=["value", "idle"],
+        points=9,
+        oldest_ns=ODD_NS,
+        newest_ns=ODD_NS + 7,
+    )
+    empty = decode_info_answer(_info(None, None))
+    assert (empty.oldest_ns, empty.newest_ns) == (None, None)
+    with pytest.raises(IncompleteResponseError):
+        decode_info_answer(_info(ODD_NS, ODD_NS)[:-1])
+
+
+async def test_info_is_a_table_op_with_an_empty_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, calls = _paged(monkeypatch, [_ok(_info(1, 2))])
+    info = await client.ts.info("cpu")
+    assert (info.oldest_ns, info.newest_ns) == (1, 2)
+    assert calls == [(OpCode.TS_INFO, b"cpu", b"", b"")]
+    assert is_table_op(OpCode.TS_INFO)
