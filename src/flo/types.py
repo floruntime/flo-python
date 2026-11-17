@@ -4,7 +4,7 @@ Core types, constants, and data classes for the Flo client SDK.
 """
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum, IntEnum
 from typing import Any, Generic, Optional, TypeVar
@@ -238,12 +238,13 @@ class OpCode(IntEnum):
     STREAM_GROUP_DELETE = 0x15C
     STREAM_GROUP_LIST = 0x15D
     STREAM_GROUP_MEMBERS = 0x15E
+    STREAM_GROUP_STEAL = 0x15F
+    STREAM_GROUP_DLQ_LIST = 0x160
+    STREAM_GROUP_DLQ_REQUEUE = 0x161
+    STREAM_GROUP_DLQ_DELETE = 0x162
 
     # ── Queues (0x170 – 0x19F) ──
     QUEUE_ENQUEUE = 0x170
-    QUEUE_DLQ_LIST = 0x176
-    QUEUE_DLQ_DELETE = 0x177
-    QUEUE_DLQ_REQUEUE = 0x178
     QUEUE_STATS = 0x17B
     QUEUE_PURGE = 0x17F
     QUEUE_PEEK = 0x180
@@ -251,6 +252,9 @@ class OpCode(IntEnum):
     QUEUE_COMPLETE = 0x182
     QUEUE_FAIL = 0x183
     QUEUE_TOUCH = 0x184
+    QUEUE_DLQ_LIST = 0x185
+    QUEUE_DLQ_REQUEUE = 0x186
+    QUEUE_DLQ_DELETE = 0x187
     QUEUE_LIST = 0x198
 
     # ── Time-Series (0x1A0 – 0x1BF) ──
@@ -397,6 +401,8 @@ class OptionTag(IntEnum):
     PARTITION_KEY = 0x25  # string: Key for partition routing
     MAX_AGE_SECONDS = 0x26  # u64: Maximum age in seconds for retention
     DRY_RUN = 0x28  # void: Flag to preview what would be deleted
+    RETENTION_COUNT = 0x29  # u64: A stream's retention: the most records it keeps
+    RETENTION_AGE = 0x2A  # u64: A stream's retention: the oldest record's age, in seconds
     FORCE = 0x2C  # void: Flag to delete a stream that still has records
 
     # Consumer Group Options (0x30 - 0x3F)
@@ -604,8 +610,9 @@ class DequeueResult:
 
 
 class QueueRefusalReason(IntEnum):
-    """Why a queue complete, fail or touch didn't apply to a message, or a
-    group ack, nack or touch to a record."""
+    """Why a queue complete, fail or touch didn't apply to a message, a group
+    ack, nack or touch to a record, or a steal, dead letter requeue or delete
+    to one."""
 
     # For a complete, already done; otherwise the message is gone.
     GONE = 0
@@ -614,6 +621,10 @@ class QueueRefusalReason(IntEnum):
     EXPIRED = 3
     RELEASED = 4
     NOT_HELD = 5
+    # A dead letter requeue or delete named one that isn't dead.
+    NOT_DEAD = 6
+    # A steal named a record its holder touched within the idle time named.
+    NOT_IDLE = 7
 
 
 @dataclass
@@ -675,27 +686,50 @@ class PeekResult:
 
 @dataclass
 class DeadLetter:
-    """A message in a queue's dead letter queue. ``payload`` is at most its
-    first 4 KiB; ``size`` is its whole length."""
+    """A message in a queue's dead letters. ``payload`` is at most its first
+    4 KiB; ``size`` is its whole length. ``failures`` counts the times it
+    failed or its lease ran out; ``error`` is its last error, its first 256
+    bytes. Times are Unix ms."""
 
     seq: int
+    priority: int
+    deliveries: int
+    failures: int
+    enqueued_at_ms: int
+    dead_at_ms: int
     size: int
     payload: bytes
-    enqueued_at_ms: int
-    deliveries: int
-    priority: int
-    moved_at_ms: int
+    error: str
+
+
+@dataclass(frozen=True)
+class DlqCursor:
+    """Where a queue's dead letter list goes on. Opaque: pass it back as
+    ``DlqListOptions.after``."""
+
+    dead_ns: int
+    seq: int
 
 
 @dataclass
 class DlqPage:
-    """A page of dead letters, oldest first. ``total`` counts them all; with
-    ``has_more``, ask again with ``after=last_seq``."""
+    """A page of a queue's dead letters, oldest dead first. ``cursor`` is
+    None on the last page; otherwise ask again with ``after=cursor``."""
 
     messages: list[DeadLetter]
-    total: int
-    has_more: bool
-    last_seq: int
+    cursor: DlqCursor | None
+
+
+@dataclass
+class DlqResult:
+    """What a dead letter requeue or delete applied to: ``applied`` messages
+    (with ``dry_run``, how many a delete would), the ``refused`` rest with
+    why (``NOT_DEAD``, or ``GONE``), and with ``all``, whether dead letters
+    remain past this batch (``more``)."""
+
+    applied: int
+    refused: list[QueueRefusal]
+    more: bool
 
 
 # =============================================================================
@@ -808,12 +842,14 @@ class GroupReadResult:
 
 @dataclass
 class GroupRefusal:
-    """A record an ack, nack or touch didn't apply to, and why. ``GONE``
-    means no such record in the group: acked already, trimmed, or the group
-    is gone."""
+    """A record an ack, nack, touch, steal, or dead letter requeue or delete
+    didn't apply to, and why. ``GONE`` means no such record in the group:
+    acked already, trimmed, or the group is gone. ``reason`` is the server's
+    words for it, where it gives them (a steal, requeue or delete)."""
 
     id: StreamID
     why: QueueRefusalReason
+    reason: str = ""
 
 
 @dataclass
@@ -843,6 +879,62 @@ class GroupTouchResult:
 
 
 @dataclass
+class GroupStealResult(GroupReadResult):
+    """A steal's records, now leased to ``consumer`` under a new delivery
+    (``term``, ``index``) until ``expires_at_ms`` (0 when it took none).
+    Each record carries its id and new ``deliveries``, not its payload: ack,
+    nack or touch them by passing this result, as for a read. ``refused``
+    lists the records it didn't take, and why (``NOT_IDLE``: its holder
+    touched it within the idle time named)."""
+
+    refused: list[GroupRefusal] = field(default_factory=list)
+
+
+@dataclass
+class GroupDeadLetter:
+    """A record in a consumer group's dead letters: its deliveries, its
+    failures (nacks and lease expiries), when it died (Unix ms) and its last
+    error, its first 256 bytes."""
+
+    id: StreamID
+    deliveries: int
+    failures: int
+    dead_at_ms: int
+    error: str
+
+
+@dataclass(frozen=True)
+class GroupDlqCursor:
+    """Where a group's dead letter list goes on. Opaque: pass it back as
+    ``GroupDlqListOptions.after``."""
+
+    dead_ns: int
+    ms: int
+    seq: int
+
+
+@dataclass
+class GroupDlqPage:
+    """A page of a group's dead letters, oldest dead first. ``cursor`` is
+    None on the last page; otherwise ask again with ``after=cursor``."""
+
+    dead: list[GroupDeadLetter]
+    cursor: GroupDlqCursor | None
+
+
+@dataclass
+class GroupDlqResult:
+    """What a group dead letter requeue or delete applied to: ``applied``
+    records (with ``dry_run``, how many a delete would), the ``refused`` rest
+    with why (``NOT_DEAD``, or ``GONE``), and with ``all``, whether dead
+    letters remain past this batch (``more``)."""
+
+    applied: int
+    refused: list[GroupRefusal]
+    more: bool
+
+
+@dataclass
 class StreamGroupInfo:
     """A consumer group's counts. ``pending`` is ``ready`` plus ``leased``;
     ``holders`` the consumers holding records now. Records at or below a
@@ -866,6 +958,10 @@ class StreamInfo:
     first_id: StreamID = None  # type: ignore[assignment]
     last_id: StreamID = None  # type: ignore[assignment]
     partition_count: int = 1
+    # Its retention: records older than this many seconds, or past this many
+    # records, are trimmed. 0 is none.
+    retention_age_s: int = 0
+    retention_count: int = 0
 
 
 @dataclass
@@ -1089,12 +1185,35 @@ class QueueFailOptions:
 
 @dataclass
 class DlqListOptions:
-    """Options for DLQ list operations: at most ``limit`` (1..100) dead
-    letters after the one whose seq is ``after`` (None starts at the oldest)."""
+    """A dead letter list's page: at most ``limit`` (1..100) dead letters,
+    past ``after``, the cursor the page before answered (None starts at the
+    oldest dead)."""
 
     namespace: str | None = None
+    limit: int = 20
+    after: DlqCursor | None = None
+
+
+@dataclass
+class DlqRequeueOptions:
+    """A dead letter requeue names its dead letters, or takes the oldest
+    with ``all``, a batch of at most ``limit`` (1..100)."""
+
+    namespace: str | None = None
+    all: bool = False
     limit: int = 100
-    after: int | None = None
+
+
+@dataclass
+class DlqDeleteOptions:
+    """A dead letter delete names its dead letters, or takes the oldest with
+    ``all``, a batch of at most ``limit`` (1..100). With ``dry_run`` it
+    deletes nothing and says how many it would."""
+
+    namespace: str | None = None
+    all: bool = False
+    limit: int = 100
+    dry_run: bool = False
 
 
 @dataclass
@@ -1181,6 +1300,69 @@ class StreamGroupCreateOptions:
 
 
 @dataclass
+class StreamCreateOptions:
+    """A stream's settings. ``partitions`` (1 when None) routes its appends;
+    ``retention_age_s`` and ``retention_count`` trim its records older than
+    that many seconds, or past that many records (0 is none)."""
+
+    namespace: str | None = None
+    partitions: int | None = None
+    retention_age_s: int = 0
+    retention_count: int = 0
+
+
+@dataclass
+class StreamAlterOptions:
+    """The retention an alter sets: each one given (above 0) replaces the
+    stream's; 0 leaves it as it is."""
+
+    namespace: str | None = None
+    retention_age_s: int = 0
+    retention_count: int = 0
+
+
+@dataclass
+class StreamGroupStealOptions:
+    """A steal's lease, 5000..43200000 ms (the group's when None)."""
+
+    namespace: str | None = None
+    lease_ms: int | None = None
+
+
+@dataclass
+class GroupDlqListOptions:
+    """A group dead letter list's page: at most ``limit`` (1..100), past
+    ``after``, the cursor the page before answered (None starts at the
+    oldest dead)."""
+
+    namespace: str | None = None
+    limit: int = 20
+    after: GroupDlqCursor | None = None
+
+
+@dataclass
+class GroupDlqRequeueOptions:
+    """A group dead letter requeue names its records, or takes the oldest
+    with ``all``, a batch of at most ``limit`` (1..100)."""
+
+    namespace: str | None = None
+    all: bool = False
+    limit: int = 100
+
+
+@dataclass
+class GroupDlqDeleteOptions:
+    """A group dead letter delete names its records, or takes the oldest with
+    ``all``, a batch of at most ``limit`` (1..100). With ``dry_run`` it
+    deletes nothing and says how many it would."""
+
+    namespace: str | None = None
+    all: bool = False
+    limit: int = 100
+    dry_run: bool = False
+
+
+@dataclass
 class StreamGroupReadOptions:
     """Options for reading from a consumer group."""
 
@@ -1256,6 +1438,9 @@ class ActionRunStatus:
     worker_id: str | None = None
     # The outcome a completed run's worker named; None for success.
     outcome: str | None = None
+    # Why its lease, past due, isn't ended yet: its end waits for room on
+    # the calling workflow's shard. None when nothing is held.
+    held: str | None = None
 
 
 @dataclass

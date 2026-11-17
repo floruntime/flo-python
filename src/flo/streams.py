@@ -5,24 +5,39 @@ Uses StreamID-native positioning (timestamp_ms + sequence).
 """
 
 import struct
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from .exceptions import IncompleteResponseError, ValidationError, not_found_error
 from .kv_body import (
+    decode_group_dlq_answer,
+    decode_group_dlq_list_answer,
     decode_group_list_answer,
     decode_group_members_answer,
+    decode_group_steal_answer,
+    encode_group_dlq_body,
+    encode_group_dlq_list_body,
     encode_group_members_body,
+    encode_group_steal_body,
 )
 from .types import (
+    GroupDlqDeleteOptions,
+    GroupDlqListOptions,
+    GroupDlqPage,
+    GroupDlqRequeueOptions,
+    GroupDlqResult,
     GroupReadResult,
     GroupRecord,
     GroupReportResult,
+    GroupStealResult,
     GroupTouchResult,
     OpCode,
     OptionTag,
     PendingEntry,
+    StreamAlterOptions,
     StreamAppendOptions,
     StreamAppendResult,
+    StreamCreateOptions,
     StreamDeleteOptions,
     StreamGroupAckOptions,
     StreamGroupCreateOptions,
@@ -31,6 +46,8 @@ from .types import (
     StreamGroupMembersResult,
     StreamGroupNackOptions,
     StreamGroupReadOptions,
+    StreamGroupStealOptions,
+    StreamID,
     StreamInfo,
     StreamInfoOptions,
     StreamReadOptions,
@@ -185,6 +202,61 @@ class StreamOperations:
             raise not_found_error(response.status, response.data, response.stale)
 
         return parse_stream_read_response(response.data)
+
+    async def create(self, stream: str, options: StreamCreateOptions | None = None) -> None:
+        """Create a stream with its settings: partitions and retention.
+
+        An append creates a stream too, with none. A create of a stream an
+        append made, and never altered, gives it the settings asked. Once a
+        stream has settings (a create or an alter gave it some), a create
+        that asks for the same ones succeeds, as a retry does, and one that
+        asks for others is refused: change them with ``alter``.
+
+        Raises:
+            ConflictError: The stream exists with other settings, or another
+                stream's name hashes as this one's (choose another name).
+        """
+        opts = options or StreamCreateOptions()
+        builder = OptionsBuilder()
+        if opts.retention_age_s:
+            builder.add_u64(OptionTag.RETENTION_AGE, opts.retention_age_s)
+        if opts.retention_count:
+            builder.add_u64(OptionTag.RETENTION_COUNT, opts.retention_count)
+        value = b""
+        if opts.partitions is not None:
+            if not 1 <= opts.partitions <= 0xFFFFFFFF:
+                raise ValidationError(f"partitions must be a u32 above 0, got {opts.partitions}")
+            value = struct.pack("<I", opts.partitions)
+        await self._client._send_and_check(
+            OpCode.STREAM_CREATE,
+            self._client.get_namespace(opts.namespace),
+            stream.encode("utf-8"),
+            value,
+            builder.build(),
+        )
+
+    async def alter(self, stream: str, options: StreamAlterOptions | None = None) -> None:
+        """Change a stream's retention: each setting given (above 0) replaces
+        the stream's, and 0 leaves it. Works on a stream an append made as on
+        one a create made; afterwards a create must ask for the stream's
+        settings as they now are, or it is refused.
+
+        Raises:
+            NotFoundError: No such stream.
+        """
+        opts = options or StreamAlterOptions()
+        builder = OptionsBuilder()
+        if opts.retention_age_s:
+            builder.add_u64(OptionTag.RETENTION_AGE, opts.retention_age_s)
+        if opts.retention_count:
+            builder.add_u64(OptionTag.RETENTION_COUNT, opts.retention_count)
+        await self._client._send_and_check(
+            OpCode.STREAM_ALTER,
+            self._client.get_namespace(opts.namespace),
+            stream.encode("utf-8"),
+            b"",
+            builder.build(),
+        )
 
     async def info(
         self,
@@ -574,3 +646,109 @@ class StreamOperations:
             encode_group_members_body(group),
         )
         return decode_group_members_answer(response.data)
+
+    async def group_steal(
+        self,
+        stream: str,
+        group: str,
+        consumer: str,
+        records: Sequence[GroupRecord | PendingEntry],
+        min_idle_ms: int,
+        options: StreamGroupStealOptions | None = None,
+    ) -> GroupStealResult:
+        """Take records another consumer holds and has left idle for at least
+        ``min_idle_ms``: each gets a new delivery and lease for ``consumer``,
+        its failures kept. Idle is the time since its holder last touched it
+        (its read, a steal, or any touch), so a holder that touches more
+        often is never stolen from. An operator's command: a read takes
+        expired records by itself.
+
+        Each record is named by its id and the deliveries its holder has:
+        pass a read's records, or ``group_pending``'s entries. The result is
+        the new delivery; ack, nack or touch it as a read's. Records it didn't
+        take are in ``refused``: ``NOT_IDLE``, ``DELIVERED_AGAIN``, ``GONE``
+        and the like.
+
+        Raises:
+            NotFoundError: The stream has no such group.
+        """
+        opts = options or StreamGroupStealOptions()
+        named = [
+            (r.id, r.delivery_count if isinstance(r, PendingEntry) else r.deliveries)
+            for r in records
+        ]
+        response = await self._client._send_and_check(
+            OpCode.STREAM_GROUP_STEAL,
+            self._client.get_namespace(opts.namespace),
+            stream.encode("utf-8"),
+            encode_group_steal_body(group, consumer, min_idle_ms, opts.lease_ms, named),
+        )
+        return decode_group_steal_answer(response.data, consumer)
+
+    async def group_dlq_list(
+        self, stream: str, group: str, options: GroupDlqListOptions | None = None
+    ) -> GroupDlqPage:
+        """A page of a consumer group's dead letters, oldest dead first, each
+        with its deliveries, failures, when it died and its last error. Page
+        with ``after=page.cursor`` until the cursor is None.
+
+        Raises:
+            NotFoundError: The stream has no such group.
+        """
+        opts = options or GroupDlqListOptions()
+        response = await self._client._send_and_check(
+            OpCode.STREAM_GROUP_DLQ_LIST,
+            self._client.get_namespace(opts.namespace),
+            stream.encode("utf-8"),
+            encode_group_dlq_list_body(group, opts.limit, opts.after),
+        )
+        return decode_group_dlq_list_answer(response.data)
+
+    async def group_dlq_requeue(
+        self,
+        stream: str,
+        group: str,
+        records: Sequence[StreamID] | None = None,
+        options: GroupDlqRequeueOptions | None = None,
+    ) -> GroupDlqResult:
+        """Make a group's dead letters ready again at once, their failures
+        reset to 0 (their deliveries and last error stay). Name up to 100 by
+        id, or set ``all`` to take the oldest dead, a batch of up to
+        ``limit``: ``more`` says others remain. One that isn't dead is
+        refused ``NOT_DEAD``; one trimmed from the stream since, ``GONE``.
+
+        Raises:
+            NotFoundError: The stream has no such group.
+        """
+        opts = options or GroupDlqRequeueOptions()
+        response = await self._client._send_and_check(
+            OpCode.STREAM_GROUP_DLQ_REQUEUE,
+            self._client.get_namespace(opts.namespace),
+            stream.encode("utf-8"),
+            encode_group_dlq_body(group, records, opts.all, opts.limit),
+        )
+        return decode_group_dlq_answer("stream.group.dlq_requeue", response.data)
+
+    async def group_dlq_delete(
+        self,
+        stream: str,
+        group: str,
+        records: Sequence[StreamID] | None = None,
+        options: GroupDlqDeleteOptions | None = None,
+    ) -> GroupDlqResult:
+        """Delete a group's dead letters for good: up to 100 named by id, or
+        with ``all`` the oldest dead, a batch of up to ``limit``. With
+        ``dry_run``, ``applied`` is how many it would delete, and nothing is
+        deleted.
+
+        Raises:
+            NotFoundError: The stream has no such group.
+        """
+        opts = options or GroupDlqDeleteOptions()
+        response = await self._client._send_and_check(
+            OpCode.STREAM_GROUP_DLQ_DELETE,
+            self._client.get_namespace(opts.namespace),
+            stream.encode("utf-8"),
+            encode_group_dlq_body(group, records, opts.all, opts.limit, opts.dry_run),
+        )
+        return decode_group_dlq_answer("stream.group.dlq_delete", response.data)

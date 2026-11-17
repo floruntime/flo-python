@@ -275,15 +275,32 @@ result = await client.queue.dequeue("tasks", 10, DequeueOptions(ack=True))
 `queue.purge` removes every message of a queue, ready, leased and dead, and
 returns how many.
 
-`queue.dlq_list` reads a page of dead letters, oldest first (`limit` 1..100):
+`queue.dlq_list` reads a page of dead letters, oldest dead first (`limit`
+1..100, default 20), each with up to 4 KiB of its payload (`size` is its
+length), its deliveries and failures, when it died and its last error. Page
+with the answer's opaque `cursor` until it is `None`.
+
+`queue.dlq_requeue` makes dead letters ready again at once, failures reset;
+`queue.dlq_delete` deletes them for good (`dry_run` says how many it would).
+Each names up to 100 by seq, or takes the oldest dead with `all`, a batch of
+up to `limit`: `more` says others remain. One that isn't dead comes back in
+`refused` as `NOT_DEAD`, one not there as `GONE`; the call itself succeeds.
+A queue that doesn't exist raises `NotFoundError`.
 
 ```python
-from flo import DlqListOptions
+from flo import DlqDeleteOptions, DlqListOptions, DlqRequeueOptions
 
 page = await client.queue.dlq_list("tasks", DlqListOptions(limit=100))
-print(f"{page.total} dead letters")
-while page.has_more:
-    page = await client.queue.dlq_list("tasks", DlqListOptions(after=page.last_seq))
+while True:
+    for msg in page.messages:
+        print(msg.seq, msg.failures, msg.error)
+    if page.cursor is None:
+        break
+    page = await client.queue.dlq_list("tasks", DlqListOptions(after=page.cursor))
+
+await client.queue.dlq_requeue("tasks", [msg.seq])
+while (await client.queue.dlq_delete("tasks", options=DlqDeleteOptions(all=True))).more:
+    pass
 ```
 
 ### Peek
@@ -370,7 +387,8 @@ read that can take nothing new for either raises `GroupHeldFullError` (an
 `OverloadedError`, reason `GROUP_HELD_FULL`; the message says which cap).
 Reading again won't help until room is made, so the client doesn't retry it.
 At the group's cap, acks and nacks make room, but dead records count too and
-stay until the group is deleted or a trim of the stream cuts them. At the
+stay until they are requeued or deleted, the group is deleted, or a trim of
+the stream cuts them. At the
 shard's cap, this group's own acks free room, as do other groups and queues on
 the shard draining.
 
@@ -430,6 +448,60 @@ pending = await client.stream.group_pending("events", "processors")  # leased no
 groups = await client.stream.group_list("events")
 members = await client.stream.group_members("events", "processors")  # consumers holding records
 await client.stream.group_delete("events", "processors")
+```
+
+A group's dead letters list a page at a time, oldest dead first, each with its
+deliveries, failures, when it died and its last error; requeue and delete
+take them by id or `all`, as a queue's do (`NOT_DEAD` for one that isn't).
+
+```python
+from flo import GroupDlqDeleteOptions, GroupDlqListOptions
+
+page = await client.stream.group_dlq_list("events", "processors", GroupDlqListOptions(limit=50))
+await client.stream.group_dlq_requeue("events", "processors", [d.id for d in page.dead])
+await client.stream.group_dlq_delete(
+    "events", "processors", options=GroupDlqDeleteOptions(all=True, dry_run=True)
+)
+```
+
+`group_steal` is an operator's command: it takes records another consumer
+holds and has left idle for at least `min_idle_ms` (idle is the time since
+its holder last read, stole or touched it), each with a new delivery and
+lease, its failures kept. Name each record with the deliveries its holder has
+(a read's records, or `group_pending`'s entries). The result is a delivery,
+acked, nacked or touched as a read's; records it didn't take come back in
+`refused` (`NOT_IDLE` for one touched within the idle time). A read takes
+expired records by itself, so a steal is for records whose holder is stuck
+but still touching them, or to move work sooner than the lease.
+
+```python
+pending = await client.stream.group_pending("events", "processors", "worker-1")
+stolen = await client.stream.group_steal("events", "processors", "worker-2", pending, 60_000)
+await client.stream.group_ack("events", "processors", stolen)
+```
+
+### Stream Settings
+
+An append creates a stream with no settings. `create` gives one its
+partitions and retention (records older than `retention_age_s`, or past
+`retention_count`, are trimmed); `alter` changes its retention, each setting
+given replacing the stream's, on a stream an append made as on one a create
+made. `info` answers the settings.
+
+Once a stream has settings, from a create or an alter, a create that names
+the same ones succeeds (a retry), and one that names others raises
+`ConflictError` ("the stream exists with other settings"): after an alter, a
+create must name the settings as altered. A create of a stream an append made
+and nothing altered gives it the settings named. A create whose name hashes
+as another stream's raises `ConflictError` too; choose another name.
+
+```python
+from flo import StreamAlterOptions, StreamCreateOptions
+
+await client.stream.create("events", StreamCreateOptions(retention_age_s=86_400))
+await client.stream.alter("events", StreamAlterOptions(retention_count=1_000_000))
+info = await client.stream.info("events")
+print(info.retention_age_s, info.retention_count)
 ```
 
 ## Time-Series Operations
@@ -607,6 +679,8 @@ if status.error_message is not None:
     print(f"Error: {status.error_message}")
 if status.outcome is not None:  # None for success
     print(f"Outcome: {status.outcome}")
+if status.held is not None:  # why a past-due lease isn't ended yet
+    print(f"Held: {status.held}")
 
 # An action's definition, its runs by status and its completed runs' latency
 info = await client.action.info("process-image")
@@ -782,6 +856,14 @@ async def run_stream_worker():
 
 asyncio.run(run_stream_worker())
 ```
+
+A worker's complete, fail, ack or nack refused without being run (overloaded
+or unavailable, once the client's own retries are spent) is sent again with a
+capped backoff until the server takes it or answers otherwise, and logged
+each time. A complete or fail that ends a run a workflow step called is
+refused overloaded while the server's queue of writes to the workflow's shard
+is full; meanwhile the run's lease doesn't run out, and `action.status` says
+why in `held`. A stopping worker gives up on it after a couple of seconds.
 
 A stream worker acks each record its handler returns from and nacks each one
 its handler raises on, naming the read's delivery. A record whose handler runs

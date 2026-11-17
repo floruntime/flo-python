@@ -89,7 +89,9 @@ def fail_tail(error: str, retry: bool, abandoned: bool = False, t: TaskAssignmen
 class FakeActionServer:
     """Hands out one task, then answers every await empty. The nth result
     (complete or fail, from 0) gets reply(n): "ok", "drop" (close the
-    connection unanswered), "hang" (never answer) or "refuse"."""
+    connection unanswered), "hang" (never answer), "refuse", or "overloaded"
+    (refused, not run, as while the end of a run a workflow called waits for
+    room on the caller's shard)."""
 
     def __init__(self, reply: Callable[[int], str] = lambda n: "ok") -> None:
         self.reply = reply
@@ -127,6 +129,9 @@ class FakeActionServer:
                         continue
                     if action == "refuse":
                         writer.write(_refusal(request_id, StatusCode.BAD_REQUEST, Ran.YES))
+                        continue
+                    if action == "overloaded":
+                        writer.write(_refusal(request_id, StatusCode.OVERLOADED, Ran.NO))
                         continue
                 writer.write(_frame(request_id, StatusCode.OK, b""))
         except (asyncio.IncompleteReadError, ConnectionError):
@@ -203,6 +208,31 @@ async def test_a_refused_complete_is_neither_resent_nor_failed(
         await _run_action(fake, _done, lambda: len(fake.results) >= 1)
     assert fake.ops() == [OpCode.ACTION_COMPLETE]
     assert not any("Action completed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("handler", ["complete", "fail"])
+async def test_a_result_refused_overloaded_is_resent_until_taken(
+    handler: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # More refusals than the client's own retries (4 tries) and the three
+    # sends a lost result gets: the worker keeps resending the same report.
+    fake = FakeActionServer(lambda n: "overloaded" if n < 6 else "ok")
+
+    async def fails(ctx: ActionContext) -> bytes:
+        raise NonRetryableError("bad input")
+
+    with caplog.at_level(logging.INFO, logger="flo.worker"):
+        await _run_action(
+            fake, _done if handler == "complete" else fails, lambda: len(fake.results) >= 7
+        )
+    op = OpCode.ACTION_COMPLETE if handler == "complete" else OpCode.ACTION_FAIL
+    assert fake.ops() == [op] * 7
+    frames = {_masked(frame) for _, frame in fake.results}
+    assert len(frames) == 1
+    assert any("refused, not run" in r.getMessage() for r in caplog.records)
+    assert not any("Dropped" in r.getMessage() for r in caplog.records)
+    if handler == "complete":
+        assert any("Action completed" in r.getMessage() for r in caplog.records)
 
 
 async def test_a_result_is_sent_at_most_three_times(caplog: pytest.LogCaptureFixture) -> None:

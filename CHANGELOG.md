@@ -5,6 +5,59 @@ All notable changes to the Flo Python SDK will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `stream.group_steal(stream, group, consumer, records, min_idle_ms)`: take
+  records another consumer holds and has left idle that long, each with a new
+  delivery and lease, its failures kept. It answers a `GroupStealResult`, a
+  delivery acked, nacked or touched as a read's, with `refused` for the
+  records it didn't take (`NOT_IDLE` for one its holder touched within the
+  idle time)
+- A consumer group's dead letters: `stream.group_dlq_list` (a page, oldest
+  dead first, with each one's deliveries, failures, `dead_at_ms` and last
+  error; page by the opaque `cursor`), `group_dlq_requeue` (ready again,
+  failures reset) and `group_dlq_delete` (with `dry_run`). Requeue and delete
+  name up to 100 records by id, or take the oldest with `all`, a batch of up to
+  `limit`; they answer `applied`, `refused` (with why and the server's words)
+  and `more`
+- `queue.dlq_requeue` and `queue.dlq_delete` (with `dry_run`), by seq or
+  `all`, answering a `DlqResult` as the group's do
+- `QueueRefusalReason.NOT_DEAD` (6) and `NOT_IDLE` (7): a requeue or delete
+  of one that isn't dead, and a steal of one that isn't idle.
+  `GroupRefusal.reason` carries the server's words where it gives them
+- `ActionRunStatus.held`: why a run's lease, past due, isn't ended yet (its
+  end waits for room on the calling workflow's shard)
+- `stream.create` (partitions, retention by age and count) and `stream.alter`
+  (retention); `StreamInfo.retention_age_s` and `retention_count`
+
+### Changed
+
+- A worker's complete, fail, ack or nack refused without being run
+  (overloaded or unavailable, after the client's own retries) is sent again
+  with a capped backoff until the server takes it or answers otherwise, and
+  logged; it used to be dropped. A complete or fail that ends a run a
+  workflow step called is refused overloaded while the server's writes to the
+  workflow's shard are queued full, and the run's lease doesn't run out
+  meanwhile. A stopping worker gives up after a couple of seconds
+- An alter of a stream an append made succeeds; it used to be not found.
+  After an alter a create must name the stream's settings as altered, or it
+  raises `ConflictError`; a create whose name hashes as another stream's does
+  too
+- A workflow step whose action isn't registered waits for one, up to the
+  server's missing-action wait, instead of failing at once
+
+### Breaking
+
+- `queue.dlq_list` sends the new op: `DlqPage` is `messages` and `cursor`
+  (a `DlqCursor`, `None` on the last page), replacing `total`, `has_more` and
+  `last_seq`; `DlqListOptions.after` takes the cursor, and `limit` defaults
+  to 20. `DeadLetter` gains `failures`, `dead_at_ms` and `error`, and loses
+  `moved_at_ms`. A queue that doesn't exist raises `NotFoundError`
+- The old dead letter op codes (0x176..0x178) are gone; `OpCode.QUEUE_DLQ_*`
+  are the server's 0x185..0x187
+
 ## [0.1.6] - 2026-11-16
 
 The op table hash moves with the server in this release: this SDK talks only

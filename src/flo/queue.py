@@ -4,6 +4,7 @@ Queue operations for Flo client.
 """
 
 import struct
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from .exceptions import IncompleteResponseError, ValidationError
@@ -11,19 +12,25 @@ from .kv_body import (
     MAX_PEEK,
     decode_dequeue_answer,
     decode_peek_answer,
+    decode_queue_dlq_answer,
+    decode_queue_dlq_list_answer,
     decode_queue_report_answer,
     decode_queue_touch_answer,
     encode_dequeue_body,
     encode_peek_body,
     encode_queue_complete_body,
+    encode_queue_dlq_body,
+    encode_queue_dlq_list_body,
     encode_queue_fail_body,
 )
 from .types import (
-    DeadLetter,
     DequeueOptions,
     DequeueResult,
+    DlqDeleteOptions,
     DlqListOptions,
     DlqPage,
+    DlqRequeueOptions,
+    DlqResult,
     EnqueueOptions,
     Message,
     OpCode,
@@ -40,8 +47,6 @@ from .wire import OptionsBuilder, parse_enqueue_response
 
 # The longest an enqueued message waits before it's ready: a day.
 MAX_ENQUEUE_DELAY_MS = 86_400_000
-# The most dead letters one page lists.
-MAX_DLQ_PAGE = 100
 
 if TYPE_CHECKING:
     from .client import FloClient
@@ -225,48 +230,81 @@ class QueueOperations:
         queue: str,
         options: DlqListOptions | None = None,
     ) -> DlqPage:
-        """List a page of the Dead Letter Queue, oldest first.
+        """A page of a queue's dead letters, oldest dead first, each with up
+        to 4 KiB of its payload, its failures, when it died and its last
+        error.
 
         A message lands here once failed or expired five times, or failed
-        with ``dead``; it stays until the queue is purged.
+        with ``dead``; it stays until requeued, deleted or purged.
 
-        Args:
-            queue: Queue name.
-            options: The page's limit (1..100) and ``after``, the seq that
-                ended the page before (``last_seq``); None starts at the oldest.
-
-        Returns:
-            DlqPage with the page's dead letters, how many there are in all,
-            and whether more follow.
+        Raises:
+            NotFoundError: No such queue.
 
         Example:
             page = await client.queue.dlq_list("tasks")
             while True:
                 for msg in page.messages:
-                    print(f"Failed message {msg.seq}: {msg.payload}")
-                if not page.has_more:
+                    print(f"Dead message {msg.seq}: {msg.error}")
+                if page.cursor is None:
                     break
-                page = await client.queue.dlq_list(
-                    "tasks", DlqListOptions(after=page.last_seq)
-                )
+                page = await client.queue.dlq_list("tasks", DlqListOptions(after=page.cursor))
         """
         opts = options or DlqListOptions()
-        namespace = self._client.get_namespace(opts.namespace)
-        if not 1 <= opts.limit <= MAX_DLQ_PAGE:
-            raise ValidationError(f"dlq list limit must be 1..{MAX_DLQ_PAGE}, got {opts.limit}")
-
-        # The page goes in the value: [limit:u32][after:u64]?
-        value = struct.pack("<I", opts.limit)
-        if opts.after is not None:
-            value += struct.pack("<Q", opts.after)
         response = await self._client._send_and_check(
             OpCode.QUEUE_DLQ_LIST,
-            namespace,
+            self._client.get_namespace(opts.namespace),
             queue.encode("utf-8"),
-            value,
+            encode_queue_dlq_list_body(opts.limit, opts.after),
         )
+        return decode_queue_dlq_list_answer(response.data)
 
-        return parse_dlq_page(response.data)
+    async def dlq_requeue(
+        self,
+        queue: str,
+        messages: Sequence[int] | None = None,
+        options: DlqRequeueOptions | None = None,
+    ) -> DlqResult:
+        """Make dead letters ready again at once, at their priority, their
+        failures reset to 0 (their deliveries and last error stay).
+
+        Name up to 100 by seq, or set ``all`` to take the oldest dead, a
+        batch of up to ``limit``: ``more`` says others remain. One that isn't
+        dead is refused ``NOT_DEAD``; one that isn't there, ``GONE``.
+
+        Raises:
+            NotFoundError: No such queue.
+        """
+        opts = options or DlqRequeueOptions()
+        response = await self._client._send_and_check(
+            OpCode.QUEUE_DLQ_REQUEUE,
+            self._client.get_namespace(opts.namespace),
+            queue.encode("utf-8"),
+            encode_queue_dlq_body(messages, opts.all, opts.limit),
+        )
+        return decode_queue_dlq_answer("queue.dlq_requeue", response.data)
+
+    async def dlq_delete(
+        self,
+        queue: str,
+        messages: Sequence[int] | None = None,
+        options: DlqDeleteOptions | None = None,
+    ) -> DlqResult:
+        """Delete dead letters for good: up to 100 named by seq, or with
+        ``all`` the oldest dead, a batch of up to ``limit`` (``more`` says
+        others remain). With ``dry_run``, ``applied`` is how many it would
+        delete, and nothing is deleted.
+
+        Raises:
+            NotFoundError: No such queue.
+        """
+        opts = options or DlqDeleteOptions()
+        response = await self._client._send_and_check(
+            OpCode.QUEUE_DLQ_DELETE,
+            self._client.get_namespace(opts.namespace),
+            queue.encode("utf-8"),
+            encode_queue_dlq_body(messages, opts.all, opts.limit, opts.dry_run),
+        )
+        return decode_queue_dlq_answer("queue.dlq_delete", response.data)
 
     async def peek(
         self,
@@ -292,46 +330,3 @@ class QueueOperations:
             encode_peek_body(limit),
         )
         return decode_peek_answer(response.data)
-
-
-def parse_dlq_page(data: bytes) -> DlqPage:
-    """A dead letter page: [count:u32]([seq:u64][size:u32][len:u32][payload]
-    [enqueued_at_ms:i64][deliveries:u32][priority:u8][moved_at_ms:i64])*
-    [total:u64][has_more:u8][last_seq:u64]."""
-    pos = 0
-
-    def take(n: int) -> bytes:
-        nonlocal pos
-        if pos + n > len(data):
-            raise IncompleteResponseError("queue.dlq_list answer is cut short")
-        b = data[pos : pos + n]
-        pos += n
-        return b
-
-    (count,) = struct.unpack("<I", take(4))
-    if count > MAX_DLQ_PAGE:
-        raise IncompleteResponseError(f"queue.dlq_list answer lists {count} dead letters")
-    messages = []
-    for _ in range(count):
-        seq, size, n = struct.unpack("<QII", take(16))
-        payload = take(n)
-        enqueued_at_ms, deliveries, priority, moved_at_ms = struct.unpack("<qIBq", take(21))
-        messages.append(
-            DeadLetter(
-                seq=seq,
-                size=size,
-                payload=payload,
-                enqueued_at_ms=enqueued_at_ms,
-                deliveries=deliveries,
-                priority=priority,
-                moved_at_ms=moved_at_ms,
-            )
-        )
-    total, has_more, last_seq = struct.unpack("<QBQ", take(17))
-    if has_more > 1:
-        raise IncompleteResponseError(f"queue.dlq_list answer has a has_more of {has_more}")
-    if pos != len(data):
-        raise IncompleteResponseError(
-            f"queue.dlq_list answer has {len(data) - pos} bytes left over"
-        )
-    return DlqPage(messages=messages, total=total, has_more=bool(has_more), last_seq=last_seq)

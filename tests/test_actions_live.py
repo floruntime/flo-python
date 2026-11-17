@@ -163,7 +163,7 @@ async def test_live_an_empty_dlq_page(client: FloClient) -> None:
     ns = fresh_namespace()
     await client.queue.enqueue("jobs", b"x", EnqueueOptions(namespace=ns))
     page = await client.queue.dlq_list("jobs", DlqListOptions(namespace=ns, limit=10))
-    assert (page.messages, page.total, page.has_more) == ([], 0, False)
+    assert (page.messages, page.cursor) == ([], None)
 
 
 async def test_live_stream_groups_and_their_members(client: FloClient) -> None:

@@ -56,3 +56,26 @@ def test_every_table_op_has_its_code_here(ops: dict[str, Any]) -> None:
 
     missing = {e["name"]: hex(e["code"]) for e in ops["ops"] if e["code"] not in set(OpCode)}
     assert missing == {}
+
+
+def _why_values(ops: dict[str, Any], op: str) -> dict[int, str]:
+    entry = next(e for e in ops["ops"] if e["name"] == op)
+    refused = next(f for f in entry["response"] if f["name"] == "refused")
+    why = next(f for f in refused["type"]["of"]["fields"] if f["name"] == "why")
+    return {v["value"]: v["name"].upper() for v in why["type"]["values"]}
+
+
+def test_refusal_reasons_match_the_server(ops: dict[str, Any]) -> None:
+    # Queue reports and group operator commands answer the same why.
+    from flo.types import QueueRefusalReason
+
+    for op in ("queue.complete", "queue.dlq_requeue", "stream.group.steal"):
+        assert _sdk(QueueRefusalReason) == _why_values(ops, op)
+
+
+def test_every_table_op_is_sent_as_one(ops: dict[str, Any]) -> None:
+    from flo.kv_body import is_table_op
+
+    # No client API sends the namespace ops.
+    sent = [e for e in ops["ops"] if not e["name"].startswith("namespace.")]
+    assert [e["name"] for e in sent if not is_table_op(e["code"])] == []

@@ -53,6 +53,8 @@ async def test_max_age_and_before(sent: tuple[FloClient, list[Call]]) -> None:
     assert start is not None and start.data == StreamID(7, 2).to_bytes()
 
 
-def test_retention_tags_are_gone() -> None:
-    for name in ("RETENTION_COUNT", "RETENTION_AGE", "RETENTION_BYTES", "MAX_BYTES"):
+def test_byte_bounds_are_gone() -> None:
+    # The server enforces retention by age and count only. Those two tags are
+    # a stream create's and alter's; a trim sends its own bounds.
+    for name in ("RETENTION_BYTES", "MAX_BYTES"):
         assert not hasattr(OptionTag, name)
