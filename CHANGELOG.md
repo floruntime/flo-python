@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The server's op table hash is now `0xac07f1f7338c66bd` (`TABLE_HASH`).
+
 ### Added
 
 - `stream.group_steal(stream, group, consumer, records, min_idle_ms)`: take
