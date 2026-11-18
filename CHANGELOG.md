@@ -5,7 +5,9 @@ All notable changes to the Flo Python SDK will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.7] - 2026-11-18
+
+Works with flo v0.1.0-dev.19.
 
 The server's op table hash is now `0xac07f1f7338c66bd` (`TABLE_HASH`).
 
