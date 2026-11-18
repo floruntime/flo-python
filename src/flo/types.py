@@ -19,7 +19,7 @@ VERSION: int = 0x03
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0xAC07F1F7338C66BD
+TABLE_HASH: int = 0xE394286115044C9D
 # Response header flag: a shard that can't apply its next entry (halted at
 # it, or blocked reading it from disk) answered a read from its state just
 # before that entry. The read succeeded.
