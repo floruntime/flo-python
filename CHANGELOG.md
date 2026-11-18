@@ -36,13 +36,15 @@ The server's op table hash is now `0xac07f1f7338c66bd` (`TABLE_HASH`).
 
 ### Changed
 
-- A worker's complete, fail, ack or nack refused without being run
-  (overloaded or unavailable, after the client's own retries) is sent again
-  with a capped backoff until the server takes it or answers otherwise, and
-  logged; it used to be dropped. A complete or fail that ends a run a
-  workflow step called is refused overloaded while the server's writes to the
-  workflow's shard are queued full, and the run's lease doesn't run out
-  meanwhile. A stopping worker gives up after a couple of seconds
+- A worker's complete, fail, ack or nack refused overloaded without being
+  run (after the client's own retries) is sent again with a capped backoff
+  until the server takes it or answers otherwise, and logged; it used to be
+  dropped. A complete or fail that ends a run a workflow step called is
+  refused so while the server's writes to the workflow's shard are queued
+  full, and the run's lease doesn't run out meanwhile; an ack's or nack's
+  lease keeps running, so a long overload can deliver the records again. A
+  stopping worker gives up after a couple of seconds, a backoff wait
+  included
 - An alter of a stream an append made succeeds; it used to be not found.
   After an alter a create must name the stream's settings as altered, or it
   raises `ConflictError`; a create whose name hashes as another stream's does

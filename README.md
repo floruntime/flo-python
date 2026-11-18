@@ -857,13 +857,14 @@ async def run_stream_worker():
 asyncio.run(run_stream_worker())
 ```
 
-A worker's complete, fail, ack or nack refused without being run (overloaded
-or unavailable, once the client's own retries are spent) is sent again with a
-capped backoff until the server takes it or answers otherwise, and logged
-each time. A complete or fail that ends a run a workflow step called is
-refused overloaded while the server's queue of writes to the workflow's shard
-is full; meanwhile the run's lease doesn't run out, and `action.status` says
-why in `held`. A stopping worker gives up on it after a couple of seconds.
+A worker's complete, fail, ack or nack refused overloaded without being run
+(once the client's own retries are spent) is sent again with a capped backoff
+until the server takes it or answers otherwise, and logged each time. A
+complete or fail that ends a run a workflow step called is refused so while
+the server's queue of writes to the workflow's shard is full; meanwhile the
+run's lease doesn't run out, and `action.status` says why in `held`. An ack's
+or nack's lease keeps running, so a long overload can deliver the records
+again. A stopping worker gives up on it after a couple of seconds.
 
 A stream worker acks each record its handler returns from and nacks each one
 its handler raises on, naming the read's delivery. A record whose handler runs
