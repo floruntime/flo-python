@@ -6,7 +6,7 @@ import struct
 import pytest
 
 from flo import StreamAlterOptions, StreamCreateOptions
-from flo.exceptions import ValidationError
+from flo.exceptions import IncompleteResponseError, ValidationError
 from flo.types import OpCode, OptionTag
 from flo.wire import OptionsIterator, parse_stream_info_response
 
@@ -52,3 +52,22 @@ def test_info_answers_the_streams_retention() -> None:
     data = struct.pack("<QQQQQQIQQQ", 1, 2, 3, 4, 5, 6, 1, 3600, 100, 0)
     info = parse_stream_info_response(data)
     assert (info.partition_count, info.retention_age_s, info.retention_count) == (1, 3600, 100)
+
+
+@pytest.mark.parametrize("size", [52, 68, 75, 77])
+def test_info_of_any_length_but_76_is_refused(size: int) -> None:
+    with pytest.raises(IncompleteResponseError):
+        parse_stream_info_response(bytes(size))
+
+
+@pytest.mark.parametrize("field", ["retention_age_s", "retention_count"])
+async def test_a_negative_retention_is_refused_before_sending(
+    sent: tuple[FloClient, list[Call]],  # noqa: F811
+    field: str,
+) -> None:
+    client, calls = sent
+    with pytest.raises(ValidationError):
+        await client.stream.create("s", StreamCreateOptions(**{field: -1}))
+    with pytest.raises(ValidationError):
+        await client.stream.alter("s", StreamAlterOptions(**{field: -1}))
+    assert calls == []

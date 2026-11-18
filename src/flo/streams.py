@@ -217,6 +217,7 @@ class StreamOperations:
                 stream's name hashes as this one's (choose another name).
         """
         opts = options or StreamCreateOptions()
+        _check_retention(opts.retention_age_s, opts.retention_count)
         builder = OptionsBuilder()
         if opts.retention_age_s:
             builder.add_u64(OptionTag.RETENTION_AGE, opts.retention_age_s)
@@ -245,6 +246,7 @@ class StreamOperations:
             NotFoundError: No such stream.
         """
         opts = options or StreamAlterOptions()
+        _check_retention(opts.retention_age_s, opts.retention_count)
         builder = OptionsBuilder()
         if opts.retention_age_s:
             builder.add_u64(OptionTag.RETENTION_AGE, opts.retention_age_s)
@@ -752,3 +754,9 @@ class StreamOperations:
             encode_group_dlq_body(group, records, opts.all, opts.limit, opts.dry_run),
         )
         return decode_group_dlq_answer("stream.group.dlq_delete", response.data)
+
+
+def _check_retention(age_s: int, count: int) -> None:
+    for name, v in (("retention_age_s", age_s), ("retention_count", count)):
+        if not 0 <= v <= 0xFFFFFFFFFFFFFFFF:
+            raise ValidationError(f"{name} must be a u64, got {v}")

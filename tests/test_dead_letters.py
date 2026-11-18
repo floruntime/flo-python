@@ -188,23 +188,18 @@ def test_a_steal_body_names_the_records_and_their_deliveries() -> None:
         + b"\x01"
         + struct.pack("<QQI", 1000, 2, 3)
     )
-    leased = encode_group_steal_body("g", "c", 1, 5000, [])
-    assert (
-        leased
-        == _str16("g")
-        + _str16("c")
-        + struct.pack("<Q", 1)
-        + b"\x01"
-        + struct.pack("<Q", 5000)
-        + b"\x00"
-    )
+    leased = encode_group_steal_body("g", "c", 1, 5000, [(rid, 1)])
+    assert leased == _str16("g") + _str16("c") + struct.pack("<Q", 1) + b"\x01" + struct.pack(
+        "<Q", 5000
+    ) + b"\x01" + struct.pack("<QQI", 1000, 2, 1)
     for consumer, idle, lease in (("", 1, None), ("c", 0, None), ("c", 43_200_001, None)):
         with pytest.raises(ValidationError):
-            encode_group_steal_body("g", consumer, idle, lease, [])
+            encode_group_steal_body("g", consumer, idle, lease, [(rid, 1)])
     with pytest.raises(ValidationError):
-        encode_group_steal_body("g", "c", 1, 4999, [])
-    with pytest.raises(ValidationError):
-        encode_group_steal_body("g", "c", 1, None, [(rid, 1)] * 101)
+        encode_group_steal_body("g", "c", 1, 4999, [(rid, 1)])
+    for records in ([], [(rid, 1)] * 101):
+        with pytest.raises(ValidationError):
+            encode_group_steal_body("g", "c", 1, None, records)
 
 
 def test_a_steal_answer_is_a_delivery_with_its_refusals() -> None:

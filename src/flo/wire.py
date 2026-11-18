@@ -507,8 +507,8 @@ def parse_stream_info_response(data: bytes) -> StreamInfo:
             [count:u64][bytes:u64][partition_count:u32][retention_age_s:u64]
             [retention_count:u64][retention_bytes:u64]
     """
-    if len(data) < 52:
-        raise IncompleteResponseError("Stream info response too short")
+    if len(data) != 76:
+        raise IncompleteResponseError(f"stream info answer of {len(data)} bytes, not 76")
 
     first_ts = struct.unpack("<Q", data[0:8])[0]
     first_seq = struct.unpack("<Q", data[8:16])[0]
@@ -517,9 +517,7 @@ def parse_stream_info_response(data: bytes) -> StreamInfo:
     count = struct.unpack("<Q", data[32:40])[0]
     bytes_size = struct.unpack("<Q", data[40:48])[0]
     partition_count = struct.unpack("<I", data[48:52])[0]
-    retention_age_s, retention_count = 0, 0
-    if len(data) >= 68:
-        retention_age_s, retention_count = struct.unpack("<QQ", data[52:68])
+    retention_age_s, retention_count = struct.unpack("<QQ", data[52:68])
 
     return StreamInfo(
         first_id=StreamID(timestamp_ms=first_ts, sequence=first_seq),

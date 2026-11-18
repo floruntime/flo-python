@@ -597,8 +597,8 @@ def encode_group_steal_body(
         or not MIN_LEASE_MS <= lease_ms <= MAX_LEASE_MS
     ):
         raise ValidationError(f"lease_ms must be {MIN_LEASE_MS}..{MAX_LEASE_MS}, got {lease_ms!r}")
-    if len(records) > MAX_DEAD_BATCH:
-        raise ValidationError(f"a steal names at most {MAX_DEAD_BATCH} records, got {len(records)}")
+    if not 1 <= len(records) <= MAX_DEAD_BATCH:
+        raise ValidationError(f"a steal names 1..{MAX_DEAD_BATCH} records, got {len(records)}")
     return (
         _bytes16("group", group.encode("utf-8"), _MAX_KEY)
         + _bytes16("consumer", consumer.encode("utf-8"), _MAX_KEY)
