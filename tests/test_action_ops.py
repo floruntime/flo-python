@@ -33,7 +33,6 @@ from flo.kv_body import (
     encode_touch_body,
     is_table_op,
 )
-from flo.queue import parse_dlq_page
 from flo.types import HEADER_SIZE, GroupMemberState, OpCode, Ran, Reason, StatusCode
 from flo.wire import REQUEST_HEADER_FORMAT
 
@@ -220,62 +219,6 @@ def test_a_peek_sends_its_limit_and_decodes_the_messages() -> None:
         5000,
         b"hello",
     )
-
-
-def _dead(seq: int, payload: bytes) -> bytes:
-    return (
-        struct.pack("<QII", seq, len(payload) + 10, len(payload))
-        + payload
-        + struct.pack("<qIBq", 100, 3, 2, 200)
-    )
-
-
-def test_a_dlq_page_decodes_its_letters_and_trailer() -> None:
-    data = struct.pack("<I", 2) + _dead(4, b"a") + _dead(6, b"bc") + struct.pack("<QBQ", 7, 1, 6)
-    page = parse_dlq_page(data)
-    assert [(d.seq, d.size, d.payload, d.deliveries, d.priority) for d in page.messages] == [
-        (4, 11, b"a", 3, 2),
-        (6, 12, b"bc", 3, 2),
-    ]
-    assert (page.total, page.has_more, page.last_seq) == (7, True, 6)
-    for bad in (data[:-1], data + b"\x00", data[:-9] + b"\x02" + data[-8:]):
-        with pytest.raises(IncompleteResponseError):
-            parse_dlq_page(bad)
-
-
-async def test_dlq_list_sends_its_page_in_the_value() -> None:
-    seen: list[bytes] = []
-
-    def reply(_n: int, _op: int, rid: int) -> bytes:
-        return _frame(rid, StatusCode.OK, struct.pack("<I", 0) + struct.pack("<QBQ", 0, 0, 0))
-
-    class Recording(_Scripted):
-        async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            self.writers.append(writer)
-            try:
-                while True:
-                    header = await reader.readexactly(HEADER_SIZE)
-                    _, n, rid, _, _op, *_ = struct.unpack(REQUEST_HEADER_FORMAT, header)
-                    seen.append(await reader.readexactly(n))
-                    writer.write(reply(0, 0, rid))
-            except (asyncio.IncompleteReadError, ConnectionError):
-                writer.close()
-
-    from flo import DlqListOptions
-
-    fake = Recording(reply)
-    server, addr = await fake.serve()
-    client = await FloClient(addr, timeout_ms=1000).connect()
-    try:
-        await client.queue.dlq_list("q", DlqListOptions(namespace="ns", limit=10, after=6))
-        await client.queue.dlq_list("q", DlqListOptions(namespace="ns"))
-    finally:
-        await client.close()
-        await fake.shut(server)
-    # [ns][key][value_len:u32][value][options_len:u16], no options.
-    prefix = _str16("ns") + _str16("q")
-    assert seen[0] == prefix + struct.pack("<IIQH", 12, 10, 6, 0)
-    assert seen[1] == prefix + struct.pack("<IIH", 4, 100, 0)
 
 
 # ── Refusals ────────────────────────────────────────────────────────────────

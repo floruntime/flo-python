@@ -11,7 +11,10 @@ from typing import Any
 import pytest
 
 from flo import FloClient, NonRetryableError
-from flo.types import HEADER_SIZE, OpCode, Ran, StatusCode, TaskAssignment
+from flo import worker as worker_mod
+from flo.exceptions import ServerError
+from flo.retry import _Backoff, _is_overloaded_unrun
+from flo.types import HEADER_SIZE, OpCode, Ran, Reason, StatusCode, TaskAssignment
 from flo.wire import REQUEST_HEADER_FORMAT
 from flo.worker import ActionContext, StreamContext
 
@@ -89,7 +92,9 @@ def fail_tail(error: str, retry: bool, abandoned: bool = False, t: TaskAssignmen
 class FakeActionServer:
     """Hands out one task, then answers every await empty. The nth result
     (complete or fail, from 0) gets reply(n): "ok", "drop" (close the
-    connection unanswered), "hang" (never answer) or "refuse"."""
+    connection unanswered), "hang" (never answer), "refuse", "overloaded"
+    (refused, not run, as while the end of a run a workflow called waits for
+    room on the caller's shard), or "unavailable" (refused, not run)."""
 
     def __init__(self, reply: Callable[[int], str] = lambda n: "ok") -> None:
         self.reply = reply
@@ -127,6 +132,12 @@ class FakeActionServer:
                         continue
                     if action == "refuse":
                         writer.write(_refusal(request_id, StatusCode.BAD_REQUEST, Ran.YES))
+                        continue
+                    if action == "overloaded":
+                        writer.write(_refusal(request_id, StatusCode.OVERLOADED, Ran.NO))
+                        continue
+                    if action == "unavailable":
+                        writer.write(_refusal(request_id, StatusCode.UNAVAILABLE, Ran.NO))
                         continue
                 writer.write(_frame(request_id, StatusCode.OK, b""))
         except (asyncio.IncompleteReadError, ConnectionError):
@@ -203,6 +214,88 @@ async def test_a_refused_complete_is_neither_resent_nor_failed(
         await _run_action(fake, _done, lambda: len(fake.results) >= 1)
     assert fake.ops() == [OpCode.ACTION_COMPLETE]
     assert not any("Action completed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("handler", ["complete", "fail"])
+async def test_a_result_refused_overloaded_is_resent_until_taken(
+    handler: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # More refusals than the client's own retries (4 tries) and the three
+    # sends a lost result gets: the worker keeps resending the same report.
+    fake = FakeActionServer(lambda n: "overloaded" if n < 6 else "ok")
+
+    async def fails(ctx: ActionContext) -> bytes:
+        raise NonRetryableError("bad input")
+
+    with caplog.at_level(logging.INFO, logger="flo.worker"):
+        await _run_action(
+            fake, _done if handler == "complete" else fails, lambda: len(fake.results) >= 7
+        )
+    op = OpCode.ACTION_COMPLETE if handler == "complete" else OpCode.ACTION_FAIL
+    assert fake.ops() == [op] * 7
+    frames = {_masked(frame) for _, frame in fake.results}
+    assert len(frames) == 1
+    assert any("refused, not run" in r.getMessage() for r in caplog.records)
+    assert not any("Dropped" in r.getMessage() for r in caplog.records)
+    if handler == "complete":
+        assert any("Action completed" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_result_refused_unavailable_is_not_resent_by_the_worker(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The client's own retries send it four times; the worker adds none: an
+    # unavailable shard may be halted, and stay so until it is repaired.
+    fake = FakeActionServer(lambda n: "unavailable")
+    with caplog.at_level(logging.INFO, logger="flo.worker"):
+        await _run_action(fake, _done, lambda: len(fake.results) >= 4, settle=0.5)
+    assert fake.ops() == [OpCode.ACTION_COMPLETE] * 4
+    assert any("not resending" in r.getMessage() for r in caplog.records)
+    assert not any("refused, not run" in r.getMessage() for r in caplog.records)
+
+
+def test_only_overloaded_unrun_results_are_resent() -> None:
+    def refusal(status: StatusCode, ran: Ran, reason: Reason = Reason.UNCLASSIFIED) -> ServerError:
+        e = ServerError("refused", status)
+        e.ran, e.reason = ran, reason
+        return e
+
+    assert _is_overloaded_unrun(refusal(StatusCode.OVERLOADED, Ran.NO))
+    assert not _is_overloaded_unrun(refusal(StatusCode.OVERLOADED, Ran.UNKNOWN))
+    assert not _is_overloaded_unrun(refusal(StatusCode.UNAVAILABLE, Ran.NO))
+    assert not _is_overloaded_unrun(refusal(StatusCode.UNAVAILABLE, Ran.NO, Reason.SHARD_HALTED))
+    assert not _is_overloaded_unrun(refusal(StatusCode.OVERLOADED, Ran.NO, Reason.GROUP_HELD_FULL))
+
+
+async def test_stop_cuts_a_resend_backoff_short(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A backoff far past the stop allowance: stop must end the wait, then
+    # the result is dropped within the allowance.
+    monkeypatch.setattr(worker_mod, "_worker_backoff", lambda: _Backoff(30.0, 30.0))
+    monkeypatch.setattr(worker_mod, "_STOP_RECONNECT_S", 0.3)
+    sends = 0
+
+    async def send() -> None:
+        nonlocal sends
+        sends += 1
+        e = ServerError("overloaded", StatusCode.OVERLOADED)
+        e.ran = Ran.NO
+        raise e
+
+    async def reconnect(seen: int) -> None:
+        raise AssertionError("an overloaded refusal doesn't reconnect")
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    task = asyncio.create_task(
+        worker_mod._send_result("complete", send, lambda: 0, reconnect, stop)
+    )
+    await _until(lambda: sends >= 1)
+    await asyncio.sleep(0.1)
+    stopped = loop.time()
+    stop.set()
+    assert await asyncio.wait_for(task, timeout=5) is False
+    assert loop.time() - stopped < 1.0
+    assert sends >= 2
 
 
 async def test_a_result_is_sent_at_most_three_times(caplog: pytest.LogCaptureFixture) -> None:

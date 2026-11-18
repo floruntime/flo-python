@@ -36,6 +36,7 @@ from .client import FloClient
 from .exceptions import NonRetryableError, NotFoundError, ServerError, is_connection_error
 from .retry import (
     _halted_backoff,
+    _is_overloaded_unrun,
     _sleep_unless_stopped,
     _worker_backoff,
     is_group_held_full,
@@ -571,10 +572,13 @@ async def _send_result(
     """Send a result, resending the identical request after a reconnect when
     the connection drops or the request times out.
 
-    A refusal is not resent: the server read the request and said no. Once
-    the worker is leaving (stopping or draining, so neither waits on a server
-    that is gone), reconnects get _STOP_RECONNECT_S in all. Nothing here
-    raises; a result that can't be sent is logged and dropped.
+    A refusal overloaded the server says it didn't run (while the outbox to
+    a calling workflow's shard is full, say) is resent with a capped backoff
+    until it is taken or answered otherwise; any other refusal is not
+    resent: the server read the request and said no. Once the worker is
+    leaving (stopping or draining, so neither waits on a server that is gone),
+    reconnects and resends get _STOP_RECONNECT_S in all. Nothing here raises;
+    a result that can't be sent is logged and dropped.
     """
     loop = asyncio.get_running_loop()
     stop_deadline: float | None = None
@@ -602,12 +606,38 @@ async def _send_result(
         task.result()
         return True
 
-    for attempt in range(1, _RESULT_SENDS + 1):
+    refused = _worker_backoff()
+    attempt = 0
+    while attempt < _RESULT_SENDS:
         seen = generation()
         try:
             await send()
             return True
         except Exception as e:
+            if _is_overloaded_unrun(e):
+                # Not run, so the same result goes again until it's taken or
+                # answered otherwise. Not counted as a lost send. A complete
+                # or fail that ends a run a workflow step called is refused
+                # so while its end waits for room, and that run's lease
+                # doesn't run out meanwhile. An ack's or nack's lease keeps
+                # running, so a long overload can hand the records out again.
+                if stop.is_set() and stop_deadline is None:
+                    stop_deadline = loop.time() + _STOP_RECONNECT_S
+                if stop_deadline is not None and loop.time() >= stop_deadline:
+                    logger.error(f"Dropped {what}: refused while the worker stops: {e}")
+                    return False
+                d = refused.next()
+                if stop_deadline is not None:
+                    d = min(d, max(stop_deadline - loop.time(), 0.0))
+                logger.warning(f"{what} refused, not run: {e}; resending in {d:.3f}s")
+                if stop_deadline is not None:
+                    await asyncio.sleep(d)
+                else:
+                    # A stop cuts the wait short: the result goes once more
+                    # at once, and later waits fit in the stop allowance.
+                    await _sleep_unless_stopped(stop, d)
+                continue
+            attempt += 1
             if not (is_connection_error(e) or isinstance(e, asyncio.TimeoutError)):
                 logger.error(f"{what} was refused, not resending: {e}")
                 return False

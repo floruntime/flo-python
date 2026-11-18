@@ -96,6 +96,19 @@ def is_refused_unrun(exc: BaseException) -> bool:
     )
 
 
+def _is_overloaded_unrun(exc: BaseException) -> bool:
+    """Whether exc is a worker result refused overloaded and not run, so the
+    same result can go again. Not unavailable: a shard that halted while
+    proposing one answers it that way and stays so until an operator repairs
+    it. Nor a full group's (see is_group_held_full): that is a read's refusal."""
+    return (
+        isinstance(exc, ServerError)
+        and exc.status_code == StatusCode.OVERLOADED
+        and exc.ran == Ran.NO
+        and exc.reason != Reason.GROUP_HELD_FULL
+    )
+
+
 def is_group_held_full(exc: BaseException) -> bool:
     """Whether exc is a group read that took nothing new because the group
     (records out and dead together) or its shard's queues and groups are at

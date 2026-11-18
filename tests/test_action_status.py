@@ -9,7 +9,7 @@ from flo.kv_body import decode_action_invoke_answer, decode_action_status_answer
 from flo.types import RunStatus
 
 # A completed run: started, completed, attempt 2, output "ok", no error, no
-# worker, no outcome (success).
+# worker, no outcome (success), nothing held.
 COMPLETED = (
     bytes([2])
     + struct.pack("<q", 100)
@@ -21,6 +21,7 @@ COMPLETED = (
     + b"\x01"
     + struct.pack("<H", 2)
     + b"ok"
+    + b"\x00"
     + b"\x00"
     + b"\x00"
     + b"\x00"
@@ -47,14 +48,21 @@ def test_a_completed_runs_status_carries_its_times_attempt_and_output() -> None:
 
 def test_a_status_carries_the_outcome_a_worker_named() -> None:
     s = decode_action_status_answer(
-        "run-1", COMPLETED[:-1] + b"\x01" + struct.pack("<H", 8) + b"approved"
+        "run-1", COMPLETED[:-2] + b"\x01" + struct.pack("<H", 8) + b"approved" + b"\x00"
     )
     assert s.outcome == "approved"
 
 
+def test_a_status_says_why_a_past_due_lease_is_held() -> None:
+    held = b"waiting for room on the caller's shard"
+    s = decode_action_status_answer("run-1", COMPLETED[:-1] + b"\x01" + bytes([len(held)]) + held)
+    assert s.held == held.decode()
+    assert decode_action_status_answer("run-1", COMPLETED).held is None
+
+
 def test_a_status_names_the_worker_that_holds_the_run() -> None:
     s = decode_action_status_answer(
-        "run-1", COMPLETED[:-2] + b"\x01" + struct.pack("<H", 4) + b"w-17" + b"\x00"
+        "run-1", COMPLETED[:-3] + b"\x01" + struct.pack("<H", 4) + b"w-17" + b"\x00\x00"
     )
     assert s.worker_id == "w-17"
 
@@ -69,6 +77,7 @@ def test_a_failed_runs_status_carries_its_error_and_no_output() -> None:
         + b"\x01"
         + struct.pack("<H", 4)
         + b"boom"
+        + b"\x00"
         + b"\x00"
         + b"\x00"
     )

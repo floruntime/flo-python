@@ -22,11 +22,22 @@ from .types import (
     ActionListEntry,
     ActionRunStatus,
     Condition,
+    DeadLetter,
     DequeueResult,
+    DlqCursor,
+    DlqPage,
+    DlqResult,
     ExistsResult,
     GetOptions,
     GetResult,
+    GroupDeadLetter,
+    GroupDlqCursor,
+    GroupDlqPage,
+    GroupDlqResult,
     GroupMemberState,
+    GroupRecord,
+    GroupRefusal,
+    GroupStealResult,
     Message,
     MGetEntry,
     OpCode,
@@ -44,6 +55,7 @@ from .types import (
     StreamGroupListResult,
     StreamGroupMember,
     StreamGroupMembersResult,
+    StreamID,
     TaskAssignment,
     VersionEntry,
     WaitFor,
@@ -85,6 +97,12 @@ MAX_CONSUMER = 4082
 MIN_LEASE_MS = 5_000
 MAX_LEASE_MS = 43_200_000
 MAX_QUEUE_ERROR = 1024
+# The most records or messages a steal, or a dead letter requeue or delete,
+# names, and the most dead letters one page lists.
+MAX_DEAD_BATCH = 100
+MAX_DLQ_PAGE = 100
+# A steal's idle time: up to the longest lease.
+MAX_MIN_IDLE_MS = 43_200_000
 # The longest TTL whose nanoseconds fit a u64.
 MAX_TTL_MS = 18_446_744_073_709
 _U64_MAX = (1 << 64) - 1
@@ -118,11 +136,18 @@ _TABLE_OPS = frozenset(
         OpCode.WORKER_INFO,
         OpCode.STREAM_GROUP_LIST,
         OpCode.STREAM_GROUP_MEMBERS,
+        OpCode.STREAM_GROUP_STEAL,
+        OpCode.STREAM_GROUP_DLQ_LIST,
+        OpCode.STREAM_GROUP_DLQ_REQUEUE,
+        OpCode.STREAM_GROUP_DLQ_DELETE,
         OpCode.QUEUE_PEEK,
         OpCode.QUEUE_DEQUEUE,
         OpCode.QUEUE_COMPLETE,
         OpCode.QUEUE_FAIL,
         OpCode.QUEUE_TOUCH,
+        OpCode.QUEUE_DLQ_LIST,
+        OpCode.QUEUE_DLQ_REQUEUE,
+        OpCode.QUEUE_DLQ_DELETE,
         OpCode.TS_READ,
         OpCode.TS_INFO,
         OpCode.PROCESSING_REMOVE,
@@ -505,6 +530,124 @@ def encode_peek_body(limit: int) -> bytes:
     return _limit("peek limit", limit, MAX_PEEK)
 
 
+def _dead_pick(names: str, count: int, all_: bool, limit: int) -> None:
+    """A dead letter requeue or delete names some, or takes all: not both,
+    nor neither."""
+    if all_ == (count > 0):
+        raise ValidationError(
+            f"name the dead letters ({names}) or give all, not both"
+            if all_
+            else f"name the dead letters ({names}), or give all"
+        )
+    if count > MAX_DEAD_BATCH:
+        raise ValidationError(f"a batch names at most {MAX_DEAD_BATCH} {names}, got {count}")
+    _limit("limit", limit, MAX_DEAD_BATCH)
+
+
+def encode_queue_dlq_list_body(limit: int, after: DlqCursor | None) -> bytes:
+    """queue.dlq_list's request: limit, after?."""
+    body = _limit("dlq list limit", limit, MAX_DLQ_PAGE)
+    if after is None:
+        return body + b"\x00"
+    return body + b"\x01" + _u64("cursor", after.dead_ns) + _u64("cursor", after.seq)
+
+
+def encode_queue_dlq_body(
+    seqs: Sequence[int] | None, all_: bool, limit: int, dry_run: bool | None = None
+) -> bytes:
+    """queue.dlq_requeue's request: messages?, all, limit; queue.dlq_delete's
+    adds dry_run (``dry_run`` not None)."""
+    picked = list(seqs or [])
+    _dead_pick("messages", len(picked), all_, limit)
+    body = (
+        (b"\x01" + bytes([len(picked)]) + b"".join(_u64("seq", q) for q in picked))
+        if picked
+        else b"\x00"
+    )
+    body += b"\x01" + _flag(all_) + _limit("limit", limit, MAX_DEAD_BATCH)
+    if dry_run is not None:
+        body += b"\x01" + _flag(dry_run)
+    return body
+
+
+def _record_id(r: StreamID) -> bytes:
+    return _u64("record ms", r.timestamp_ms) + _u64("record seq", r.sequence)
+
+
+def encode_group_steal_body(
+    group: str,
+    consumer: str,
+    min_idle_ms: int,
+    lease_ms: int | None,
+    records: Sequence[tuple[StreamID, int]],
+) -> bytes:
+    """stream.group.steal's request: group, consumer, min_idle_ms, lease_ms?,
+    records (each id and the deliveries its holder has)."""
+    if not consumer:
+        raise ValidationError("a steal names the consumer that takes the records")
+    if (
+        not isinstance(min_idle_ms, int)
+        or isinstance(min_idle_ms, bool)
+        or not 1 <= min_idle_ms <= MAX_MIN_IDLE_MS
+    ):
+        raise ValidationError(f"min_idle_ms must be 1..{MAX_MIN_IDLE_MS}, got {min_idle_ms!r}")
+    if lease_ms is not None and (
+        not isinstance(lease_ms, int)
+        or isinstance(lease_ms, bool)
+        or not MIN_LEASE_MS <= lease_ms <= MAX_LEASE_MS
+    ):
+        raise ValidationError(f"lease_ms must be {MIN_LEASE_MS}..{MAX_LEASE_MS}, got {lease_ms!r}")
+    if not 1 <= len(records) <= MAX_DEAD_BATCH:
+        raise ValidationError(f"a steal names 1..{MAX_DEAD_BATCH} records, got {len(records)}")
+    return (
+        _bytes16("group", group.encode("utf-8"), _MAX_KEY)
+        + _bytes16("consumer", consumer.encode("utf-8"), _MAX_KEY)
+        + _u64("min_idle_ms", min_idle_ms)
+        + _opt_u64("lease_ms", lease_ms)
+        + bytes([len(records)])
+        + b"".join(_record_id(rid) + _u32("deliveries", d) for rid, d in records)
+    )
+
+
+def encode_group_dlq_list_body(group: str, limit: int, after: GroupDlqCursor | None) -> bytes:
+    """stream.group.dlq_list's request: group, limit, after?."""
+    body = _bytes16("group", group.encode("utf-8"), _MAX_KEY) + _limit(
+        "dlq list limit", limit, MAX_DLQ_PAGE
+    )
+    if after is None:
+        return body + b"\x00"
+    return (
+        body
+        + b"\x01"
+        + _u64("cursor", after.dead_ns)
+        + _u64("cursor", after.ms)
+        + _u64("cursor", after.seq)
+    )
+
+
+def encode_group_dlq_body(
+    group: str,
+    records: Sequence[StreamID] | None,
+    all_: bool,
+    limit: int,
+    dry_run: bool | None = None,
+) -> bytes:
+    """stream.group.dlq_requeue's request: group, records?, all, limit;
+    stream.group.dlq_delete's adds dry_run (``dry_run`` not None)."""
+    picked = list(records or [])
+    _dead_pick("records", len(picked), all_, limit)
+    body = _bytes16("group", group.encode("utf-8"), _MAX_KEY)
+    body += (
+        (b"\x01" + bytes([len(picked)]) + b"".join(_record_id(r) for r in picked))
+        if picked
+        else b"\x00"
+    )
+    body += b"\x01" + _flag(all_) + _limit("limit", limit, MAX_DEAD_BATCH)
+    if dry_run is not None:
+        body += b"\x01" + _flag(dry_run)
+    return body
+
+
 # ── Answers ───────────────────────────────────────────────────────────────
 
 
@@ -713,7 +856,8 @@ def _text(a: _Answer, op: str, raw: bytes) -> str:
 
 def decode_action_status_answer(run_id: str, data: bytes) -> ActionRunStatus:
     """action.status's answer: status, created_at, started_at?, completed_at?,
-    attempt, output?, error_message?, worker_id?, outcome?, with u16 lengths."""
+    attempt, output?, error_message?, worker_id?, outcome? (u16 lengths),
+    held? (a u8 length)."""
     a = _Answer("action.status", data)
     code = a.u8()
     try:
@@ -730,6 +874,7 @@ def decode_action_status_answer(run_id: str, data: bytes) -> ActionRunStatus:
     error = a.bytes16() if a.present() else None
     worker_id = a.bytes16() if a.present() else None
     outcome = a.bytes16() if a.present() else None
+    held = a.bytes8() if a.present() else None
     a.done()
     return ActionRunStatus(
         run_id=run_id,
@@ -742,6 +887,7 @@ def decode_action_status_answer(run_id: str, data: bytes) -> ActionRunStatus:
         error_message=error.decode("utf-8", errors="replace") if error is not None else None,
         worker_id=worker_id.decode("utf-8", errors="replace") if worker_id is not None else None,
         outcome=outcome.decode("utf-8", errors="replace") if outcome is not None else None,
+        held=held.decode("utf-8", errors="replace") if held is not None else None,
     )
 
 
@@ -1064,3 +1210,120 @@ def decode_queue_touch_answer(data: bytes) -> QueueTouchResult:
     refused = _refusals(a, op)
     a.done()
     return QueueTouchResult(expires_at_ms=expires_at_ms, applied=applied, refused=refused)
+
+
+def _why(a: _Answer, op: str) -> QueueRefusalReason:
+    code = a.u8()
+    try:
+        return QueueRefusalReason(code)
+    except ValueError:
+        raise IncompleteResponseError(f"{op} answer has an unknown refusal {code}") from None
+
+
+def _group_refusals(a: _Answer, op: str) -> list[GroupRefusal]:
+    refused = []
+    for _ in range(a.u8()):
+        ms, seq = a.u64(), a.u64()
+        why = _why(a, op)
+        refused.append(
+            GroupRefusal(
+                id=StreamID(timestamp_ms=ms, sequence=seq),
+                why=why,
+                reason=_text(a, op, a.bytes8()),
+            )
+        )
+    return refused
+
+
+def decode_group_steal_answer(data: bytes, consumer: str) -> GroupStealResult:
+    """stream.group.steal's answer: term, index, expires_at_ms, stolen (each
+    id and new deliveries), refused."""
+    op = "stream.group.steal"
+    a = _Answer(op, data)
+    term, index, expires_at_ms = a.u64(), a.u64(), a.i64()
+    stolen = []
+    for _ in range(a.u8()):
+        ms, seq, deliveries = a.u64(), a.u64(), a.u32()
+        stolen.append(
+            GroupRecord(id=StreamID(timestamp_ms=ms, sequence=seq), deliveries=deliveries)
+        )
+    refused = _group_refusals(a, op)
+    a.done()
+    return GroupStealResult(
+        records=stolen,
+        term=term,
+        index=index,
+        expires_at_ms=expires_at_ms,
+        consumer=consumer,
+        refused=refused,
+    )
+
+
+def decode_group_dlq_list_answer(data: bytes) -> GroupDlqPage:
+    """stream.group.dlq_list's answer: dead, cursor?."""
+    op = "stream.group.dlq_list"
+    a = _Answer(op, data)
+    dead = []
+    for _ in range(a.u8()):
+        ms, seq, deliveries, failures, dead_at_ms = a.u64(), a.u64(), a.u32(), a.u32(), a.i64()
+        error = a.bytes16().decode("utf-8", errors="replace")
+        dead.append(
+            GroupDeadLetter(
+                id=StreamID(timestamp_ms=ms, sequence=seq),
+                deliveries=deliveries,
+                failures=failures,
+                dead_at_ms=dead_at_ms,
+                error=error,
+            )
+        )
+    cursor = GroupDlqCursor(dead_ns=a.u64(), ms=a.u64(), seq=a.u64()) if a.present() else None
+    a.done()
+    return GroupDlqPage(dead=dead, cursor=cursor)
+
+
+def decode_group_dlq_answer(op: str, data: bytes) -> GroupDlqResult:
+    """stream.group.dlq_requeue's and dlq_delete's answer: applied, refused, more."""
+    a = _Answer(op, data)
+    applied = a.u32()
+    refused = _group_refusals(a, op)
+    more = a.flag()
+    a.done()
+    return GroupDlqResult(applied=applied, refused=refused, more=more)
+
+
+def decode_queue_dlq_list_answer(data: bytes) -> DlqPage:
+    """queue.dlq_list's answer: dead, cursor?."""
+    op = "queue.dlq_list"
+    a = _Answer(op, data)
+    messages = []
+    for _ in range(a.u8()):
+        seq, priority, deliveries, failures = a.u64(), a.u32(), a.u32(), a.u32()
+        enqueued_at_ms, dead_at_ms, size = a.i64(), a.i64(), a.u32()
+        payload = a.bytes16()
+        error = a.bytes16().decode("utf-8", errors="replace")
+        messages.append(
+            DeadLetter(
+                seq=seq,
+                priority=priority,
+                deliveries=deliveries,
+                failures=failures,
+                enqueued_at_ms=enqueued_at_ms,
+                dead_at_ms=dead_at_ms,
+                size=size,
+                payload=payload,
+                error=error,
+            )
+        )
+    cursor = DlqCursor(dead_ns=a.u64(), seq=a.u64()) if a.present() else None
+    a.done()
+    return DlqPage(messages=messages, cursor=cursor)
+
+
+def decode_queue_dlq_answer(op: str, data: bytes) -> DlqResult:
+    """queue.dlq_requeue's and dlq_delete's answer: applied, refused, more."""
+    a = _Answer(op, data)
+    applied = a.u32()
+    refused = _refusals(a, op)
+    more = a.flag()
+    a.done()
+    return DlqResult(applied=applied, refused=refused, more=more)
