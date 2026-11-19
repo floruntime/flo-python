@@ -238,20 +238,32 @@ class StreamOperations:
 
     async def alter(self, stream: str, options: StreamAlterOptions | None = None) -> None:
         """Change a stream's retention: each setting given (above 0) replaces
-        the stream's, and 0 leaves it. Works on a stream an append made as on
-        one a create made; afterwards a create must ask for the stream's
-        settings as they now are, or it is refused.
+        the stream's, and 0 leaves it; ``clear_retention_age`` and
+        ``clear_retention_count`` drop a bound. Works on a stream an append
+        made as on one a create made; afterwards a create must ask for the
+        stream's settings as they now are, or it is refused.
 
         Raises:
+            ValidationError: The alter both sets and clears a bound.
             NotFoundError: No such stream.
+            BadRequestError: A bound the server refuses (a count of 2**64-1,
+                an age over 100 years).
         """
         opts = options or StreamAlterOptions()
         _check_retention(opts.retention_age_s, opts.retention_count)
+        if opts.clear_retention_age and opts.retention_age_s:
+            raise ValidationError("an alter can't both set and clear retention_age_s")
+        if opts.clear_retention_count and opts.retention_count:
+            raise ValidationError("an alter can't both set and clear retention_count")
         builder = OptionsBuilder()
         if opts.retention_age_s:
             builder.add_u64(OptionTag.RETENTION_AGE, opts.retention_age_s)
         if opts.retention_count:
             builder.add_u64(OptionTag.RETENTION_COUNT, opts.retention_count)
+        if opts.clear_retention_age:
+            builder.add_flag(OptionTag.RETENTION_AGE_CLEAR)
+        if opts.clear_retention_count:
+            builder.add_flag(OptionTag.RETENTION_COUNT_CLEAR)
         await self._client._send_and_check(
             OpCode.STREAM_ALTER,
             self._client.get_namespace(opts.namespace),

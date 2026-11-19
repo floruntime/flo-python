@@ -2,7 +2,8 @@
 settings, against a live server: a dead letter lists with its error and
 failures, pages by cursor, is requeued or deleted by id or all, and one not
 dead is refused NOT_DEAD; a steal takes an idle holder's records and refuses
-NOT_IDLE ones; an alter works on a stream an append made."""
+NOT_IDLE ones; an alter works on a stream an append made, and clears a
+retention bound."""
 
 import asyncio
 import secrets
@@ -34,7 +35,9 @@ from flo import (
     StreamID,
     StreamInfoOptions,
 )
-from flo.exceptions import BadRequestError, ConflictError, NotFoundError
+from flo.exceptions import BadRequestError, ConflictError, NotFoundError, ValidationError
+from flo.types import OpCode, OptionTag
+from flo.wire import OptionsBuilder
 
 
 def fresh_namespace() -> str:
@@ -305,3 +308,70 @@ async def test_live_a_create_gives_an_append_made_stream_its_settings(client: Fl
     await client.stream.create("s", StreamCreateOptions(namespace=ns, retention_count=10))
     with pytest.raises(ConflictError):
         await client.stream.create("s", StreamCreateOptions(namespace=ns, retention_count=11))
+
+
+async def test_live_an_alter_clears_a_retention_bound(client: FloClient) -> None:
+    ns = fresh_namespace()
+    await client.stream.create(
+        "s", StreamCreateOptions(namespace=ns, retention_age_s=3600, retention_count=500)
+    )
+    # Neither bound given, or both 0: unchanged.
+    await client.stream.alter("s", StreamAlterOptions(namespace=ns))
+    info = await client.stream.info("s", StreamInfoOptions(namespace=ns))
+    assert (info.retention_age_s, info.retention_count) == (3600, 500)
+
+    await client.stream.alter("s", StreamAlterOptions(namespace=ns, clear_retention_age=True))
+    info = await client.stream.info("s", StreamInfoOptions(namespace=ns))
+    assert (info.retention_age_s, info.retention_count) == (0, 500)
+    await client.stream.alter("s", StreamAlterOptions(namespace=ns, clear_retention_count=True))
+    info = await client.stream.info("s", StreamInfoOptions(namespace=ns))
+    assert (info.retention_age_s, info.retention_count) == (0, 0)
+
+
+async def test_live_setting_and_clearing_one_bound_is_refused(client: FloClient) -> None:
+    ns = fresh_namespace()
+    await client.stream.create("s", StreamCreateOptions(namespace=ns, retention_count=500))
+    # The SDK refuses it before sending; the server refuses it too.
+    with pytest.raises(ValidationError):
+        await client.stream.alter(
+            "s", StreamAlterOptions(namespace=ns, retention_count=5, clear_retention_count=True)
+        )
+    for tag in (OptionTag.RETENTION_COUNT, OptionTag.RETENTION_AGE):
+        clear = (
+            OptionTag.RETENTION_COUNT_CLEAR
+            if tag == OptionTag.RETENTION_COUNT
+            else OptionTag.RETENTION_AGE_CLEAR
+        )
+        options = OptionsBuilder().add_u64(tag, 5).add_flag(clear).build()
+        with pytest.raises(BadRequestError, match="both sets and clears"):
+            await client._send_and_check(
+                OpCode.STREAM_ALTER, client.get_namespace(ns), b"s", b"", options
+            )
+    info = await client.stream.info("s", StreamInfoOptions(namespace=ns))
+    assert (info.retention_age_s, info.retention_count) == (0, 500)
+
+
+async def test_live_a_create_with_a_clear_is_refused(client: FloClient) -> None:
+    # StreamCreateOptions has no clear; sent by hand, the server refuses it.
+    ns = fresh_namespace()
+    for clear in (OptionTag.RETENTION_AGE_CLEAR, OptionTag.RETENTION_COUNT_CLEAR):
+        options = OptionsBuilder().add_flag(clear).build()
+        with pytest.raises(BadRequestError):
+            await client._send_and_check(
+                OpCode.STREAM_CREATE, client.get_namespace(ns), b"s", b"", options
+            )
+
+
+async def test_live_a_retention_count_of_u64_max_is_refused(client: FloClient) -> None:
+    ns = fresh_namespace()
+    top = 0xFFFFFFFFFFFFFFFF
+    with pytest.raises(BadRequestError, match="retention bound too large"):
+        await client.stream.create("s", StreamCreateOptions(namespace=ns, retention_count=top))
+    await client.stream.create("s", StreamCreateOptions(namespace=ns, retention_count=500))
+    with pytest.raises(BadRequestError, match="retention bound too large"):
+        await client.stream.alter("s", StreamAlterOptions(namespace=ns, retention_count=top))
+    # An age that large is past the 100-year cap, refused for that.
+    with pytest.raises(BadRequestError, match="over 100 years"):
+        await client.stream.alter("s", StreamAlterOptions(namespace=ns, retention_age_s=top))
+    info = await client.stream.info("s", StreamInfoOptions(namespace=ns))
+    assert (info.retention_age_s, info.retention_count) == (0, 500)

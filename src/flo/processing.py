@@ -50,7 +50,10 @@ class ProcessingOperations:
     async def submit(
         self, yaml: str | bytes, options: ProcessingSubmitOptions | None = None
     ) -> str:
-        """Submit a processing job from a YAML definition. Returns the job ID."""
+        """Submit a processing job from a YAML definition. Returns the job ID.
+
+        The server refuses a definition whose job ``name`` is over 4096 bytes.
+        """
         opts = options or ProcessingSubmitOptions()
         namespace = self._client.get_namespace(opts.namespace)
 

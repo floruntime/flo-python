@@ -137,7 +137,7 @@ def test_answers_decode_whole_or_not_at_all() -> None:
 
 
 def test_new_reasons_are_known() -> None:
-    assert [r.value for r in Reason if r.value >= 13] == list(range(13, 38))
+    assert [r.value for r in Reason if r.value >= 13] == list(range(13, 39))
     assert Reason(18).name == "KEYS_NOT_COLOCATED"
     assert (Reason(27).name, Reason(28).name) == ("WORKER_UNHEALTHY", "WORKER_DRAINING")
     assert Reason(29).name == "SHARD_HALTED"

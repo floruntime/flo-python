@@ -301,3 +301,13 @@ async def test_a_limit_answer_is_read_whole_and_the_next_answer_still_parses() -
     assert result is not None and result.value == b"second"
     await client.close()
     server.close()
+
+
+def test_skipped_by_repair_decodes_by_name() -> None:
+    assert Reason(38) is Reason.SKIPPED_BY_REPAIR
+    with pytest.raises(ConflictError) as raised:
+        raise_for_status(
+            StatusCode.CONFLICT, _refusal(b"skipped by a repair", Reason.SKIPPED_BY_REPAIR)
+        )
+    assert raised.value.reason is Reason.SKIPPED_BY_REPAIR
+    assert str(raised.value) == "skipped by a repair"

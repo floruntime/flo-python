@@ -103,6 +103,9 @@ class Reason(IntEnum):
     # dead together), or the shard's queues and groups are at theirs (status
     # OVERLOADED). Reading again won't help until room is made.
     GROUP_HELD_FULL = 37
+    # A repair skipped the entry or channel message that carried the request:
+    # it never runs, on any node.
+    SKIPPED_BY_REPAIR = 38
 
     @classmethod
     def _missing_(cls, value: object) -> "Reason | None":
@@ -404,6 +407,8 @@ class OptionTag(IntEnum):
     RETENTION_COUNT = 0x29  # u64: A stream's retention: the most records it keeps
     RETENTION_AGE = 0x2A  # u64: A stream's retention: the oldest record's age, in seconds
     FORCE = 0x2C  # void: Flag to delete a stream that still has records
+    RETENTION_AGE_CLEAR = 0x2D  # void: Alter only: drop the stream's age bound
+    RETENTION_COUNT_CLEAR = 0x2E  # void: Alter only: drop the stream's count bound
 
     # Consumer Group Options (0x30 - 0x3F)
     ACK_TIMEOUT_MS = 0x30  # u32: A group's lease, 5 s to 12 h (default 30 s)
@@ -1314,11 +1319,16 @@ class StreamCreateOptions:
 @dataclass
 class StreamAlterOptions:
     """The retention an alter sets: each one given (above 0) replaces the
-    stream's; 0 leaves it as it is."""
+    stream's; 0 leaves it as it is. ``clear_retention_age`` and
+    ``clear_retention_count`` drop the bound, so the stream keeps records of
+    any age, or any number of them; setting and clearing one bound in the
+    same alter is refused."""
 
     namespace: str | None = None
     retention_age_s: int = 0
     retention_count: int = 0
+    clear_retention_age: bool = False
+    clear_retention_count: bool = False
 
 
 @dataclass

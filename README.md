@@ -488,6 +488,14 @@ partitions and retention (records older than `retention_age_s`, or past
 given replacing the stream's, on a stream an append made as on one a create
 made. `info` answers the settings.
 
+In an alter, a bound left at 0 stays as it is; `clear_retention_age` and
+`clear_retention_count` drop it, so the stream keeps records of any age, or
+any number. Setting and clearing the same bound in one alter raises
+`ValidationError` before anything is sent. Only an alter clears: a create
+has no clear. The server refuses (`BadRequestError`) a `retention_count` of
+2**64-1, which it keeps to mean "cleared", and a `retention_age_s` over 100
+years.
+
 Once a stream has settings, from a create or an alter, a create that names
 the same ones succeeds (a retry), and one that names others raises
 `ConflictError` ("the stream exists with other settings"): after an alter, a
@@ -500,6 +508,8 @@ from flo import StreamAlterOptions, StreamCreateOptions
 
 await client.stream.create("events", StreamCreateOptions(retention_age_s=86_400))
 await client.stream.alter("events", StreamAlterOptions(retention_count=1_000_000))
+# Keep records of any age from now on:
+await client.stream.alter("events", StreamAlterOptions(clear_retention_age=True))
 info = await client.stream.info("events")
 print(info.retention_age_s, info.retention_count)
 ```
@@ -616,6 +626,10 @@ job_id = await client.processing.submit(open("pipeline.yaml").read())
 status = await client.processing.status(job_id)
 print(status.status, status.runtime.records_in, status.runtime.late_points)
 ```
+
+The server refuses a job whose `name` is over 4096 bytes when it parses the
+definition. Likewise `workflow.create` and `workflow.sync` are refused for a
+workflow whose `version` is over 256 bytes.
 
 A TS source reads its field up to its `lateness_ms` window behind the
 field's newest point (30 s by default, at most a day; 0 reads with no
