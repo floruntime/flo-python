@@ -472,7 +472,9 @@ lease, its failures kept. Name each record with the deliveries its holder has
 acked, nacked or touched as a read's; records it didn't take come back in
 `refused` (`NOT_IDLE` for one touched within the idle time). A read takes
 expired records by itself, so a steal is for records whose holder is stuck
-but still touching them, or to move work sooner than the lease.
+but still touching them, or to move work sooner than the lease. A steal
+naming no records is answered at once, after the group and consumer checks:
+nothing stolen and a lease of zeros.
 
 ```python
 pending = await client.stream.group_pending("events", "processors", "worker-1")

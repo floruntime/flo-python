@@ -26,7 +26,10 @@ The server's op table hash is now `0xdc7e06b2a9f89c65`, the hash of flo `08d5161
   4096 bytes and a workflow's `version` at most 256, refused when the
   definition is parsed
 - A stream deleted and made again under the same name keeps numbering its
-  ids past the old ones, rather than starting over
+  ids past the old ones while the server still holds the deleted stream's
+  tombstone; once the tombstone is forgotten, they start again
+- A `group_steal` naming no records is answered at once, after the group
+  and consumer checks: nothing stolen, a lease of zeros, and nothing logged
 
 ## [0.1.7] - 2026-11-18
 
