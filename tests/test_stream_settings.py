@@ -71,3 +71,37 @@ async def test_a_negative_retention_is_refused_before_sending(
     with pytest.raises(ValidationError):
         await client.stream.alter("s", StreamAlterOptions(**{field: -1}))
     assert calls == []
+
+
+async def test_alter_sends_each_clear_as_a_void_flag(
+    sent: tuple[FloClient, list[Call]],  # noqa: F811
+) -> None:
+    client, calls = sent
+    await client.stream.alter("s", StreamAlterOptions(clear_retention_age=True))
+    await client.stream.alter(
+        "s", StreamAlterOptions(clear_retention_count=True, retention_age_s=60)
+    )
+    (_, _, _, _, age_clear), (_, _, _, _, count_clear) = calls
+    # A void option: its tag and a zero length, no value.
+    assert age_clear == bytes([0x2D, 0])
+    clear = OptionsIterator(count_clear).find(OptionTag.RETENTION_COUNT_CLEAR)
+    assert clear is not None and clear.data == b"" and OptionTag.RETENTION_COUNT_CLEAR == 0x2E
+    assert _u64(count_clear, OptionTag.RETENTION_AGE) == 60
+    assert OptionsIterator(count_clear).find(OptionTag.RETENTION_AGE_CLEAR) is None
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        StreamAlterOptions(retention_age_s=60, clear_retention_age=True),
+        StreamAlterOptions(retention_count=5, clear_retention_count=True),
+    ],
+)
+async def test_setting_and_clearing_one_bound_is_refused_before_sending(
+    sent: tuple[FloClient, list[Call]],  # noqa: F811
+    options: StreamAlterOptions,
+) -> None:
+    client, calls = sent
+    with pytest.raises(ValidationError, match="both set and clear"):
+        await client.stream.alter("s", options)
+    assert calls == []

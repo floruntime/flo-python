@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The server's op table hash is now `0xe394286115044c9d`, the hash of flo `19cfe003`; this SDK and older servers refuse each other. Run ids may now be up to 42 bytes (`{prefix}{bits}-{shard}-{term}`); treat them as opaque.
+The server's op table hash is now `0xdc7e06b2a9f89c65`, the hash of flo `08d51612`; this SDK and older servers refuse each other. Run ids may now be up to 42 bytes (`{prefix}{bits}-{shard}-{term}`); treat them as opaque.
+
+### Added
+
+- `StreamAlterOptions.clear_retention_age` and `clear_retention_count`: an
+  alter drops the stream's age or count bound. A bound left at 0 is still
+  unchanged; setting and clearing one bound in the same alter raises
+  `ValidationError` before sending. A create can't clear. The server refuses a
+  `retention_count` of 2**64-1 (`BadRequestError`, "retention bound too
+  large"), on create and alter
+- `Reason.SKIPPED_BY_REPAIR` (38): a repair skipped the entry or channel
+  message that carried the request, so it never runs on any node
+
+### Changed
+
+- Documented the server's name caps: a processing job's `name` is at most
+  4096 bytes and a workflow's `version` at most 256, refused when the
+  definition is parsed
+- A stream deleted and made again under the same name keeps numbering its
+  ids past the old ones while the server still holds the deleted stream's
+  tombstone; once the tombstone is forgotten, they start again
+- A `group_steal` naming no records is answered at once, after the group
+  and consumer checks: nothing stolen, a lease of zeros, and nothing logged
 
 ## [0.1.7] - 2026-11-18
 

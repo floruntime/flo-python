@@ -51,7 +51,10 @@ class WorkflowOperations:
     async def create(
         self, name: str, yaml: str | bytes, options: WorkflowCreateOptions | None = None
     ) -> None:
-        """Create (or replace) a workflow from a YAML definition."""
+        """Create (or replace) a workflow from a YAML definition.
+
+        The server refuses a definition whose ``version`` is over 256 bytes.
+        """
         opts = options or WorkflowCreateOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
