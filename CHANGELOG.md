@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The server's op table hash is now `0xe394286115044c9d`, the hash of flo `19cfe003`; this SDK and older servers refuse each other. Run ids may now be up to 42 bytes (`{prefix}{bits}-{shard}-{term}`); treat them as opaque.
+The server's op table hash is now `0xdc7e06b2a9f89c65`, the hash of flo `08d51612`; this SDK and older servers refuse each other. Run ids may now be up to 42 bytes (`{prefix}{bits}-{shard}-{term}`); treat them as opaque.
 
 ### Added
 
