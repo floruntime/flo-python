@@ -22,6 +22,9 @@ The server's op table hash is now `0xd0aab08ab0c92ba9`, the hash of flo `06f3693
 
 ### Changed
 
+- A delete now drops a key's earlier versions: after put, delete, put, `history` is the new version and the delete's tombstone. The server removes old tombstones in time.
+- A workflow signal is taken by one wait: a wait takes the oldest signal of its type the run holds, and a run keeps at most 64 that no wait has taken (one more is refused) until a wait takes them or the run ends.
+- Idempotency keys starting with `_` are reserved for the server and refused on a workflow start.
 - Documented the server's name caps: a processing job's `name` is at most
   4096 bytes and a workflow's `version` at most 256, refused when the
   definition is parsed

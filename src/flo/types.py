@@ -1773,6 +1773,8 @@ class WorkflowStartOptions:
     """Options for starting a workflow run."""
 
     namespace: str | None = None
+    # The same key answers with the run it started. Keys starting with '_' are
+    # reserved for the server and refused.
     idempotency_key: str | None = None
     run_id: str | None = None
     version: str | None = None

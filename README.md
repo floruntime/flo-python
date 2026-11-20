@@ -138,7 +138,9 @@ from flo import HistoryOptions
 
 # A page of versions newest first (limit 1..65, default 10), each with its write
 # time in ms and whether it was a delete; empty for a missing key. `more` says
-# older kept versions follow: ask again from before the last one.
+# older kept versions follow: ask again from before the last one. A delete
+# drops the versions before it, so history ends at its tombstone, and the
+# server removes old tombstones in time.
 opts = HistoryOptions(limit=10)
 while True:
     page = await client.kv.history("user:123", opts)
