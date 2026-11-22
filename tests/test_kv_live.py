@@ -23,6 +23,7 @@ async def test_get_shows_when_a_ttl_runs_out(client: FloClient) -> None:
 
 
 async def test_history_marks_the_deleted_version(client: FloClient) -> None:
+    # A delete frees what the key held, so the version before it is gone.
     key = f"py-hist-{secrets.token_hex(4)}"
     await client.kv.put(key, b"one")
     await client.kv.delete(key)
@@ -31,7 +32,6 @@ async def test_history_marks_the_deleted_version(client: FloClient) -> None:
     assert [(e.deleted, e.value) for e in history.versions] == [
         (False, b"three"),
         (True, b""),
-        (False, b"one"),
     ]
     assert (history.more, history.stale) == (False, False)
 

@@ -19,7 +19,7 @@ VERSION: int = 0x03
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0xDC7E06B2A9F89C65
+TABLE_HASH: int = 0x2440B62EDFFE27A6
 # Response header flag: a shard that can't apply its next entry (halted at
 # it, or blocked reading it from disk) answered a read from its state just
 # before that entry. The read succeeded.
@@ -1773,6 +1773,8 @@ class WorkflowStartOptions:
     """Options for starting a workflow run."""
 
     namespace: str | None = None
+    # The same key answers with the run it started. Keys starting with '_' are
+    # reserved for the server and refused.
     idempotency_key: str | None = None
     run_id: str | None = None
     version: str | None = None

@@ -254,7 +254,12 @@ class WorkflowOperations:
         data: str | bytes | None = None,
         options: WorkflowSignalOptions | None = None,
     ) -> None:
-        """Send a signal to a running workflow."""
+        """Send a signal to a running workflow.
+
+        Each signal ends one wait: a wait takes the oldest signal of its type
+        the run holds. The run keeps signals no wait has taken (at most 64;
+        one more is refused) until a wait takes them or the run ends.
+        """
         opts = options or WorkflowSignalOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
