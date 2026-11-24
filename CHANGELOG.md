@@ -5,7 +5,9 @@ All notable changes to the Flo Python SDK will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.8] - 2026-11-24
+
+Works with flo v0.1.0-dev.21.
 
 The server's op table hash is now `0xe188239e79bb6bef`, the hash of flo `0f2bd2e2`; this SDK and older servers refuse each other. Run ids may now be up to 42 bytes (`{prefix}{bits}-{shard}-{term}`); treat them as opaque.
 
