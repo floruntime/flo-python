@@ -943,8 +943,8 @@ class ActionWorker(_RegisteredWorker):
         Raises:
             ValueError: If no handlers are registered.
             ConnectionError: If connection to server fails.
-            LimitError: Registering was refused at a limit (too many actions,
-                say). start() fails with the limit error; a limit hit while
+            LimitError: Registering was refused at a limit (the node's memory
+                budget, say). start() fails with the limit error; a limit hit while
                 running is logged and backed off.
         """
         if not self._handlers:

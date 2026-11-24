@@ -11,14 +11,12 @@ Run:
 
 import asyncio
 import json
-import struct
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from flo import FloClient, WorkflowListDefinitionsOptions
+from flo import FloClient, RunHistoryOptions, WorkflowListDefinitionsOptions
 from flo.exceptions import FloError, NotFoundError
 from flo.types import RunStatus
 from flo.worker import ActionWorker
@@ -118,56 +116,6 @@ steps:
 
 # Path to order-workflow.yaml (next to this file)
 ORDER_WORKFLOW_PATH = str(Path(__file__).parent / "order-workflow.yaml")
-
-
-# ---------------------------------------------------------------------------
-# Binary response parsers (matching Go parseHistory)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class HistoryEvent:
-    type: str
-    detail: str
-    timestamp: int
-
-
-def parse_history(data: bytes) -> list[HistoryEvent]:
-    """Parse binary history response.
-
-    Format: [count:u32]([type_len:u16][type][detail_len:u16][detail][ts:i64])*
-    """
-    if len(data) < 4:
-        return []
-    count = struct.unpack_from("<I", data, 0)[0]
-    pos = 4
-    events = []
-    for _ in range(count):
-        if pos + 2 > len(data):
-            break
-        type_len = struct.unpack_from("<H", data, pos)[0]
-        pos += 2
-        if pos + type_len > len(data):
-            break
-        typ = data[pos : pos + type_len].decode("utf-8")
-        pos += type_len
-
-        if pos + 2 > len(data):
-            break
-        detail_len = struct.unpack_from("<H", data, pos)[0]
-        pos += 2
-        if pos + detail_len > len(data):
-            break
-        detail = data[pos : pos + detail_len].decode("utf-8")
-        pos += detail_len
-
-        if pos + 8 > len(data):
-            break
-        ts = struct.unpack_from("<q", data, pos)[0]
-        pos += 8
-
-        events.append(HistoryEvent(type=typ, detail=detail, timestamp=ts))
-    return events
 
 
 # ---------------------------------------------------------------------------
@@ -479,24 +427,30 @@ class TestHistory:
         run_id = await client.workflow.start("order-processing", input_data)
         assert run_id
 
-        # Wait for completion
-        await poll_status(
+        final = await poll_status(
             client,
             run_id,
             lambda s: s["status"] in ("completed", "failed"),
             timeout_sec=30,
         )
 
-        # Get history
-        history_data = await client.workflow.history(run_id)
-        assert history_data is not None
-
-        events = parse_history(history_data)
-        assert len(events) >= 1, "Expected at least one history event"
-
-        # Log events for debugging
-        for ev in events:
-            print(f"  History: type={ev.type} detail={ev.detail}")
+        # Every event, a page of two at a time, oldest first.
+        events = []
+        opts = RunHistoryOptions(limit=2)
+        for _ in range(100):
+            page = await client.workflow.history(run_id, opts)
+            assert len(page.events) <= 2
+            events.extend(page.events)
+            if not page.has_more:
+                break
+            opts = RunHistoryOptions(limit=2, cursor=page.cursor)
+        else:
+            pytest.fail("the cursor never ran out")
+        types = [e.type for e in events]
+        assert types[0] == "workflow_started"
+        assert types.count(f"workflow_{final['status']}") == 1
+        # The whole output is in the history only when the status's was cut.
+        assert ("workflow_output" in types) == final["output_truncated"]
 
 
 class TestListRuns:

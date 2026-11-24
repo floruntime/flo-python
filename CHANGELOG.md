@@ -5,6 +5,45 @@ All notable changes to the Flo Python SDK will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The server's op table hash is now `0xaaef4dfa38d45632`, the hash of flo `0bc90b34`; this SDK and older servers refuse each other.
+
+### Added
+
+- `action.history(run_id, RunHistoryOptions)`: a page of an action run's
+  history, its invoke, deliveries, failures and result, in order
+- `ActionRunStatus.output_truncated` and `error_truncated`: `output` and
+  `error_message` are now their first 256 bytes, and these say more were cut.
+  The whole output is the run's `action_settled` history event
+- `workflow.status` decodes the run's `output`, once it has one, and
+  `output_truncated`. An ended run's `input` is empty and its `output` its
+  first 256 bytes; with `output_truncated` the whole is the history's
+  `workflow_output` event. A status answer with bytes left over is refused
+
+### Changed
+
+- A history read may be held up to 5 s while the run's history catches up;
+  the client waits that long on top of its timeout
+- A register past the node's memory is refused `LimitError` with reason
+  `MEMORY_BUDGET`; the server has no count caps on actions or workflows
+- Documented the name caps: a workflow name over 256 bytes is refused at
+  create and start, an action name over 256 bytes at register
+  (`BadRequestError`), and a workflow step calling an action named longer
+  than that fails
+
+### Breaking
+
+- `workflow.history` returns a `RunHistoryPage` (`events` of
+  `RunHistoryEvent`: `type`, `detail`, `extra`, `timestamp_ms`; `has_more`;
+  `cursor`) in place of the raw answer bytes, the same page as
+  `action.history`, and is sent as a table op; the server refuses the old
+  request. `RunHistoryOptions` (`limit`, `cursor`, `newest_first`, each `None`
+  for the server's default) replaces `WorkflowHistoryOptions`. A `limit`
+  outside 1..1000 raises `ValidationError` before sending
+- `Reason.TOO_MANY_ACTIONS` (33), `TOO_MANY_WORKFLOW_DEFINITIONS` (34) and
+  `TOO_MANY_WORKFLOW_RUNS` (35) are gone; the other reasons keep their numbers
+
 ## [0.1.8] - 2026-11-24
 
 Works with flo v0.1.0-dev.21.

@@ -19,7 +19,7 @@ VERSION: int = 0x03
 # header. A server built from another table refuses the request, and its
 # answers carry its own hash, which this SDK refuses. CI's live tests run
 # against the flo commit in .github/flo-ref.env: change both in one commit.
-TABLE_HASH: int = 0xE188239E79BB6BEF
+TABLE_HASH: int = 0xAAEF4DFA38D45632
 # Response header flag: a shard that can't apply its next entry (halted at
 # it, or blocked reading it from disk) answered a read from its state just
 # before that entry. The read succeeded.
@@ -89,12 +89,6 @@ class Reason(IntEnum):
     JOB_RUNNING = 31
     # The node's memory budget is spent (status LIMIT).
     MEMORY_BUDGET = 32
-    # The shard holds as many actions as it registers (status LIMIT).
-    TOO_MANY_ACTIONS = 33
-    # The node holds as many workflow definitions as it keeps (status LIMIT).
-    TOO_MANY_WORKFLOW_DEFINITIONS = 34
-    # The node holds as many workflow runs as it keeps (status LIMIT).
-    TOO_MANY_WORKFLOW_RUNS = 35
     # The queue, or the shard's queues and groups together, are at their caps
     # (status OVERLOADED). It drains as messages are acked: back off and send
     # again.
@@ -282,6 +276,7 @@ class OpCode(IntEnum):
     ACTION_FAIL = 0x30C
     ACTION_TOUCH = 0x30D
     ACTION_INFO = 0x30F
+    ACTION_HISTORY = 0x310
 
     # ── Workers (0x320 – 0x33F) ──
     WORKER_REGISTER = 0x320
@@ -1433,7 +1428,10 @@ class RunStatus(IntEnum):
 class ActionRunStatus:
     """Status of an action run. Times are ms since the epoch; ``attempt``
     counts from 1 once a worker has taken the run. ``output`` is a completed
-    run's result, and ``error_message`` the last failure's message."""
+    run's result, and ``error_message`` the last failure's message: each only
+    its first 256 bytes. ``output_truncated`` and ``error_truncated`` say more
+    were cut; the whole output is the ``action_settled`` event of the run's
+    history (``actions.history``), the whole error its failure's event."""
 
     run_id: str
     status: RunStatus
@@ -1451,6 +1449,8 @@ class ActionRunStatus:
     # Why its lease, past due, isn't ended yet: its end waits for room on
     # the calling workflow's shard. None when nothing is held.
     held: str | None = None
+    output_truncated: bool = False
+    error_truncated: bool = False
 
 
 @dataclass
@@ -1802,11 +1802,50 @@ class WorkflowCancelOptions:
 
 
 @dataclass
-class WorkflowHistoryOptions:
-    """Options for getting workflow history."""
+class RunHistoryOptions:
+    """Options for reading a page of a workflow's or an action's run history.
+
+    ``limit`` is the most events to answer, 1..1000; None takes the server's
+    100. ``cursor`` is the last page's, None to start from the first event
+    (or, with ``newest_first``, the newest). ``newest_first`` None takes the
+    server's False.
+    """
 
     namespace: str | None = None
-    limit: int = 100
+    limit: int | None = None
+    cursor: int | None = None
+    newest_first: bool | None = None
+
+
+@dataclass
+class RunHistoryEvent:
+    """One event of a run's history.
+
+    ``type`` says what happened, ``detail`` carries its input, result, error
+    or worker. A gap's event (``history_lost``: events the log no longer
+    holds or a repair skipped; ``history_missing``: events not landed in
+    time) stands for the events it names in its detail. An ended workflow
+    run whose output was longer than its status's 256-byte preview has a
+    ``workflow_output`` event carrying the whole.
+    """
+
+    type: str
+    detail: bytes
+    # An action's settle event: the outcome its worker named. An action's
+    # delivery, retried failure or hand-back: "truncated" when ``detail`` is
+    # only the first 256 bytes. Empty otherwise.
+    extra: str
+    timestamp_ms: int
+
+
+@dataclass
+class RunHistoryPage:
+    """A page of a run's history, in the order asked. ``cursor`` asks for the
+    next page; None, with ``has_more`` False, on the last."""
+
+    events: list[RunHistoryEvent]
+    has_more: bool = False
+    cursor: int | None = None
 
 
 @dataclass

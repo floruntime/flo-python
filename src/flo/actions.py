@@ -16,12 +16,14 @@ from .kv_body import (
     decode_action_status_answer,
     decode_await_answer,
     decode_empty_answer,
+    decode_run_history_answer,
     decode_touch_answer,
     decode_worker_info_answer,
     decode_worker_list_answer,
     encode_await_body,
     encode_complete_body,
     encode_fail_body,
+    encode_run_history_body,
     encode_touch_body,
     encode_worker_list_body,
 )
@@ -37,6 +39,8 @@ from .types import (
     ActionStatusOptions,
     ActionType,
     OpCode,
+    RunHistoryOptions,
+    RunHistoryPage,
     TaskAssignment,
     WorkerAwaitOptions,
     WorkerAwaitResult,
@@ -144,7 +148,10 @@ class ActionOperations:
             options: Optional status options.
 
         Returns:
-            ActionRunStatus with current status.
+            ActionRunStatus with current status. Its ``output`` and
+            ``error_message`` are previews, their first 256 bytes; the
+            truncated flags say when more were cut, and ``history`` holds the
+            whole.
         """
         opts = options or ActionStatusOptions()
         namespace = self._client.get_namespace(opts.namespace)
@@ -157,6 +164,33 @@ class ActionOperations:
         )
 
         return decode_action_status_answer(run_id, response.data)
+
+    async def history(
+        self,
+        run_id: str,
+        options: RunHistoryOptions | None = None,
+    ) -> RunHistoryPage:
+        """One page of an action run's history: its invoke, deliveries,
+        failures and result, in order.
+
+        Page by passing the page's ``cursor`` back until ``has_more`` is
+        False. The server may hold the read up to 5 s while the run's history
+        catches up.
+
+        Raises:
+            ValidationError: ``limit`` is outside 1..1000.
+            NotFoundError: No run has that id.
+        """
+        opts = options or RunHistoryOptions()
+        namespace = self._client.get_namespace(opts.namespace)
+
+        response = await self._client._send_and_check(
+            OpCode.ACTION_HISTORY,
+            namespace,
+            run_id.encode("utf-8"),
+            encode_run_history_body(opts.limit, opts.cursor, opts.newest_first),
+        )
+        return decode_run_history_answer("action.history", response.data)
 
     async def list(
         self,

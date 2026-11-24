@@ -137,16 +137,15 @@ def test_answers_decode_whole_or_not_at_all() -> None:
 
 
 def test_new_reasons_are_known() -> None:
-    assert [r.value for r in Reason if r.value >= 13] == list(range(13, 39))
+    # 33..35 are gone: the server dropped its count caps on actions and
+    # workflows, and refuses past memory with MEMORY_BUDGET.
+    assert [r.value for r in Reason if r.value >= 13] == [*range(13, 33), *range(36, 39)]
     assert Reason(18).name == "KEYS_NOT_COLOCATED"
     assert (Reason(27).name, Reason(28).name) == ("WORKER_UNHEALTHY", "WORKER_DRAINING")
     assert Reason(29).name == "SHARD_HALTED"
     assert Reason(30).name == "ADMIN_ONLY"
     assert Reason(31).name == "JOB_RUNNING"
-    assert [Reason(n).name for n in range(32, 36)] == [
-        "MEMORY_BUDGET",
-        "TOO_MANY_ACTIONS",
-        "TOO_MANY_WORKFLOW_DEFINITIONS",
-        "TOO_MANY_WORKFLOW_RUNS",
-    ]
+    assert Reason(32).name == "MEMORY_BUDGET"
+    for gone in ("TOO_MANY_ACTIONS", "TOO_MANY_WORKFLOW_DEFINITIONS", "TOO_MANY_WORKFLOW_RUNS"):
+        assert gone not in Reason.__members__
     assert (Reason(36).name, Reason(37).name) == ("QUEUE_FULL", "GROUP_HELD_FULL")

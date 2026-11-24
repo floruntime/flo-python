@@ -23,6 +23,7 @@ CALLS: dict[str, Callable[[FloClient], Awaitable[Any]]] = {
     "stream.group_delete": lambda c: c.stream.group_delete("s", "g"),
     "stream.group_info": lambda c: c.stream.group_info("s", "g"),
     "workflow.history": lambda c: c.workflow.history("no-such-run"),
+    "action.history": lambda c: c.action.history("no-such-run"),
 }
 
 

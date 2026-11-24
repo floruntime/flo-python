@@ -9,7 +9,7 @@ from flo.kv_body import decode_action_invoke_answer, decode_action_status_answer
 from flo.types import RunStatus
 
 # A completed run: started, completed, attempt 2, output "ok", no error, no
-# worker, no outcome (success), nothing held.
+# worker, no outcome (success), nothing held, nothing truncated.
 COMPLETED = (
     bytes([2])
     + struct.pack("<q", 100)
@@ -25,7 +25,10 @@ COMPLETED = (
     + b"\x00"
     + b"\x00"
     + b"\x00"
+    + b"\x00\x00"
 )
+# output_truncated, error_truncated: neither.
+FLAGS = b"\x00\x00"
 
 
 def test_a_completed_runs_status_carries_its_times_attempt_and_output() -> None:
@@ -48,21 +51,23 @@ def test_a_completed_runs_status_carries_its_times_attempt_and_output() -> None:
 
 def test_a_status_carries_the_outcome_a_worker_named() -> None:
     s = decode_action_status_answer(
-        "run-1", COMPLETED[:-2] + b"\x01" + struct.pack("<H", 8) + b"approved" + b"\x00"
+        "run-1", COMPLETED[:-4] + b"\x01" + struct.pack("<H", 8) + b"approved" + b"\x00" + FLAGS
     )
     assert s.outcome == "approved"
 
 
 def test_a_status_says_why_a_past_due_lease_is_held() -> None:
     held = b"waiting for room on the caller's shard"
-    s = decode_action_status_answer("run-1", COMPLETED[:-1] + b"\x01" + bytes([len(held)]) + held)
+    s = decode_action_status_answer(
+        "run-1", COMPLETED[:-3] + b"\x01" + bytes([len(held)]) + held + FLAGS
+    )
     assert s.held == held.decode()
     assert decode_action_status_answer("run-1", COMPLETED).held is None
 
 
 def test_a_status_names_the_worker_that_holds_the_run() -> None:
     s = decode_action_status_answer(
-        "run-1", COMPLETED[:-3] + b"\x01" + struct.pack("<H", 4) + b"w-17" + b"\x00\x00"
+        "run-1", COMPLETED[:-5] + b"\x01" + struct.pack("<H", 4) + b"w-17" + b"\x00\x00" + FLAGS
     )
     assert s.worker_id == "w-17"
 
@@ -80,6 +85,7 @@ def test_a_failed_runs_status_carries_its_error_and_no_output() -> None:
         + b"\x00"
         + b"\x00"
         + b"\x00"
+        + FLAGS
     )
     s = decode_action_status_answer("run-1", data)
     assert (s.status, s.started_at_ms, s.output, s.error_message) == (
@@ -88,6 +94,17 @@ def test_a_failed_runs_status_carries_its_error_and_no_output() -> None:
         None,
         "boom",
     )
+
+
+def test_a_status_says_its_output_or_error_is_a_preview() -> None:
+    s = decode_action_status_answer("run-1", COMPLETED)
+    assert (s.output_truncated, s.error_truncated) == (False, False)
+    s = decode_action_status_answer("run-1", COMPLETED[:-2] + b"\x01\x00")
+    assert (s.output_truncated, s.error_truncated) == (True, False)
+    s = decode_action_status_answer("run-1", COMPLETED[:-2] + b"\x00\x01")
+    assert (s.output_truncated, s.error_truncated) == (False, True)
+    with pytest.raises(IncompleteResponseError):
+        decode_action_status_answer("run-1", COMPLETED[:-2] + b"\x02\x00")
 
 
 @pytest.mark.parametrize("n", range(len(COMPLETED)))

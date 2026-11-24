@@ -290,15 +290,13 @@ class OutcomePendingError(ServerError):
 
 class LimitError(ServerError):
     """The node or shard is at one of its limits; ``reason`` names which
-    (TOO_MANY_ACTIONS, MEMORY_BUDGET, TOO_MANY_WORKFLOW_DEFINITIONS or
-    TOO_MANY_WORKFLOW_RUNS) and the message says more. It never ran.
+    (today MEMORY_BUDGET: a write, an action's register among them, past its
+    node's memory budget) and the message says more. It never ran.
 
-    Terminal: retrying won't clear it, so the client never retries it. The
-    limits are fixed in the server's build, not settings an operator raises:
-    deleting something clears it (TOO_MANY_ACTIONS counts the actions on one
-    shard, so delete an action there; MEMORY_BUDGET also clears when the node
-    has more memory). For a worker, start() fails with the limit error; a
-    limit hit while running is logged and backed off.
+    Terminal: retrying won't clear it, so the client never retries it.
+    Deleting something, or giving the node more memory, clears it. For a
+    worker, start() fails with the limit error; a limit hit while running is
+    logged and backed off.
     """
 
     def __init__(self, message: str = StatusCode.LIMIT.message()):
