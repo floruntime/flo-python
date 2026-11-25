@@ -19,19 +19,15 @@ plans:
     executors:
       - name: stripe
         run: "@actions/process-payment"
-        priority: 1
         retry:
           max_attempts: 3
-          initial_delay_ms: 100
         breaker:
           failure_threshold: 5
           cooldown_ms: 30000
       - name: paypal
         run: "@actions/process-payment-fallback"
-        priority: 2
         retry:
           max_attempts: 2
-          initial_delay_ms: 200
 
 start:
   run: "@actions/validate-payment"
