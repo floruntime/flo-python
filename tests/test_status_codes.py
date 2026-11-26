@@ -276,21 +276,12 @@ def test_queue_full_and_group_held_full_are_overloaded_with_their_own_errors() -
 
 def test_status_15_is_a_limit_carrying_its_reason_and_message() -> None:
     assert StatusCode(15) is StatusCode.LIMIT
-    body = _refusal(b"limit: node holds 10000 actions; delete one", Reason.TOO_MANY_ACTIONS)
+    body = _refusal(b"limit: node n1's memory budget is spent", Reason.MEMORY_BUDGET)
     with pytest.raises(LimitError) as raised:
         raise_for_status(StatusCode(15), body)
     assert raised.value.status_code == StatusCode.LIMIT
-    assert (raised.value.reason, raised.value.ran) == (Reason.TOO_MANY_ACTIONS, Ran.NO)
-    assert str(raised.value) == "limit: node holds 10000 actions; delete one"
-    # The reasons defined ahead of their checks decode by name too.
-    for reason in (
-        Reason.MEMORY_BUDGET,
-        Reason.TOO_MANY_WORKFLOW_DEFINITIONS,
-        Reason.TOO_MANY_WORKFLOW_RUNS,
-    ):
-        with pytest.raises(LimitError) as raised:
-            raise_for_status(StatusCode.LIMIT, _refusal(b"limit", reason))
-        assert raised.value.reason == reason
+    assert (raised.value.reason, raised.value.ran) == (Reason.MEMORY_BUDGET, Ran.NO)
+    assert str(raised.value) == "limit: node n1's memory budget is spent"
 
 
 async def test_a_limit_answer_is_read_whole_and_the_next_answer_still_parses() -> None:

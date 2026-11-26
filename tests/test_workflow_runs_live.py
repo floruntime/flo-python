@@ -2,16 +2,15 @@
 once, newest first, and a run started with the caller's id is found by it."""
 
 import secrets
-import struct
 import uuid
 
 import pytest
 
 from flo import (
     FloClient,
+    RunHistoryOptions,
     WorkflowCancelOptions,
     WorkflowCreateOptions,
-    WorkflowHistoryOptions,
     WorkflowListRunsOptions,
     WorkflowRunEntry,
     WorkflowSignalOptions,
@@ -113,9 +112,9 @@ async def test_a_run_started_with_its_own_id_is_found_by_it(client: FloClient, r
     status = await client.workflow.status(run_id, WorkflowStatusOptions(namespace=ns))
     assert (status["run_id"], status["workflow"]) == (run_id, "wf-a")
 
-    history = await client.workflow.history(run_id, WorkflowHistoryOptions(namespace=ns))
-    (events,) = struct.unpack_from("<I", history, 0)
-    assert events >= 1
+    history = await client.workflow.history(run_id, RunHistoryOptions(namespace=ns))
+    assert history.events and history.events[0].type == "workflow_started"
+    assert not history.has_more and history.cursor is None
 
     with pytest.raises(ConflictError):
         await client.workflow.start("wf-b", "{}", WorkflowStartOptions(namespace=ns, run_id=run_id))
@@ -123,7 +122,11 @@ async def test_a_run_started_with_its_own_id_is_found_by_it(client: FloClient, r
     await client.workflow.signal(run_id, "nudge", b"{}", WorkflowSignalOptions(namespace=ns))
     await client.workflow.cancel(run_id, "done", WorkflowCancelOptions(namespace=ns))
     status = await client.workflow.status(run_id, WorkflowStatusOptions(namespace=ns))
-    assert status["status"] == "cancelled"
+    assert (status["status"], status["input"]) == ("cancelled", b"")
+    last = await client.workflow.history(
+        run_id, RunHistoryOptions(namespace=ns, limit=1, newest_first=True)
+    )
+    assert [e.type for e in last.events] == ["workflow_cancelled"]
 
     runs = await list_all(client, ns, None)
     assert [(r.run_id, r.workflow) for r in runs] == [(run_id, "wf-a")]

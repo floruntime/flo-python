@@ -1,6 +1,7 @@
 """The ops on the server's op table: KV, the action reports and reads,
 worker.list and worker.info, stream group reads, the queue's dequeue,
-reports and peek, ts.read and ts.info, and processing.remove.
+reports and peek, ts.read and ts.info, processing.remove, and the run
+history reads (workflow.history, action.history).
 
 The request is ``[namespace][key][body]``, the body coded by the op's
 schema, field by field in order. An optional field is a presence byte then
@@ -50,6 +51,8 @@ from .types import (
     QueueRefusalReason,
     QueueReportResult,
     QueueTouchResult,
+    RunHistoryEvent,
+    RunHistoryPage,
     RunStatus,
     StreamGroupEntry,
     StreamGroupListResult,
@@ -103,6 +106,13 @@ MAX_DEAD_BATCH = 100
 MAX_DLQ_PAGE = 100
 # A steal's idle time: up to the longest lease.
 MAX_MIN_IDLE_MS = 43_200_000
+# A run history page: at most this many events, each event's type and detail
+# at most 65536 bytes (u32 lengths), its extra at most 256 (a u16 length).
+MAX_RUN_HISTORY_PAGE = 1000
+_MAX_HISTORY_EVENT = 65_536
+_MAX_HISTORY_EXTRA = 256
+# How long the server may hold a history read for its run's history to land.
+RUN_HISTORY_HOLD_MS = 5_000
 # The longest TTL whose nanoseconds fit a u64.
 MAX_TTL_MS = 18_446_744_073_709
 _U64_MAX = (1 << 64) - 1
@@ -132,6 +142,7 @@ _TABLE_OPS = frozenset(
         OpCode.ACTION_FAIL,
         OpCode.ACTION_TOUCH,
         OpCode.ACTION_INFO,
+        OpCode.ACTION_HISTORY,
         OpCode.WORKER_LIST,
         OpCode.WORKER_INFO,
         OpCode.STREAM_GROUP_LIST,
@@ -151,6 +162,7 @@ _TABLE_OPS = frozenset(
         OpCode.TS_READ,
         OpCode.TS_INFO,
         OpCode.PROCESSING_REMOVE,
+        OpCode.WORKFLOW_HISTORY,
     }
 )
 
@@ -314,6 +326,18 @@ def encode_worker_list_body(limit: int, cursor: bytes | None, action: str | None
         _limit("limit", limit, MAX_WORKER_LIST)
         + _bytes16("cursor", cursor or b"", _MAX_WORKER_ID)
         + _bytes16("action", (action or "").encode("utf-8"), _MAX_WORKER_ID)
+    )
+
+
+def encode_run_history_body(
+    limit: int | None, cursor: int | None, newest_first: bool | None
+) -> bytes:
+    """workflow.history's and action.history's request: limit, cursor,
+    newest_first. A field left None is sent absent, for the server's default."""
+    return (
+        (b"\x00" if limit is None else _limit("history limit", limit, MAX_RUN_HISTORY_PAGE))
+        + _opt_u64("history cursor", cursor)
+        + (b"\x00" if newest_first is None else b"\x01" + _flag(newest_first))
     )
 
 
@@ -857,7 +881,7 @@ def _text(a: _Answer, op: str, raw: bytes) -> str:
 def decode_action_status_answer(run_id: str, data: bytes) -> ActionRunStatus:
     """action.status's answer: status, created_at, started_at?, completed_at?,
     attempt, output?, error_message?, worker_id?, outcome? (u16 lengths),
-    held? (a u8 length)."""
+    held? (a u8 length), output_truncated, error_truncated."""
     a = _Answer("action.status", data)
     code = a.u8()
     try:
@@ -875,6 +899,7 @@ def decode_action_status_answer(run_id: str, data: bytes) -> ActionRunStatus:
     worker_id = a.bytes16() if a.present() else None
     outcome = a.bytes16() if a.present() else None
     held = a.bytes8() if a.present() else None
+    output_truncated, error_truncated = a.flag(), a.flag()
     a.done()
     return ActionRunStatus(
         run_id=run_id,
@@ -888,7 +913,50 @@ def decode_action_status_answer(run_id: str, data: bytes) -> ActionRunStatus:
         worker_id=worker_id.decode("utf-8", errors="replace") if worker_id is not None else None,
         outcome=outcome.decode("utf-8", errors="replace") if outcome is not None else None,
         held=held.decode("utf-8", errors="replace") if held is not None else None,
+        output_truncated=output_truncated,
+        error_truncated=error_truncated,
     )
+
+
+def decode_run_history_answer(op: str, data: bytes) -> RunHistoryPage:
+    """workflow.history's and action.history's answer: [count:u16] events
+    ([type_len:u32][type][detail_len:u32][detail][extra_len:u16][extra]
+    [timestamp_ms:i64]), has_more, then cursor? (a u64), present when more
+    follow."""
+    a = _Answer(op, data)
+    count = a.u16()
+    if count > MAX_RUN_HISTORY_PAGE:
+        raise IncompleteResponseError(f"{op} answer lists {count} events")
+    events = []
+    for _ in range(count):
+        event_type, detail = a.bytes32(), a.bytes32()
+        extra = a.bytes16()
+        if max(len(event_type), len(detail)) > _MAX_HISTORY_EVENT:
+            raise IncompleteResponseError(
+                f"{op} answer has an event over {_MAX_HISTORY_EVENT} bytes"
+            )
+        if len(extra) > _MAX_HISTORY_EXTRA:
+            raise IncompleteResponseError(
+                f"{op} answer has an extra over {_MAX_HISTORY_EXTRA} bytes"
+            )
+        events.append(
+            RunHistoryEvent(
+                type=_text(a, op, event_type),
+                detail=detail,
+                extra=_text(a, op, extra),
+                timestamp_ms=a.i64(),
+            )
+        )
+    has_more = a.flag()
+    cursor = a.u64() if a.present() else None
+    a.done()
+    if has_more != (cursor is not None):
+        raise IncompleteResponseError(
+            f"{op} answer has more pages but no cursor"
+            if has_more
+            else f"{op} answer has a cursor on its last page"
+        )
+    return RunHistoryPage(events=events, has_more=has_more, cursor=cursor)
 
 
 def decode_await_answer(data: bytes) -> TaskAssignment | None:

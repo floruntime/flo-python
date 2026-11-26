@@ -633,7 +633,42 @@ print(status.status, status.runtime.records_in, status.runtime.late_points)
 
 The server refuses a job whose `name` is over 4096 bytes when it parses the
 definition. Likewise `workflow.create` and `workflow.sync` are refused for a
-workflow whose `version` is over 256 bytes.
+workflow whose `version` is over 256 bytes, and `workflow.create` and
+`workflow.start` for a name over 256 bytes (`BadRequestError`). A workflow
+step calling an action whose name is longer than that fails.
+
+## Workflow Runs
+
+```python
+from flo import RunHistoryOptions
+
+status = await client.workflow.status(run_id)
+print(status["status"], status.get("output"), status["output_truncated"])
+
+# A run's history a page at a time, oldest first
+opts = RunHistoryOptions(limit=100)
+while True:
+    page = await client.workflow.history(run_id, opts)
+    for event in page.events:
+        print(event.timestamp_ms, event.type, event.detail)
+    if not page.has_more:
+        break
+    opts = RunHistoryOptions(limit=100, cursor=page.cursor)
+```
+
+An ended run's status has an empty `input`, and its `output` is only the
+first 256 bytes; with `output_truncated` the whole is the history's
+`workflow_output` event.
+
+`workflow.history` and `action.history` answer the same `RunHistoryPage`.
+`limit` is 1..1000 (a `ValidationError` otherwise); left `None`, the server
+answers up to 100. `newest_first=True` reads back from the cursor. An event's
+`extra` is, for an action's `action_settled`, the outcome its worker named,
+and for its deliveries, retried failures and hand-backs `"truncated"` when
+`detail` is only the first 256 bytes; it is empty otherwise. A gap shows as a
+`history_lost` or `history_missing` event naming the events it stands for.
+The server may hold a history read up to 5 s while the run's history catches
+up.
 
 A TS source reads its field up to its `lateness_ms` window behind the
 field's newest point (30 s by default, at most a day; 0 reads with no
@@ -664,7 +699,7 @@ await client.action.register(
 
 `timeout_ms` is the lease: how long a worker holds a run without completing,
 failing or touching it. The server takes 5000 to 43200000 ms (0 is its
-default, 300000).
+default, 300000). A name over 256 bytes is refused (`BadRequestError`).
 
 ### Invoke an Action
 
@@ -699,6 +734,12 @@ if status.outcome is not None:  # None for success
     print(f"Outcome: {status.outcome}")
 if status.held is not None:  # why a past-due lease isn't ended yet
     print(f"Held: {status.held}")
+
+# output and error_message are their first 256 bytes; the history has the whole
+if status.output_truncated:
+    page = await client.action.history(result.run_id)
+    settled = next(e for e in page.events if e.type == "action_settled")
+    print(f"Whole output: {settled.detail!r}")
 
 # An action's definition, its runs by status and its completed runs' latency
 info = await client.action.info("process-image")
@@ -970,7 +1011,7 @@ A call that times out (`RequestTimeoutError`, also an `asyncio.TimeoutError`) or
 | `GroupHeldFullError` | An `OverloadedError` with reason `GROUP_HELD_FULL`: a group read took nothing new because the group is at its cap (records out and dead together) or the shard's queues and groups are at theirs. Never retried |
 | `UnavailableError` | No leader, or the shard isn't taking writes or is offline, and the client's retries ran out (the message says why, and whether an operator must act first) |
 | `StaleNotFoundError` | A `NotFoundError` from a node that may be behind (a halted or read-blocked shard, or a follower that couldn't reach the leader): `kv.get` or `kv.json_get` found no key, or `stream.read`, `ts.read` or `ts.iter_points` no stream or series, but it may exist. Read again rather than treat it as gone |
-| `LimitError` | Status `LIMIT` (15): the node or shard is at one of its limits; `reason` says which (`TOO_MANY_ACTIONS`, `MEMORY_BUDGET`, `TOO_MANY_WORKFLOW_DEFINITIONS`, `TOO_MANY_WORKFLOW_RUNS`). It didn't run. Terminal, never retried (see below) |
+| `LimitError` | Status `LIMIT` (15): the node or shard is at one of its limits; `reason` says which (today `MEMORY_BUDGET`). It didn't run. Terminal, never retried (see below) |
 | `OutcomePendingError` | The write committed but hasn't applied: its shard halted at or before it (reason `SHARD_HALTED`, ran `UNKNOWN`; the message says whether it applies when the shard resumes). Never retried |
 | `InternalServerError` | Server internal error; not retryable (may mean committed but not applied) |
 | `GenericServerError` | Any other error status, including one this SDK doesn't know (`status_code` carries it) |
@@ -1000,10 +1041,9 @@ same one again is safe; the stream worker's read loop does so with a backoff,
 without logging an error.
 
 A `LimitError` is never retried: the node or shard is at one of its limits
-(today, registering past the 10,000 actions a shard holds), and retrying won't
-clear it. The limits are fixed in the server's build, not settings an operator
-raises; deleting something clears it (for `TOO_MANY_ACTIONS`, an action on
-that shard). For a worker, start() fails with the limit error; a limit hit while running is logged and backed off.
+(today, a write past its node's memory budget, `MEMORY_BUDGET`, such as
+registering an action), and retrying won't clear it. Deleting something, or
+giving the node more memory, clears it. For a worker, start() fails with the limit error; a limit hit while running is logged and backed off.
 The poll and touch loops log it once per reason, at error, and back off (up
 to 30 s) until it clears. A stream worker's read loop does the same for
 `GroupHeldFullError`, until the group or the shard has room again.

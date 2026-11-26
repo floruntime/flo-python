@@ -12,8 +12,11 @@ import struct
 from typing import TYPE_CHECKING, Any
 
 from .exceptions import IncompleteResponseError, ValidationError
+from .kv_body import decode_run_history_answer, encode_run_history_body
 from .types import (
     OpCode,
+    RunHistoryOptions,
+    RunHistoryPage,
     StatusCode,
     WorkflowCancelOptions,
     WorkflowCreateOptions,
@@ -21,7 +24,6 @@ from .types import (
     WorkflowDisableOptions,
     WorkflowEnableOptions,
     WorkflowGetDefinitionOptions,
-    WorkflowHistoryOptions,
     WorkflowListDefinitionsOptions,
     WorkflowListDefinitionsResult,
     WorkflowListRunsOptions,
@@ -152,9 +154,18 @@ class WorkflowOperations:
     async def status(
         self, run_id: str, options: WorkflowStatusOptions | None = None
     ) -> dict[str, Any]:
-        """Get the status of a workflow run. Returns parsed binary status."""
-        import struct
+        """Get the status of a workflow run, as a dict.
 
+        Keys: ``run_id``, ``workflow``, ``version``, ``status``,
+        ``current_step``, ``input``, ``created_at``, then ``started_at``,
+        ``completed_at`` and ``wait_signal`` when set, ``output`` once the run
+        has one, and ``output_truncated``. An ended run's ``input`` is empty
+        and its ``output`` only its first 256 bytes; with ``output_truncated``
+        the whole is the run's ``workflow_output`` history event.
+
+        Raises:
+            NotFoundError: No run has that id.
+        """
         opts = options or WorkflowStatusOptions()
         namespace = self._client.get_namespace(opts.namespace)
 
@@ -164,88 +175,7 @@ class WorkflowOperations:
             run_id.encode("utf-8"),
             b"",
         )
-
-        data = resp.data
-        pos = 0
-        status_names = [
-            "pending",
-            "running",
-            "waiting",
-            "completed",
-            "failed",
-            "cancelled",
-            "timed_out",
-        ]
-
-        def read_u16() -> int:
-            nonlocal pos
-            v: int = struct.unpack_from("<H", data, pos)[0]
-            pos += 2
-            return v
-
-        def read_str() -> str:
-            n = read_u16()
-            nonlocal pos
-            s = data[pos : pos + n].decode("utf-8")
-            pos += n
-            return s
-
-        parsed_run_id = read_str()
-        workflow = read_str()
-        version = read_str()
-
-        status_byte = data[pos]
-        pos += 1
-        status_str = (
-            status_names[status_byte]
-            if status_byte < len(status_names)
-            else f"unknown({status_byte})"
-        )
-
-        current_step = read_str()
-
-        (input_len,) = struct.unpack_from("<I", data, pos)
-        pos += 4
-        input_data = data[pos : pos + input_len]
-        pos += input_len
-
-        (created_at,) = struct.unpack_from("<q", data, pos)
-        pos += 8
-
-        result: dict[str, Any] = {
-            "run_id": parsed_run_id,
-            "workflow": workflow,
-            "version": version,
-            "status": status_str,
-            "current_step": current_step,
-            "input": input_data,
-            "created_at": created_at,
-        }
-
-        # Optional: started_at
-        if pos < len(data) and data[pos] == 1:
-            pos += 1
-            (started_at,) = struct.unpack_from("<q", data, pos)
-            pos += 8
-            result["started_at"] = started_at
-        elif pos < len(data):
-            pos += 1
-
-        # Optional: completed_at
-        if pos < len(data) and data[pos] == 1:
-            pos += 1
-            (completed_at,) = struct.unpack_from("<q", data, pos)
-            pos += 8
-            result["completed_at"] = completed_at
-        elif pos < len(data):
-            pos += 1
-
-        # Optional: wait_signal
-        if pos < len(data) and data[pos] == 1:
-            pos += 1
-            result["wait_signal"] = read_str()
-
-        return result
+        return _parse_status(resp.data)
 
     async def signal(
         self,
@@ -299,21 +229,29 @@ class WorkflowOperations:
             value,
         )
 
-    async def history(self, run_id: str, options: WorkflowHistoryOptions | None = None) -> bytes:
-        """Get the execution history of a workflow run. Returns raw response bytes."""
-        opts = options or WorkflowHistoryOptions()
-        namespace = self._client.get_namespace(opts.namespace)
+    async def history(
+        self, run_id: str, options: RunHistoryOptions | None = None
+    ) -> RunHistoryPage:
+        """One page of a workflow run's history: what happened to it, in order.
 
-        value = struct.pack("<I", opts.limit)
+        Page by passing the page's ``cursor`` back until ``has_more`` is
+        False. The server may hold the read up to 5 s while the run's history
+        catches up.
+
+        Raises:
+            ValidationError: ``limit`` is outside 1..1000.
+            NotFoundError: No run has that id.
+        """
+        opts = options or RunHistoryOptions()
+        namespace = self._client.get_namespace(opts.namespace)
 
         resp = await self._client._send_and_check(
             OpCode.WORKFLOW_HISTORY,
             namespace,
             run_id.encode("utf-8"),
-            value,
+            encode_run_history_body(opts.limit, opts.cursor, opts.newest_first),
         )
-
-        return resp.data
+        return decode_run_history_answer("workflow.history", resp.data)
 
     async def list_runs(
         self, options: WorkflowListRunsOptions | None = None
@@ -471,6 +409,80 @@ class WorkflowOperations:
                 result = await self.sync(yaml_content, options)
                 results.append(result)
         return results
+
+
+_STATUS_NAMES = (
+    "pending",
+    "running",
+    "waiting",
+    "completed",
+    "failed",
+    "cancelled",
+    "timed_out",
+)
+
+
+def _parse_status(data: bytes) -> dict[str, Any]:
+    """workflow.status's answer.
+
+    Wire format: [run_id_len:u16][run_id][workflow_len:u16][workflow]
+                 [version_len:u16][version][status:u8][step_len:u16][step]
+                 [input_len:u32][input][created_at:i64]
+                 [has_started:u8][started_at:i64]?[has_completed:u8][completed_at:i64]?
+                 [has_wait_signal:u8]([signal_len:u16][signal])?
+                 [has_output:u8]([output_len:u32][output][output_truncated:u8])?
+    """
+    pos = 0
+
+    def take(n: int) -> bytes:
+        nonlocal pos
+        if pos + n > len(data):
+            raise IncompleteResponseError("workflow.status answer is truncated")
+        b = data[pos : pos + n]
+        pos += n
+        return b
+
+    def flag() -> bool:
+        b = take(1)[0]
+        if b > 1:
+            raise IncompleteResponseError(f"workflow.status answer has a bool of {b}")
+        return b == 1
+
+    def read_str() -> str:
+        (n,) = struct.unpack("<H", take(2))
+        try:
+            return take(n).decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise IncompleteResponseError(
+                "workflow.status answer has a field that isn't UTF-8"
+            ) from e
+
+    def i64() -> int:
+        return int(struct.unpack("<q", take(8))[0])
+
+    result: dict[str, Any] = {"run_id": read_str(), "workflow": read_str(), "version": read_str()}
+    code = take(1)[0]
+    result["status"] = _STATUS_NAMES[code] if code < len(_STATUS_NAMES) else f"unknown({code})"
+    result["current_step"] = read_str()
+    (input_len,) = struct.unpack("<I", take(4))
+    result["input"] = take(input_len)
+    result["created_at"] = i64()
+    if flag():
+        result["started_at"] = i64()
+    if flag():
+        result["completed_at"] = i64()
+    if flag():
+        result["wait_signal"] = read_str()
+    result["output_truncated"] = False
+    if flag():
+        (output_len,) = struct.unpack("<I", take(4))
+        result["output"] = take(output_len)
+        result["output_truncated"] = flag()
+    if pos != len(data):
+        raise IncompleteResponseError(
+            f"workflow.status answer has {len(data) - pos} bytes after the output"
+        )
+    return result
 
 
 # A page holds at most this many entries; a larger count is a corrupt answer.

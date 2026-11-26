@@ -19,6 +19,7 @@ from flo import (
     FloClient,
     GroupMemberState,
     PeekOptions,
+    RunHistoryOptions,
     RunStatus,
     StaleReportError,
     StreamAppendOptions,
@@ -92,6 +93,17 @@ async def test_live_action_round_trip(client: FloClient) -> None:
     # 10: the run completed with its result and no named outcome.
     status = await client.action.status(task.run, ActionStatusOptions(namespace=ns))
     assert (status.status, status.output, status.outcome) == (RunStatus.COMPLETED, b"pong", None)
+    assert (status.output_truncated, status.error_truncated) == (False, False)
+
+    # Its history starts with the invoke and ends with the run's end, its
+    # one settle carrying the result.
+    page = await client.action.history(task.run, RunHistoryOptions(namespace=ns))
+    assert not page.has_more and page.cursor is None
+    types = [e.type for e in page.events]
+    assert (types[0], page.events[0].detail) == ("action_invoked", b"ping")
+    assert types[-1] == "action_ended"
+    settled = [e for e in page.events if e.type == "action_settled"]
+    assert [(e.detail, e.extra) for e in settled] == [(b"pong", "")]
 
     # 11: a failed delivery comes back as the next attempt; an abandoned one
     # comes back without spending one.
@@ -110,6 +122,33 @@ async def test_live_action_round_trip(client: FloClient) -> None:
     assert (info.version, info.timeout_ms, info.max_attempts) == (1, 5000, 3)
     assert info.ready == 0 and not info.too_many_runs
     assert info.completed == 2
+
+
+async def test_live_a_long_output_is_a_preview_and_its_history_holds_the_whole(
+    client: FloClient,
+) -> None:
+    ns = fresh_namespace()
+    await client.action.register("echo", ActionType.USER, ActionRegisterOptions(namespace=ns))
+    invoked = await client.action.invoke("echo", b"ping", ActionInvokeOptions(namespace=ns))
+    task = await _await(client, ns)
+    whole = bytes(range(256)) + b"tail" * 25  # 356 bytes
+    await client.worker.complete("w1", task, whole)
+
+    status = await client.action.status(invoked.run_id, ActionStatusOptions(namespace=ns))
+    assert (status.status, status.output) == (RunStatus.COMPLETED, whole[:256])
+    assert (status.output_truncated, status.error_truncated) == (True, False)
+
+    # Paged one event at a time, newest first: the end, then the settle.
+    newest = await client.action.history(
+        invoked.run_id, RunHistoryOptions(namespace=ns, limit=1, newest_first=True)
+    )
+    assert [e.type for e in newest.events] == ["action_ended"]
+    assert newest.has_more and newest.cursor is not None
+    before = await client.action.history(
+        invoked.run_id,
+        RunHistoryOptions(namespace=ns, limit=1, newest_first=True, cursor=newest.cursor),
+    )
+    assert [(e.type, e.detail) for e in before.events] == [("action_settled", whole)]
 
 
 async def test_live_action_info_of_an_unknown_action_is_not_found(client: FloClient) -> None:
